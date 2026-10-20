@@ -19,7 +19,7 @@ replaced. Landlock ABI 5, close_range and seccomp TSYNC are required.
 
 `--vcpu-capacity` defaults to 128 concurrent guest tasks. Reusable slots reset
 registers, debug/event state and XSAVE before reassignment. Exhaustion returns
-EAGAIN before PID allocation or clone randomness. The default 8 GiB guest RAM pool
+EAGAIN before PID allocation or clone randomness. The default 8 GiB guest RAM budget
 is configurable with `--mem`; it does not cap total host allocations or tmpfs.
 
 Embedders remain unconfined unless they request `confine_host(true)` and use
@@ -106,7 +106,12 @@ python3 docs/worklog/2026-10-20-host-confinement/checks.py \
    would require a separate cgroup policy.
 
 Implementation agent: Codex, GPT-6 family. Exact model variant, token counts and
-tool-use counters were unavailable. Independent review was arranged separately;
-final reconciliation remains with the integration owner.
+tool-use counters were unavailable.
+
+Independent review returned MERGE for `9aa8b30`, with no remaining findings.
+It reconciled the committed source and independently passed 16 focused checks:
+seven ordinary confinement tests, two real-KVM resource tests, five CLI tests,
+and the PMU syscall-return and caller-state regressions. The review confirmed
+the requested adjacent FD-exemption and EROFS metadata-disclosure comments.
 
 Final feature diff against merged master: 21 files, 2176 insertions and 153 deletions.
