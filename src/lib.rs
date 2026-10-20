@@ -16,8 +16,10 @@
 //! * [`image`]  — guest root-image resolve/download/cache.
 //! * [`sandbox`]— the public [`Sandbox`] builder that wires it all together.
 //!
-//! `unsafe` is confined to the hardware backends (`vcpu::hvf`, `vcpu::kvm`);
-//! everything else is safe Rust.
+//! Audited unsafe boundaries cover hardware backends, guest-RAM allocation,
+//! confined host filesystem calls, and Linux [`host`] preparation/RNG FFI.
+//! Executable-only glue exports the Linux RNG symbol; linking this library
+//! alone does not interpose randomness or change the process personality.
 //!
 //! ```no_run
 //! use nixvm::Sandbox;
@@ -33,6 +35,7 @@
 pub mod abi;
 pub mod clock;
 pub mod fs;
+pub mod host;
 pub mod image;
 pub mod kernel;
 pub mod loader;

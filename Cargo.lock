@@ -424,6 +424,7 @@ dependencies = [
  "console_error_panic_hook",
  "fstool",
  "iced-x86",
+ "libc",
  "pktkit",
  "rand_chacha",
  "rust-fs-core",

@@ -12,11 +12,14 @@
 //! nixvm version
 //! ```
 
+mod common;
+
 use std::process::ExitCode;
 
 use nixvm::{Arch, Sandbox};
 
 fn main() -> ExitCode {
+    common::prepare();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),

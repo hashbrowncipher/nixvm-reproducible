@@ -253,15 +253,42 @@ policies.
 /proc,/sys
 ```
 
+### Linux host determinism
+
+Linux executables use a separate process-wide ChaCha20 stream for host
+`getrandom`, including the Rust 1.93.1 stdlib route used by HashMap
+initialization. Raw syscalls and unrelated native entropy interfaces are outside
+this symbol interposition. Set
+`NIXVM_HOST_RANDOM_SEED` to exactly 64 hexadecimal digits; unset means 32 zero
+bytes. Invalid values fail startup without printing the seed. Calls before
+startup use zeros for invalid values until startup rejects the configuration.
+The host stream never advances guest output or follows guest clone reseeding.
+Replay requires the same toolchain and host random-call/thread order. These
+predictable bytes are unsuitable for secrets or hostile hash inputs.
+
+At the beginning of each Linux executable, startup sets the process's
+`ADDR_NO_RANDOMIZE` personality bit and re-executes `/proc/self/exe` once when
+needed. Startup checks the real bit and fails on personality or exec errors.
+Arguments, environment, cwd, inherited stdio and PID survive re-execution.
+The kernel must allow that personality and expose `/proc/self/exe`.
+
+Linking the library changes neither host randomness nor process layout.
+Embedders opt in with `nixvm::host::prepare()` and an executable-level C
+`getrandom` wrapper forwarding to `nixvm::host::prepared_getrandom`.
+The helper documents its writable-buffer contract, Linux flags, errno and
+256-byte short reads. Its lazy initialization allocates nothing and uses no
+host entropy or clock. Set the seed before launch; initialization must not
+race environment mutation. Calls serialize on a leaf mutex and are not
+signal-safe. Non-Linux startup remains unchanged.
+
 ## Design notes
 
 - **Single crate, feature-gated deps.** Everything lives under one `nixvm`
   crate (`abi`, `vcpu`, `loader`, `fs`, `kernel`, `image`, `sandbox`) instead
   of a workspace; heavy or platform-specific dependencies are opt-in cargo
   features (`hvf`, `kvm`, `interp`, `fstool`, `wasm`, `cli`) rather than
-  separate crates. The core builds fully offline with zero third-party
-  dependencies.
-- **`unsafe` policy.** `unsafe` is confined to four documented sites; the
+  separate crates. The core builds fully offline from pinned dependencies.
+- **`unsafe` policy.** `unsafe` is confined to documented boundaries; the
   interpreter and kernel paths have none. (1) `vcpu::hvf` — the
   Hypervisor.framework FFI (`hv_vm_*`/`hv_vcpu_*`) — and `vcpu::kvm`, its
   Linux equivalent (hand-rolled `/dev/kvm` ioctls, structs verified against
@@ -281,6 +308,11 @@ policies.
   actual I/O syscall is always issued directly against `(parent_dirfd, name)`
   with `O_NOFOLLOW`, so even a symlink swapped in mid-race fails safely
   instead of redirecting the I/O.
+
+  (4) Linux `host` preparation adds audited `libc` calls for environment access,
+  errno and personality, plus a checked-length writable-buffer conversion.
+  Executable-only glue exports the C RNG wrapper. The kernel and interpreter
+  retain no unsafe host-policy calls.
 
 ## License
 

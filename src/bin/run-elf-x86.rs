@@ -8,6 +8,8 @@
 //! cargo run --bin run-elf-x86 -- <host-elf> [guest-argv...]
 //! ```
 
+mod common;
+
 use std::path::PathBuf;
 
 use nixvm::abi::Arch;
@@ -21,6 +23,7 @@ const GUEST_BASE: u64 = 0x1_0000;
 const MEM_BYTES: u64 = 512 * 1024 * 1024;
 
 fn main() {
+    common::prepare();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(host) = args.first() else {
         eprintln!("usage: run-elf-x86 <host-elf> [guest-argv...]");
