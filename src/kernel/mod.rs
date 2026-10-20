@@ -46,6 +46,8 @@ mod pagecache;
 mod path;
 mod poll;
 mod prctl;
+#[cfg(test)]
+mod reproducibility_tests;
 mod procx;
 mod ptimer;
 mod pty;

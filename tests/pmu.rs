@@ -20,6 +20,45 @@ fn invalid_quantum_is_rejected_before_opening_kvm() {
 }
 
 #[test]
+#[ignore = "requires KVM and guest-only Intel perf counters"]
+fn stepping_flags_are_hidden_from_pushf_and_popf_roundtrips() {
+    for code in [
+        vec![0x9c, 0x58, 0x0f, 0x05], // pushfq; pop rax; syscall
+        vec![0x66, 0x9c, 0x66, 0x58, 0x0f, 0x05], // pushfw; pop ax; syscall
+        vec![0x9c, 0x58, 0x50, 0x9d, 0x9c, 0x58, 0x0f, 0x05],
+    ] {
+        let backend = KvmBackend::with_branch_quantum(64).unwrap();
+        let mut memory = GuestMemory::new(BASE, 64 * 1024);
+        memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+        memory.map(BASE + PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
+        memory.write_init(BASE + 2 * PAGE_SIZE - 8, &[0; 8]).unwrap();
+        memory.write_init(BASE, &code).unwrap();
+        let mut cpu = backend.new_vcpu(BASE, BASE + 2 * PAGE_SIZE).unwrap();
+        cpu.set_preemption_required(true);
+        cpu.begin_slice();
+        assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Syscall);
+        assert_eq!(cpu.reg(0) & 0x100, 0, "pushed flags include host TF: {code:x?}");
+        assert_eq!(cpu.rflags() & 0x100, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires KVM and guest-only Intel perf counters"]
+fn stepping_flags_are_hidden_from_exception_frames() {
+    for code in [vec![0x0f, 0x0b], vec![0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]] {
+        let backend = KvmBackend::with_branch_quantum(64).unwrap();
+        let mut memory = GuestMemory::new(BASE, 64 * 1024);
+        memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+        memory.write_init(BASE, &code).unwrap();
+        let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+        cpu.set_preemption_required(true);
+        cpu.begin_slice();
+        assert!(matches!(cpu.run(&mut memory).unwrap(), Exit::IllegalInstruction { .. } | Exit::MemFault { .. }));
+        assert_eq!(cpu.rflags() & 0x100, 0, "exception flags include host TF: {code:x?}");
+    }
+}
+
+#[test]
 #[ignore = "requires KVM and guest-only perf counters on a supported Intel CPU"]
 fn branch_quantum_lands_at_the_same_instruction_on_repeated_runs() {
     for quantum in [64, 20_000] {
