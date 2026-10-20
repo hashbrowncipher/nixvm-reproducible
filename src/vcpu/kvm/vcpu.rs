@@ -1086,3 +1086,62 @@ impl Drop for KvmVcpu {
         unsafe { sys::munmap(self.run.cast(), self.vm.vcpu_mmap_size()) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vcpu::ctrl::{KSTACK_TOP, SEL_KCODE};
+
+    #[test]
+    fn interrupted_exception_frames_are_recovered_before_yielding() {
+        let vm = match Vm::new() {
+            Ok(vm) => Arc::new(vm),
+            Err(error) => {
+                eprintln!("skipping KVM exception interruption test: {error}");
+                return;
+            }
+        };
+        let mem = GuestMemory::new(0x1_0000, 64 * 1024);
+        let mut v = KvmVcpu::create(vm).unwrap();
+        v.sync_cr3(&mem);
+        let phys = mem.phys_arc();
+        // Model the register snapshot returned by an interrupted KVM_RUN.
+        // The CPU has pushed the frame, but userspace has not consumed it.
+        for (trampoline, error_code) in [
+            (FAULT_TRAMP_VA, true),
+            (FAULT_TRAMP_VA + 0x10, true),  // #GP
+            (FAULT_TRAMP_VA + 0x20, false), // #UD
+        ] {
+            for past_hlt in [0, 1] {
+                let mut frame = vec![
+                    0x12345,
+                    u64::from(SEL_UCODE),
+                    0x1_0247,
+                    0x18765,
+                    u64::from(SEL_UDATA),
+                ];
+                if error_code {
+                    frame.insert(0, 2);
+                }
+                let size = frame.len() as u64 * 8;
+                for (index, value) in frame.into_iter().enumerate() {
+                    phys.write(
+                        v.kstack_pa + crate::vcpu::mem::PAGE_SIZE - size + index as u64 * 8,
+                        &value.to_le_bytes(),
+                    );
+                }
+                v.regs.rip = trampoline + past_hlt;
+                v.regs.rsp = KSTACK_TOP - size;
+                v.sregs.cs.selector = SEL_KCODE;
+                v.sregs.cs.dpl = 0;
+                v.decode_exit(sys::KVM_EXIT_INTR).unwrap();
+                assert_eq!(v.regs.rip, 0x12345, "trampoline {trampoline:#x}+{past_hlt}");
+                assert_eq!(v.regs.rsp, 0x18765);
+                assert_eq!(v.regs.rflags, 0x1_0247);
+                assert_eq!(v.sregs.cs.selector, SEL_UCODE);
+                assert_eq!(v.sregs.ss.selector, SEL_UDATA);
+                assert!(v.regs_dirty && v.sregs_dirty);
+            }
+        }
+    }
+}
