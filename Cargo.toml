@@ -70,9 +70,8 @@ fetch = ["dep:ureq"]
 tunnel = ["dep:pktkit"]
 
 [dependencies]
-# The core builds fully offline with no third-party deps. `fstool` is the first
-# optional dependency, gated behind its feature; per-phase additions arrive
-# gated by the features above (object, kvm-ioctls, sha2, a fetch stack, …).
+# The core links no third-party runtime dependencies. Optional runtime libraries
+# are feature-gated; the host-only CPUID parser is under build-dependencies.
 # `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
 # Since 0.4.28 each filesystem is its own feature (a `default-features = false`
 # build gets none and doesn't compile); enable the ones nixvm reads/builds:
@@ -99,6 +98,10 @@ compcol = { version = "0.6", optional = true, default-features = false, features
 pktkit = { version = "0.1.11", optional = true, default-features = false, features = [
     "vclient",
 ] }
+
+[build-dependencies]
+serde = { version = "=1.0.228", features = ["derive"] }
+toml = { version = "=0.8.23", default-features = false, features = ["parse"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Only pulled in on wasm32, and only linked when the `wasm` feature is on

@@ -17,6 +17,7 @@
 
 use crate::abi::Arch;
 
+pub(crate) mod cpuid;
 pub(crate) mod ctrl;
 pub mod mem;
 pub(crate) mod pagetable;

@@ -35,7 +35,7 @@ pub struct KvmBackend {
 
 impl KvmBackend {
     /// Probe KVM by opening `/dev/kvm` and building the VM (control block
-    /// mapped, CPUID snapshot taken). Returns an error — which
+    /// mapped, CPU profile checked against host capabilities). Returns an error — which
     /// [`crate::vcpu::select`] turns into an interpreter fallback — when KVM
     /// is unavailable or inaccessible.
     pub fn new() -> Result<Self, VcpuError> {
@@ -99,7 +99,13 @@ mod tests {
         ]);
         mem.write_init(base, &code).unwrap();
         let mut parent = backend.new_vcpu(base, base + 0x8000).unwrap();
-        while parent.run(&mut mem).unwrap() == Exit::Interrupted {}
+        loop {
+            match parent.run(&mut mem).unwrap() {
+                Exit::Interrupted => {}
+                Exit::Syscall => break,
+                other => panic!("unexpected fork parent exit: {other:?}"),
+            }
+        }
         let mut child = parent.fork();
         child.set_syscall_ret(0);
         loop {

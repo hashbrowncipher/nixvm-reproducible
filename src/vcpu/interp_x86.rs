@@ -110,7 +110,7 @@ const USER_CS: u16 = 0x33;
 const USER_SS: u16 = 0x2b;
 
 /// The x86-64-v3 extensions. Each switch gates both execution (`#UD` while
-/// off, as on a CPU without the feature) and the `CPUID` bit advertising it.
+/// off, as on a CPU without the feature). The public CPUID profile is in `cpuid.toml`.
 /// `AVX` also covers `XSAVE`/`XRSTOR`/`XGETBV` and the YMM state (`OSXSAVE`,
 /// `XCR0` = x87|SSE|AVX).
 const AVX: bool = true;
@@ -125,44 +125,6 @@ const MOVBE: bool = true;
 
 /// The `XCR0` state components `XSAVE` manages (and `XGETBV` reports).
 const XCR0: u64 = if AVX { 0b111 } else { 0b11 };
-
-/// `CPUID` leaf 1 `ECX`: SSE3 (0), SSSE3 (9), CX16 (13), SSE4.1 (19), SSE4.2
-/// (20), POPCNT (23), RDRAND (30) — with LAHF-SAHF (`0x8000_0001` `ECX`) the
-/// whole x86-64-v2 level — plus, from x86-64-v3, FMA (12), MOVBE (22),
-/// XSAVE (26), OSXSAVE (27), AVX (28) and F16C (29).
-const CPUID1_ECX: u32 = 1
-    | (1 << 9)
-    | (1 << 13)
-    | (1 << 19)
-    | (1 << 20)
-    | (1 << 23)
-    | (1 << 30)
-    | ((FMA as u32) << 12)
-    | ((MOVBE as u32) << 22)
-    | ((AVX as u32) << 26)
-    | ((AVX as u32) << 27)
-    | ((AVX as u32) << 28)
-    | ((F16C as u32) << 29);
-
-/// `CPUID` leaf 7 (subleaf 0) `EBX`: BMI1 (3), AVX2 (5), BMI2 (8).
-const CPUID7_EBX: u32 = ((BMI1 as u32) << 3) | ((AVX2 as u32) << 5) | ((BMI2 as u32) << 8);
-
-/// `CPUID` leaf 1 `EDX`: FPU (0), PSE (3), TSC (4), MSR (5), PAE (6), CX8
-/// (8), PGE (13), CMOV (15), CLFSH (19), MMX (23), FXSR (24), SSE (25), SSE2
-/// (26) — the same bits the loader reports in `AT_HWCAP`.
-const CPUID1_EDX: u32 = (1 << 0)
-    | (1 << 3)
-    | (1 << 4)
-    | (1 << 5)
-    | (1 << 6)
-    | (1 << 8)
-    | (1 << 13)
-    | (1 << 15)
-    | (1 << 19)
-    | (1 << 23)
-    | (1 << 24)
-    | (1 << 25)
-    | (1 << 26);
 
 #[derive(Debug)]
 pub struct X86Backend {
@@ -1895,65 +1857,13 @@ impl X86Interp {
         self.next(pc)
     }
 
-    /// `CPUID` (`0F A2`): dispatch on the leaf in `EAX` (and the subleaf in
-    /// `ECX`) and write `EAX`/`EBX`/`ECX`/`EDX`. Feature bits are set *only*
-    /// for what this interpreter executes, so glibc/musl's CPUID-gated dispatch
-    /// never picks an unimplemented instruction path; they mirror the loader's
-    /// `AT_HWCAP` (leaf 1 `EDX`). Unrecognized leaves return zeros.
+    /// Answer from the same embedded CPU profile installed on KVM vcpus.
     fn cpuid(&mut self) {
-        let leaf = self.gpr[RAX] as u32;
-        let sub = self.gpr[RCX] as u32;
-        let (eax, ebx, ecx, edx): (u32, u32, u32, u32) = match leaf {
-            // Max standard leaf + the "GenuineIntel" vendor string, split
-            // EBX/EDX/ECX = "Genu"/"ineI"/"ntel".
-            0 => (
-                if AVX { 0xD } else { 7 },
-                0x756E_6547,
-                0x6C65_746E,
-                0x4965_6E69,
-            ),
-            // EAX = family 6 signature; EBX = 1 logical processor, 64-byte
-            // CLFLUSH line; ECX/EDX = the feature words.
-            1 => (0x0007_06A1, 0x0001_0800, CPUID1_ECX, CPUID1_EDX),
-            // Deterministic cache parameters: a plausible hierarchy so libc
-            // cache-size probes (memcpy non-temporal thresholds) see sane
-            // values.
-            4 => cache_leaf(sub),
-            // Structured extended features (leaf 7, subleaf 0 — the only one).
-            7 if sub == 0 => (0, CPUID7_EBX, 0, 0),
-            // XSAVE state components: XCR0's bits, the standard-format area
-            // size (legacy region + header + AVX = 832 bytes), and the AVX
-            // component's size/offset. No XSAVEOPT/XSAVEC/XSAVES (subleaf 1).
-            0xD if AVX => match sub {
-                0 => (XCR0 as u32, 0x340, 0x340, 0),
-                2 => (0x100, 0x240, 0, 0),
-                _ => (0, 0, 0, 0),
-            },
-            0x8000_0000 => (0x8000_0008, 0, 0, 0),
-            // LAHF/SAHF in 64-bit mode (ECX bit 0); SYSCALL (EDX 11), NX (20),
-            // RDTSCP (27), LM (29).
-            0x8000_0001 => (0, 0, 0x1 | (u32::from(LZCNT) << 5), 0x2810_0800),
-            0x8000_0002..=0x8000_0004 => Self::cpuid_brand_leaf(leaf),
-            // 48-bit virtual / 46-bit physical address sizes.
-            0x8000_0008 => (0x0000_302e, 0, 0, 0),
-            _ => (0, 0, 0, 0),
-        };
-        self.gpr[RAX] = u64::from(eax);
-        self.gpr[RBX] = u64::from(ebx);
-        self.gpr[RCX] = u64::from(ecx);
-        self.gpr[RDX] = u64::from(edx);
-    }
-
-    /// The `EAX`/`EBX`/`ECX`/`EDX` quartet for one of `CPUID`'s three
-    /// "processor brand string" leaves (`0x8000_0002..=0x8000_0004`).
-    fn cpuid_brand_leaf(leaf: u32) -> (u32, u32, u32, u32) {
-        const TEXT: &[u8] = b"nixvm software x86-64 CPU";
-        let mut brand = [0u8; 48];
-        brand[..TEXT.len()].copy_from_slice(TEXT);
-        let base = ((leaf - 0x8000_0002) * 16) as usize;
-        let word =
-            |off: usize| u32::from_le_bytes(brand[base + off..base + off + 4].try_into().unwrap());
-        (word(0), word(4), word(8), word(12))
+        let entry = super::cpuid::query(self.gpr[RAX] as u32, self.gpr[RCX] as u32);
+        self.gpr[RAX] = u64::from(entry.eax);
+        self.gpr[RBX] = u64::from(entry.ebx);
+        self.gpr[RCX] = u64::from(entry.ecx);
+        self.gpr[RDX] = u64::from(entry.edx);
     }
 
     /// Advance and return the free-running counter behind `RDTSC`/`RDTSCP`:
@@ -3067,23 +2977,6 @@ impl X86Interp {
     }
 }
 
-/// `CPUID` leaf 4 (deterministic cache parameters), subleaf `sub`: L1d, L1i,
-/// L2, L3, then the terminating null entry. `EBX` = (ways-1) << 22 | (line
-/// size-1); `ECX` = sets-1.
-fn cache_leaf(sub: u32) -> (u32, u32, u32, u32) {
-    // (type: 1 data / 2 instruction / 3 unified, level, ways, sets)
-    let (ty, level, ways, sets): (u32, u32, u32, u32) = match sub {
-        0 => (1, 1, 8, 64),    // 32 KiB L1d
-        1 => (2, 1, 8, 64),    // 32 KiB L1i
-        2 => (3, 2, 4, 1024),  // 256 KiB L2
-        3 => (3, 3, 16, 8192), // 8 MiB L3
-        _ => return (0, 0, 0, 0),
-    };
-    let eax = ty | (level << 5) | (1 << 8); // self-initializing
-    let ebx = ((ways - 1) << 22) | 63;
-    (eax, ebx, sets - 1, 0)
-}
-
 impl Vcpu for X86Interp {
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError> {
         // Time-based preemption deadline, computed once. A compute-bound guest
@@ -4163,7 +4056,7 @@ mod tests {
         // cpuid (0F A2)
         m.write_init(CODE, &[0x0F, 0xA2]).unwrap();
         cpu.exec(&mut m);
-        assert_eq!(cpu.gpr[RAX] as u32, 0xD, "max standard leaf (XSAVE)");
+        assert_eq!(cpu.gpr[RAX] as u32, 0x16, "max standard leaf");
         let mut vendor = Vec::new();
         vendor.extend_from_slice(&(cpu.gpr[RBX] as u32).to_le_bytes());
         vendor.extend_from_slice(&(cpu.gpr[RDX] as u32).to_le_bytes());

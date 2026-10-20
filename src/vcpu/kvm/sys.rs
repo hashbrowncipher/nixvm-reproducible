@@ -148,6 +148,10 @@ pub const KVM_GET_FPU: c_ulong = 0x81A0_AE8C;
 pub const KVM_SET_FPU: c_ulong = 0x41A0_AE8D;
 pub const KVM_SET_CPUID2: c_ulong = 0x4008_AE90;
 pub const KVM_SET_XCRS: c_ulong = 0x4188_AEA7;
+pub const KVM_GET_XSAVE: c_ulong = 0x9000_AEA4;
+pub const KVM_GET_XSAVE2: c_ulong = 0x9000_AECF;
+pub const KVM_SET_XSAVE: c_ulong = 0x5000_AEA5;
+pub const KVM_CAP_XSAVE2: c_ulong = 208;
 pub const KVM_SET_GUEST_DEBUG: c_ulong = 0x4048_AE9B;
 
 // `kvm_guest_debug.control` flags.

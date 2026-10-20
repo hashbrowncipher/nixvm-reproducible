@@ -889,16 +889,33 @@ fn aarch64_features() -> String {
 /// architecture.
 fn write_cpuinfo_block(out: &mut String, i: usize, arch: crate::abi::Arch) {
     if arch == crate::abi::Arch::X86_64 {
+        let features = crate::vcpu::cpuid::flag_string();
+        let vendor = crate::vcpu::cpuid::vendor_id();
+        let brand = crate::vcpu::cpuid::brand_string();
+        let signature = crate::vcpu::cpuid::query(1, 0).eax;
+        let base_family = (signature >> 8) & 0xf;
+        let family = base_family
+            + if base_family == 0xf {
+                (signature >> 20) & 0xff
+            } else {
+                0
+            };
+        let model = ((signature >> 4) & 0xf)
+            | if matches!(base_family, 6 | 15) {
+                (signature >> 12) & 0xf0
+            } else {
+                0
+            };
+        let stepping = signature & 0xf;
         let _ = write!(
             out,
             "processor\t: {i}\n\
-             vendor_id\t: GenuineIntel\n\
-             cpu family\t: 6\n\
-             model name\t: nixvm Virtual CPU\n\
-             flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov \
-             pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm constant_tsc \
-             rep_good nopl cpuid pni pclmulqdq ssse3 cx16 sse4_1 sse4_2 x2apic \
-             popcnt aes xsave avx rdrand hypervisor lahf_lm abm 3dnowprefetch\n\
+             vendor_id\t: {vendor}\n\
+             cpu family\t: {family}\n\
+             model\t\t: {model}\n\
+             model name\t: {brand}\n\
+             stepping\t: {stepping}\n\
+             flags\t\t: {features}\n\
              bogomips\t: 100.00\n\n"
         );
     } else {

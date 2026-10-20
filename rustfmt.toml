@@ -1,0 +1,2 @@
+# Keep the upstream crate's standard Rust formatting.
+max_width = 100

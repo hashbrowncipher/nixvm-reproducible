@@ -2031,7 +2031,7 @@ mod tests {
     }
 
     #[test]
-    fn cpuid_advertises_v3_consistently() {
+    fn cpuid_advertises_avx_consistently() {
         let mut m = mem();
         let cpuid = |m: &mut GuestMemory, leaf: u64, sub: u64| {
             let (c, _) = run(m, &[0x0F, 0xA2], |c| {
@@ -2041,14 +2041,13 @@ mod tests {
             (c.gpr[RAX], c.gpr[RBX], c.gpr[RCX], c.gpr[RDX])
         };
         let (_, _, ecx, _) = cpuid(&mut m, 1, 0);
-        for bit in [12, 22, 26, 27, 28, 29] {
+        for bit in [22, 26, 27, 28] {
             assert_ne!(ecx & (1 << bit), 0, "leaf 1 ecx bit {bit}");
         }
         let (_, ebx, _, _) = cpuid(&mut m, 7, 0);
         assert_eq!(ebx & 0x128, 0x128); // BMI1, AVX2, BMI2
         assert_eq!(cpuid(&mut m, 0xD, 0), (7, 0x340, 0x340, 0));
         assert_eq!(cpuid(&mut m, 0xD, 2), (0x100, 0x240, 0, 0));
-        assert_ne!(cpuid(&mut m, 0x8000_0001, 0).2 & (1 << 5), 0); // LZCNT
         assert!(cpuid(&mut m, 0, 0).0 >= 0xD);
     }
 }

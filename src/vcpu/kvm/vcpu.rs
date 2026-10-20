@@ -710,6 +710,29 @@ impl KvmVcpu {
         }
         self.regs_dirty = true;
     }
+
+    fn read_xsave(&self) -> Result<Vec<u8>, VcpuError> {
+        let mut state = vec![0; self.vm.xsave_size()];
+        // SAFETY: the writable buffer has the VM's reported XSAVE size. GET_XSAVE
+        // is used only for the fixed-size legacy ABI; GET_XSAVE2 uses the full size.
+        let ret = unsafe { sys::ioctl(self.fd.0, self.vm.xsave_get(), state.as_mut_ptr()) };
+        check(ret, "KVM_GET_XSAVE")?;
+        Ok(state)
+    }
+
+    fn write_xsave(&self, state: &[u8]) -> Result<(), VcpuError> {
+        let mut buffer = vec![0; self.vm.xsave_size()];
+        if state.len() > buffer.len() {
+            return Err(VcpuError::Backend(
+                "XSAVE state exceeds KVM buffer size".into(),
+            ));
+        }
+        buffer[..state.len()].copy_from_slice(state);
+        // SAFETY: SET_XSAVE reads the VM's full reported size. Unexposed state
+        // components and reserved bytes outside the supplied image are zeroed.
+        let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_SET_XSAVE, buffer.as_ptr()) };
+        check(ret, "KVM_SET_XSAVE").map(drop)
+    }
 }
 
 /// The flat 64-bit user code segment (CPL3).
@@ -902,6 +925,42 @@ impl Vcpu for KvmVcpu {
         self.sregs_dirty = true;
     }
 
+    fn simd_state(&self) -> Vec<u8> {
+        let mut state = self.read_xsave().expect("read XSAVE state (signal)");
+        state.truncate(crate::vcpu::X86_XSAVE_SIZE);
+        state
+    }
+
+    fn set_simd_state(&mut self, bytes: &[u8]) {
+        if bytes.len() < 512 {
+            return;
+        }
+        // Match the interpreter's FXRSTOR contract: reserved MXCSR bits leave
+        // state untouched. Guest signal frames cannot supply other components
+        // or compacted-format/reserved XSAVE header fields to the host kernel.
+        let mxcsr = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+        if mxcsr & !0xffff != 0 {
+            return;
+        }
+        let mut state = vec![0; crate::vcpu::X86_XSAVE_SIZE];
+        state[..512].copy_from_slice(&bytes[..512]);
+        let components = if bytes.len() >= state.len() {
+            state[576..].copy_from_slice(&bytes[576..crate::vcpu::X86_XSAVE_SIZE]);
+            u64::from_le_bytes(bytes[512..520].try_into().unwrap()) & XCR0_AVX
+        } else {
+            3 // A bare FXSAVE image resets the upper YMM halves.
+        };
+        // XRSTOR restores MXCSR independently of the SSE/YMM presence bits.
+        // KVM_SET_XSAVE initializes it when both are absent. Materialize the
+        // initial XMM registers and mark SSE present so the supplied MXCSR survives.
+        if components & 2 == 0 {
+            state[160..416].fill(0);
+        }
+        state[512..520].copy_from_slice(&(components | 2).to_le_bytes());
+        self.write_xsave(&state)
+            .expect("restore XSAVE state (signal)");
+    }
+
     fn fork(&self) -> Box<dyn Vcpu> {
         // A sibling vcpu in the same VM, cloned from the cached (just
         // refreshed) register state — including the mid-trap CPL0 segment
@@ -917,14 +976,10 @@ impl Vcpu for KvmVcpu {
         // The child runs the *child's* address space (a different cr3); force a
         // re-sync on its first run rather than inheriting the parent's cached one.
         child.cur_cr3 = None;
-        // FPU/SSE state is not cached host-side; copy it fd-to-fd.
-        let mut fpu = sys::kvm_fpu::default();
-        // SAFETY: valid out-pointer; both fds are live vcpus of this VM.
-        let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_FPU, std::ptr::from_mut(&mut fpu)) };
-        check(ret, "KVM_GET_FPU").expect("read FPU state (fork)");
-        // SAFETY: as above; the kernel only reads the struct.
-        let ret = unsafe { sys::ioctl(child.fd.0, sys::KVM_SET_FPU, std::ptr::from_ref(&fpu)) };
-        check(ret, "KVM_SET_FPU").expect("write FPU state (fork)");
+        // XSAVE includes the upper YMM halves and the component presence bits
+        // needed to restore the complete x87/SSE/AVX register file.
+        let state = self.read_xsave().expect("read XSAVE state (fork)");
+        child.write_xsave(&state).expect("write XSAVE state (fork)");
         Box::new(child)
     }
 
@@ -942,6 +997,12 @@ impl Vcpu for KvmVcpu {
         self.sregs.fs.base = 0;
         self.sregs_dirty = true;
         self.in_syscall = false;
+        let mut state = vec![0; crate::vcpu::X86_XSAVE_SIZE];
+        state[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        state[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        state[512..520].copy_from_slice(&3u64.to_le_bytes());
+        self.write_xsave(&state)
+            .expect("reset XSAVE state (execve)");
         // execve installed fresh page tables in the same GuestMemory: its `cr3()`
         // changed, so drop the cached value and re-sync on the next run.
         self.cur_cr3 = None;

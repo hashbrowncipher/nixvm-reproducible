@@ -57,8 +57,8 @@ pub fn check(ret: c_int, what: &str) -> Result<c_int, VcpuError> {
     }
 }
 
-/// One KVM virtual machine. Holds `/dev/kvm`, the VM fd, the supported-CPUID
-/// snapshot, and — once the first vcpu runs — a handle on the shared pool whose
+/// One KVM virtual machine. Holds `/dev/kvm`, the VM fd, the guest CPUID
+/// profile, and — once the first vcpu runs — a handle on the shared pool whose
 /// single memslot it registered.
 #[derive(Debug)]
 pub struct Vm {
@@ -66,6 +66,8 @@ pub struct Vm {
     fd: Fd,
     vcpu_mmap_size: usize,
     cpuid: Box<sys::kvm_cpuid2>,
+    xsave_size: usize,
+    xsave_get: std::ffi::c_ulong,
     /// The shared physical pool, registered as the one RAM memslot on the first
     /// run. `None` until then. Kept so the fault path can read the exception frame
     /// out of the control block without a `GuestMemory` borrow (the SMP path holds
@@ -111,28 +113,42 @@ impl Vm {
         let raw = unsafe { sys::ioctl(sys_fd.0, sys::KVM_GET_VCPU_MMAP_SIZE, 0) };
         let vcpu_mmap_size = check(raw, "KVM_GET_VCPU_MMAP_SIZE")? as usize;
 
-        // Snapshot the host's supported CPUID so guest `cpuid` reports real
-        // features (musl/libgcc probe SSE levels at startup).
-        let mut cpuid = Box::new(sys::kvm_cpuid2 {
+        // Host capabilities validate the profile; they never supply guest identity.
+        let mut supported = Box::new(sys::kvm_cpuid2 {
             nent: sys::CPUID_CAP as u32,
             ..Default::default()
         });
-        // SAFETY: `cpuid` is a live, writable allocation whose `nent` bounds the
+        // SAFETY: `supported` is a live, writable allocation whose `nent` bounds the
         // entry array; the kernel fills entries and shrinks `nent`.
         let raw = unsafe {
             sys::ioctl(
                 sys_fd.0,
                 sys::KVM_GET_SUPPORTED_CPUID,
-                std::ptr::from_mut(cpuid.as_mut()),
+                std::ptr::from_mut(supported.as_mut()),
             )
         };
         check(raw, "KVM_GET_SUPPORTED_CPUID")?;
+        let cpuid = guest_cpuid(&supported)?;
+
+        // SET_XSAVE consumes the VM's full buffer size, including any dynamically
+        // enabled host components. Only x87/SSE/YMM are exposed to the guest.
+        // SAFETY: CHECK_EXTENSION takes a capability number on a live VM fd.
+        let raw = unsafe { sys::ioctl(fd.0, sys::KVM_CHECK_EXTENSION, sys::KVM_CAP_XSAVE2) };
+        let size = check(raw, "KVM_CHECK_EXTENSION(XSAVE2)")? as usize;
+        let xsave_size = size.max(4096);
+        let xsave_get = if size > 0 {
+            sys::KVM_GET_XSAVE2
+        } else {
+            sys::KVM_GET_XSAVE
+        };
 
         Ok(Self {
             _sys_fd: sys_fd,
             fd,
             vcpu_mmap_size,
             cpuid,
+            xsave_size,
+            xsave_get,
             pool: Mutex::new(None),
             next_vcpu_id: AtomicU32::new(0),
         })
@@ -210,5 +226,138 @@ impl Vm {
 
     pub fn cpuid(&self) -> &sys::kvm_cpuid2 {
         &self.cpuid
+    }
+
+    pub fn xsave_size(&self) -> usize {
+        self.xsave_size
+    }
+
+    pub fn xsave_get(&self) -> std::ffi::c_ulong {
+        self.xsave_get
+    }
+}
+
+fn guest_cpuid(supported: &sys::kvm_cpuid2) -> Result<Box<sys::kvm_cpuid2>, VcpuError> {
+    use crate::vcpu::cpuid::{ENTRIES, indexed, query};
+
+    // Feature words describe instructions and control state. Identity, topology,
+    // cache sizes, and frequencies are deliberately excluded from this comparison.
+    for (leaf, subleaf, masks) in [
+        (1, 0, [0, 0, !(1 << 27 | 1 << 31), u32::MAX]),
+        (7, 0, [0, u32::MAX, u32::MAX, u32::MAX]),
+        (0xd, 0, [u32::MAX, 0, 0, u32::MAX]),
+        (0x8000_0001, 0, [0, 0, u32::MAX, u32::MAX]),
+    ] {
+        let expected = query(leaf, subleaf);
+        let available = supported.entries[..supported.nent as usize]
+            .iter()
+            .find(|entry| entry.function == leaf && entry.index == subleaf)
+            .copied()
+            .unwrap_or_default();
+        for ((required, present), mask) in [expected.eax, expected.ebx, expected.ecx, expected.edx]
+            .into_iter()
+            .zip([available.eax, available.ebx, available.ecx, available.edx])
+            .zip(masks)
+        {
+            let missing = required & mask & !present;
+            if missing != 0 {
+                return Err(VcpuError::Backend(format!(
+                    "KVM cannot execute the CPUID profile: leaf {leaf:#x}/{subleaf:#x} missing bits {missing:#x}"
+                )));
+            }
+        }
+    }
+
+    let mut result = Box::new(sys::kvm_cpuid2::default());
+    if ENTRIES.len() > result.entries.len() {
+        return Err(VcpuError::Backend(
+            "CPUID profile exceeds KVM table capacity".into(),
+        ));
+    }
+    result.nent = ENTRIES.len() as u32;
+    for (target, entry) in result.entries.iter_mut().zip(ENTRIES) {
+        *target = sys::kvm_cpuid_entry2 {
+            function: entry.leaf,
+            index: entry.subleaf,
+            flags: u32::from(indexed(entry.leaf)),
+            eax: entry.eax,
+            ebx: entry.ebx,
+            ecx: entry.ecx,
+            edx: entry.edx,
+            padding: [0; 3],
+        };
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{guest_cpuid, sys};
+    use crate::vcpu::cpuid::ENTRIES;
+
+    fn supported_profile() -> sys::kvm_cpuid2 {
+        let mut supported = sys::kvm_cpuid2::default();
+        supported.nent = ENTRIES.len() as u32;
+        for (target, source) in supported.entries.iter_mut().zip(ENTRIES) {
+            target.function = source.leaf;
+            target.index = source.subleaf;
+            target.eax = source.eax;
+            target.ebx = source.ebx;
+            target.ecx = source.ecx;
+            target.edx = source.edx;
+        }
+        supported
+    }
+
+    #[test]
+    fn host_identity_and_extra_features_do_not_enter_the_profile() {
+        let mut supported = supported_profile();
+        for entry in &mut supported.entries[..supported.nent as usize] {
+            match entry.function {
+                0 => entry.ebx = 0x1234_5678,
+                1 => {
+                    entry.eax = u32::MAX;
+                    entry.ebx = u32::MAX;
+                    entry.ecx |= 1 << 30; // Host RDRAND stays hidden.
+                    entry.ecx &= !(1 << 27); // OSXSAVE comes from guest CR4.
+                }
+                0x8000_0002..=0x8000_0004 => entry.eax = u32::MAX,
+                _ => {}
+            }
+        }
+        let guest = guest_cpuid(&supported).unwrap();
+        for (actual, expected) in guest.entries.iter().zip(ENTRIES) {
+            assert_eq!(
+                (
+                    actual.function,
+                    actual.index,
+                    actual.eax,
+                    actual.ebx,
+                    actual.ecx,
+                    actual.edx
+                ),
+                (
+                    expected.leaf,
+                    expected.subleaf,
+                    expected.eax,
+                    expected.ebx,
+                    expected.ecx,
+                    expected.edx
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn missing_avx2_rejects_hardware_instead_of_changing_guest_cpuid() {
+        let mut supported = supported_profile();
+        let structured = supported
+            .entries
+            .iter_mut()
+            .find(|entry| entry.function == 7)
+            .unwrap();
+        structured.ebx &= !(1 << 5);
+        let error = guest_cpuid(&supported).unwrap_err().to_string();
+        assert!(error.contains("leaf 0x7/0x0 missing bits 0x20"), "{error}");
     }
 }
