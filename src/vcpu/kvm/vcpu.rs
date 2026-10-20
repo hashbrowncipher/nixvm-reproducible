@@ -300,13 +300,15 @@ impl KvmVcpu {
         let ret = unsafe { sys::ioctl(fd.0, sys::KVM_SET_CPUID2, std::ptr::from_ref(vm.cpuid())) };
         check(ret, "KVM_SET_CPUID2")?;
 
-        // The syscall trampoline wiring (see `super::vm`).
+        // The syscall trampoline wiring (see `super::vm`), and the fixed TSC_AUX
+        // that guest RDPID reads natively. Pooled slots must not keep an old value.
         let entries = [
             (sys::MSR_IA32_STAR, STAR_VALUE),
             (sys::MSR_IA32_LSTAR, LSTAR_VA),
             (sys::MSR_IA32_CSTAR, 0),
             (sys::MSR_IA32_FMASK, FMASK_VALUE),
             (sys::MSR_KERNEL_GS_BASE, 0),
+            (sys::MSR_TSC_AUX, 0),
         ];
         let mut msrs = sys::kvm_msrs {
             nmsrs: entries.len() as u32,
