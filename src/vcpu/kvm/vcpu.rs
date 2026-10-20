@@ -1,21 +1,16 @@
 //! The KVM virtual CPU: one guest thread on a KVM vcpu fd.
 //!
 //! Execution model (long mode, guest at CPL3):
-//! * Guest RAM ([`GuestMemory`]) is one contiguous region mapped as slot 0 of
-//!   the backend's VM at `guest_phys == base`; the fixed identity page tables
-//!   in the control block (see [`super::vm`]) make guest virtual == guest
-//!   physical, so the flat address space the interpreter models maps 1:1 onto
-//!   hardware. The VM re-issues the slot whenever
-//!   [`GuestMemory::backing_generation`] changes (fork/execve).
+//! * Guest RAM is a shared physical pool, mapped as slot 0 of the VM. Each
+//!   address space has its own page tables, selected by CR3.
 //! * A guest `syscall` vectors to the `hlt; sysretq` trampoline at CPL0; the
 //!   `hlt` exits to the host as `KVM_EXIT_HLT` → [`Exit::Syscall`]. The kernel
 //!   writes the return value into `rax` ([`KvmVcpu::set_syscall_ret`]) and the
 //!   resumed `sysretq` returns to CPL3 at the user `rip`/`rflags` that
 //!   `syscall` saved in `rcx`/`r11`.
-//! * A guest access to a guest-physical hole (no memory slot) exits as
-//!   `KVM_EXIT_MMIO` → [`Exit::MemFault`]. A CPU exception (the IDT is empty)
-//!   escalates to a triple fault → `KVM_EXIT_SHUTDOWN`, decoded as a fault at
-//!   `cr2` when one is recorded.
+//! * #PF, #GP and #UD enter supervisor HLT trampolines through the IDT. The
+//!   host recovers the original user state from the exception frame. CR4.TSD
+//!   traps RDTSC through #GP; we decode it and supply a logical counter.
 //!
 //! Register state is cached host-side: refreshed from the vcpu after every
 //! `KVM_RUN`, flushed back (when dirty) before the next. That makes the
@@ -25,13 +20,15 @@
 
 use super::sys;
 use super::vm::{
-    FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE, Vm, check,
+    FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, GP_TRAMP_VA, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE,
+    UD_TRAMP_VA, Vm, check,
 };
-use crate::vcpu::mem::PAGE_SIZE;
+use crate::vcpu::ctrl::KSTACK_TOP;
 use crate::vcpu::phys::PhysMem;
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
+use iced_x86::Code;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Per-thread wall-clock preemption for `KVM_RUN`.
 ///
@@ -181,7 +178,8 @@ const CR0_LONG: u64 = 0x8005_0033;
 /// x87|SSE|AVX via `KVM_SET_XCRS`. Without OSXSAVE a runtime's AVX probe (which
 /// checks OSXSAVE then `xgetbv`) reports AVX unavailable and may fall back to a
 /// slower/rarer path.
-const CR4_LONG: u64 = 0x620 | 0x4_0000;
+// TSD (bit 2) makes CPL3 RDTSC fault so it cannot expose the hardware clock.
+const CR4_LONG: u64 = 0x620 | 0x4_0000 | (1 << 2);
 
 /// `XCR0` value: enable x87 (bit 0), SSE (bit 1) and AVX (bit 2) xsave state.
 const XCR0_AVX: u64 = 0x7;
@@ -425,7 +423,7 @@ impl KvmVcpu {
     }
 
     /// Flush dirty caches to the vcpu, run it once, and refresh the caches.
-    fn run_once(&mut self) -> Result<u32, VcpuError> {
+    fn run_once(&mut self, quantum: Option<Duration>) -> Result<u32, VcpuError> {
         if self.regs_dirty {
             // SAFETY: valid struct pointer; the fd is live.
             let ret =
@@ -472,13 +470,13 @@ impl KvmVcpu {
         // exits is broken out after the quantum: the timer signal interrupts
         // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
         // after so a late expiry can't fire into an unrelated later slice.
-        if let Some(q) = self.quantum {
+        if let Some(q) = quantum {
             preempt::arm(q);
         }
         // SAFETY: `KVM_RUN` takes no argument; the fd is live and not run
         // concurrently (see the `Send` note).
         let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_RUN, 0) };
-        if self.quantum.is_some() {
+        if quantum.is_some() {
             preempt::disarm();
         }
         let interrupted = if ret < 0 {
@@ -526,11 +524,18 @@ impl KvmVcpu {
     /// solely to read the value written at a debug watchpoint; the lockless SMP
     /// path passes `None` (no `GuestMemory` borrow is held) and logs the hit
     /// without the value. Everything else — fault-frame recovery, exit decode —
-    /// reads the control block via `self.vm`, never guest memory, so it works
+    /// reads the cached physical pool and CR3, so it works
     /// identically with or without `mem`.
     fn run_loop(&mut self, mem: Option<&GuestMemory>) -> Result<Exit, VcpuError> {
+        let started = Instant::now();
         loop {
-            let reason = self.run_once()?;
+            // Count time across internal exits too: a loop containing only
+            // trapped RDTSC must yield even though each KVM_RUN is brief.
+            let remaining = self.quantum.map(|q| q.saturating_sub(started.elapsed()));
+            if remaining.is_some_and(|q| q.is_zero()) {
+                return Ok(Exit::Interrupted);
+            }
+            let reason = self.run_once(remaining)?;
             // Debug watchpoint hit: log the write (value + faulting pc) and
             // resume — the write already completed (a data #DB is a trap).
             if reason == sys::KVM_EXIT_DEBUG {
@@ -565,100 +570,147 @@ impl KvmVcpu {
                 }
                 continue;
             }
-            let exit = self.decode_exit(reason)?;
+            let Some(exit) = self.decode_exit(reason)? else {
+                continue;
+            };
             if exit == Exit::Syscall {
+                // Count actual guest entry once. A blocked syscall is delivered
+                // again through in_syscall without running or ticking here.
+                self.vm.tick();
                 self.in_syscall = true;
             }
             return Ok(exit);
         }
     }
 
-    /// Decode one exit reason into an [`Exit`].
-    fn decode_exit(&mut self, reason: u32) -> Result<Exit, VcpuError> {
-        match reason {
-            // A `hlt` exit is either the syscall trampoline or the #PF
-            // trampoline; the vcpu `rip` (just past the executed `hlt`)
-            // distinguishes them.
+    /// Recover a CPL3 exception frame and restore the state exposed to the kernel.
+    /// #PF and #GP push an error code; #UD pushes only RIP, CS, RFLAGS, RSP, SS.
+    fn restore_exception(&mut self, error_code: bool) -> Result<u64, VcpuError> {
+        let words = if error_code { 6 } else { 5 };
+        let expected_sp = KSTACK_TOP - words * 8;
+        if self.regs.rsp != expected_sp || self.sregs.cs.selector != crate::vcpu::ctrl::SEL_KCODE {
+            return Err(VcpuError::Backend(
+                "exception outside the user exception stack".into(),
+            ));
+        }
+        let phys = self
+            .phys
+            .as_ref()
+            .ok_or_else(|| VcpuError::Backend("missing exception stack".into()))?;
+        let pa = self.kstack_pa + crate::vcpu::mem::PAGE_SIZE - words * 8;
+        let offset = u64::from(error_code) * 8;
+        let at = |i: u64| phys.read_u64(pa + offset + i * 8);
+        if at(1) != u64::from(SEL_UCODE) || at(4) != u64::from(SEL_UDATA) {
+            return Err(VcpuError::Backend(
+                "exception did not originate in user mode".into(),
+            ));
+        }
+        let err = if error_code { phys.read_u64(pa) } else { 0 };
+        self.regs.rip = at(0);
+        self.regs.rflags = at(2);
+        self.regs.rsp = at(3);
+        self.regs_dirty = true;
+        self.sregs.cs = user_cs();
+        self.sregs.ss = user_ss();
+        self.sregs_dirty = true;
+        Ok(err)
+    }
+
+    /// `None` means an intercepted instruction completed; resume internally.
+    fn decode_exit(&mut self, reason: u32) -> Result<Option<Exit>, VcpuError> {
+        let exit = match reason {
             sys::KVM_EXIT_HLT if self.regs.rip == FAULT_TRAMP_VA + 1 => {
-                // A page fault vectored here at CPL0. The CPU pushed
-                // [error_code, RIP, CS, RFLAGS, RSP, SS] onto the kernel stack
-                // (now `rsp`). Recover the faulting user state so accessors and
-                // signal delivery see it, and report the fault at cr2.
-                let ksp = self.regs.rsp;
-                // The frame sits in this address space's private kstack page; read
-                // it from that frame's pool physical address (cached in `sync_cr3`)
-                // so concurrent sibling faults never read one another's frame.
-                let frame = self.phys.as_ref().map(|ph| {
-                    let at = |va: u64| ph.read_u64(self.kstack_pa + (va & (PAGE_SIZE - 1)));
-                    (at(ksp), at(ksp + 8), at(ksp + 24), at(ksp + 32))
-                });
-                if let Some((err, fault_rip, fault_rflags, fault_rsp)) = frame {
-                    self.regs.rip = fault_rip;
-                    self.regs.rsp = fault_rsp;
-                    self.regs.rflags = fault_rflags;
-                    self.regs_dirty = true; // resume re-runs the faulting instruction
-                    // The exception entered CPL0; restore the user segments so
-                    // the resumed guest runs at CPL3, not with kernel privilege
-                    // (and so its next fault switches to RSP0 again).
-                    self.sregs.cs = user_cs();
-                    self.sregs.ss = user_ss();
-                    self.sregs_dirty = true;
-                    Ok(Exit::MemFault {
-                        addr: self.sregs.cr2,
-                        write: err & 0x2 != 0, // #PF error-code bit 1 = write
-                    })
-                } else {
-                    // The frame wasn't on the kernel stack (unexpected); fall
-                    // back to a bare fault at cr2 rather than crashing.
-                    Ok(Exit::MemFault {
-                        addr: self.sregs.cr2,
-                        write: false,
-                    })
+                let err = self.restore_exception(true)?;
+                Exit::MemFault {
+                    addr: self.sregs.cr2,
+                    write: err & 2 != 0,
                 }
             }
-            // The trampoline's `hlt` — a guest `syscall`. (With no in-kernel
-            // irqchip, `hlt` exits straight to userspace and the next KVM_RUN
-            // resumes after it, at the `sysretq`.)
-            sys::KVM_EXIT_HLT => Ok(Exit::Syscall),
+            sys::KVM_EXIT_HLT if self.regs.rip == GP_TRAMP_VA + 1 => {
+                let err = self.restore_exception(true)?;
+                if err == 0 {
+                    let decoded = super::instruction::decode(
+                        self.sregs.cr3,
+                        self.phys
+                            .as_ref()
+                            .expect("exception recovery requires physical memory"),
+                        self.regs.rip,
+                    );
+                    match decoded {
+                        Ok(instruction) if instruction.code() == Code::Rdtsc => {
+                            let tsc = self.vm.tick();
+                            self.regs.rax = u64::from(tsc as u32);
+                            self.regs.rdx = tsc >> 32;
+                            self.regs.rip = instruction.next_ip();
+                            // Fault delivery sets RF in the saved image. The
+                            // emulated instruction completed, so consume RF.
+                            self.regs.rflags &= !(1 << 16);
+                            return Ok(None);
+                        }
+                        Err(exit) => return Ok(Some(exit)),
+                        _ => {}
+                    }
+                }
+                Exit::ProtectionFault { pc: self.regs.rip }
+            }
+            sys::KVM_EXIT_HLT if self.regs.rip == UD_TRAMP_VA + 1 => {
+                self.restore_exception(false)?;
+                Exit::IllegalInstruction { pc: self.regs.rip }
+            }
+            // SYSCALL enters CPL0; the next run resumes at SYSRETQ.
+            sys::KVM_EXIT_HLT if self.regs.rip == LSTAR_VA + 1 => Exit::Syscall,
             sys::KVM_EXIT_MMIO => {
                 // SAFETY: the union's `mmio` arm is the one the kernel wrote
                 // for this exit reason; all fields are plain old data.
                 let mmio = unsafe { (*self.run).exit.mmio };
-                Ok(Exit::MemFault {
+                Exit::MemFault {
                     addr: mmio.phys_addr,
                     write: mmio.is_write != 0,
-                })
+                }
             }
-            // Triple fault. The IDT has a #PF gate, so genuine page faults are
-            // delivered through the trampoline above and never reach here (the
-            // kstack is a pinned control-block frame, so #PF delivery cannot
-            // itself fault). A SHUTDOWN is therefore an exception we don't handle
-            // — #UD, #GP, #BP, … — reported as an illegal instruction at the
-            // faulting `rip`. (cr2 is deliberately *not* consulted: it is sticky
-            // from the last real #PF, so with demand paging it is almost always
-            // non-zero and would misattribute a #UD as a bogus memory fault.)
-            sys::KVM_EXIT_SHUTDOWN => Ok(Exit::IllegalInstruction { pc: self.regs.rip }),
-            sys::KVM_EXIT_INTR => Ok(Exit::Interrupted),
+            // Exceptions without an IDT gate still escalate to a triple fault.
+            sys::KVM_EXIT_SHUTDOWN => Exit::IllegalInstruction { pc: self.regs.rip },
+            sys::KVM_EXIT_INTR => {
+                // The address space's exception stack is shared by its threads.
+                // Consume any live frame before yielding the memory lock to a
+                // sibling. On the next slice, retry the original user instruction.
+                let pc = self.regs.rip;
+                // User RIP may name a trampoline before its supervisor-page
+                // fetch faults; an interrupted CPL3 fetch has no frame to recover.
+                if self.sregs.cs.selector == crate::vcpu::ctrl::SEL_KCODE {
+                    if (FAULT_TRAMP_VA..=FAULT_TRAMP_VA + 1).contains(&pc)
+                        || (GP_TRAMP_VA..=GP_TRAMP_VA + 1).contains(&pc)
+                    {
+                        self.restore_exception(true)?;
+                    } else if (UD_TRAMP_VA..=UD_TRAMP_VA + 1).contains(&pc) {
+                        self.restore_exception(false)?;
+                    }
+                }
+                Exit::Interrupted
+            }
             sys::KVM_EXIT_FAIL_ENTRY => {
                 // SAFETY: as `mmio` — the arm matching the exit reason.
                 let fail = unsafe { (*self.run).exit.fail_entry };
-                Err(VcpuError::Backend(format!(
+                return Err(VcpuError::Backend(format!(
                     "KVM_EXIT_FAIL_ENTRY (hardware reason {:#x})",
                     fail.hardware_entry_failure_reason
-                )))
+                )));
             }
             sys::KVM_EXIT_INTERNAL_ERROR => {
                 // SAFETY: as `mmio` — the arm matching the exit reason.
                 let internal = unsafe { (*self.run).exit.internal };
-                Err(VcpuError::Backend(format!(
+                return Err(VcpuError::Backend(format!(
                     "KVM_EXIT_INTERNAL_ERROR (suberror {})",
                     internal.suberror
-                )))
+                )));
             }
-            other => Err(VcpuError::Backend(format!(
-                "unexpected KVM exit reason {other}"
-            ))),
-        }
+            other => {
+                return Err(VcpuError::Backend(format!(
+                    "unexpected KVM exit reason {other}"
+                )));
+            }
+        };
+        Ok(Some(exit))
     }
 
     /// Architectural x86 register index → cached `kvm_regs` field. The trait
@@ -806,9 +858,7 @@ fn init_user_sregs(sregs: &mut sys::kvm_sregs) {
         limit: GDT_LIMIT,
         padding: [0; 3],
     };
-    // IDT with a #PF gate (see the control block); a page fault vectors to the
-    // fault trampoline and exits cleanly with the real register state, instead
-    // of triple-faulting (which loses it). Other exceptions still triple-fault.
+    // #PF, #GP and #UD gates preserve the user register state on the kernel stack.
     sregs.idt = sys::kvm_dtable {
         base: super::vm::IDT_BASE,
         limit: 0xFFF,
@@ -1009,42 +1059,9 @@ impl Vcpu for KvmVcpu {
     }
 
     fn vdso_calibration(&self) -> Option<crate::vcpu::VdsoCal> {
-        // Guest TSC frequency (kHz) — the ioctl returns it directly.
-        // SAFETY: `KVM_GET_TSC_KHZ` takes no argument; the fd is a live vcpu.
-        let khz = unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_TSC_KHZ, 0) };
-        let tsc_khz = u64::try_from(khz).ok().filter(|&k| k > 0)?;
-        // ns ≈ tsc_delta * 1e6 / tsc_khz. As a fixed-point multiply-shift with
-        // shift = 32: mult = round(1e6 * 2^32 / tsc_khz). For 1–5 GHz this is
-        // ~1.7e9 down to ~8.6e8, comfortably within u64, and the vDSO's 128-bit
-        // `mul` + `shrd` keeps full precision.
-        let shift: u64 = 32;
-        let mult = ((1_000_000u128 << shift) / u128::from(tsc_khz)) as u64;
-
-        // Read the guest TSC (IA32_TSC) and the host clocks as close together as
-        // possible so the vDSO's TSC-derived time matches the syscall clock (which
-        // reads the same host sources). `CLOCK_MONOTONIC` and `CLOCK_REALTIME`
-        // have distinct bases: the vDSO adds the scaled TSC delta to whichever the
-        // guest asked for, exactly as the clock-aware `sys_clock_gettime` does.
-        let mut msrs = sys::kvm_msrs {
-            nmsrs: 1,
-            pad: 0,
-            entries: [sys::kvm_msr_entry::default(); sys::MSRS_CAP],
-        };
-        msrs.entries[0].index = 0x10; // IA32_TSC
-        // SAFETY: valid struct; `nmsrs = 1` bounds the entries read/written.
-        let got =
-            unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_MSRS, std::ptr::from_mut(&mut msrs)) };
-        if got != 1 {
-            return None;
-        }
-        let base_tsc = msrs.entries[0].data;
-        Some(crate::vcpu::VdsoCal {
-            mult,
-            shift,
-            base_tsc,
-            base_mono_ns: crate::clock::now_monotonic().as_nanos() as u64,
-            base_wall_ns: crate::clock::now_unix().as_nanos() as u64,
-        })
+        // RDTSC counts logical events rather than host time. Leave vvar uncalibrated so
+        // the vDSO uses clock syscalls, whose clock policy is owned by the kernel.
+        None
     }
 
     fn settle_syscall_return(&mut self) {

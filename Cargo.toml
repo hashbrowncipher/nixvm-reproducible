@@ -34,8 +34,9 @@ required-features = ["cli"]
 default = ["cli"]
 # CLI-only deps (clap, tracing-subscriber, …) get added here in a later phase.
 cli = []
-# Hardware virtualization backends. Both link no extra crates (hand-rolled FFI)
-# and `vcpu::select` probes them at runtime, falling back to the interpreter
+# Hardware virtualization backends use hand-rolled FFI; KVM uses iced-x86 to
+# decode instructions intercepted through guest exceptions.
+# `vcpu::select` probes them at runtime, falling back to the interpreter
 # when unavailable (HVF: unentitled binary; KVM: no /dev/kvm). KVM is compiled
 # by target cfg alone. HVF additionally needs this feature: it predates the
 # paged GuestMemory (it maps guest RAM flat, MMU off) and doesn't build against
@@ -70,8 +71,8 @@ fetch = ["dep:ureq"]
 tunnel = ["dep:pktkit"]
 
 [dependencies]
-# The core links no third-party runtime dependencies. Optional runtime libraries
-# are feature-gated; the host-only CPUID parser is under build-dependencies.
+# Portable runtime libraries are feature-gated. The KVM instruction decoder is
+# target-gated; the host-only CPUID parser is under build-dependencies.
 # `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
 # Since 0.4.28 each filesystem is its own feature (a `default-features = false`
 # build gets none and doesn't compile); enable the ones nixvm reads/builds:
@@ -102,6 +103,9 @@ pktkit = { version = "0.1.11", optional = true, default-features = false, featur
 [build-dependencies]
 serde = { version = "=1.0.228", features = ["derive"] }
 toml = { version = "=0.8.23", default-features = false, features = ["parse"] }
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Only pulled in on wasm32, and only linked when the `wasm` feature is on

@@ -317,7 +317,7 @@ pub trait Vcpu: Send {
     /// One-time vDSO clock calibration: read the guest TSC frequency and its
     /// current value and correlate it with the host wall clock, so the guest's
     /// `vdso` can compute `clock_gettime` from `rdtsc` with no syscall. `None`
-    /// when the backend can't (the interpreter — no real TSC) or calibration
+    /// when the backend uses a logical TSC (KVM and the interpreter) or calibration
     /// failed; the caller then leaves the vvar page zeroed and the vDSO falls
     /// back to the syscall. Read once, before the guest runs.
     fn vdso_calibration(&self) -> Option<VdsoCal> {

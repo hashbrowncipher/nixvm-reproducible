@@ -18,6 +18,7 @@
 //! under plain `cargo test` wherever `/dev/kvm` exists, and skip themselves
 //! where it doesn't.
 
+mod instruction;
 mod sys;
 mod vcpu;
 mod vm;

@@ -1,4 +1,4 @@
-//! A minimal x86-64 vDSO so the guest can read the clock **without a syscall**.
+//! A minimal x86-64 vDSO with optional TSC clock calibration.
 //!
 //! Clock-polling runtimes (Bun/JSC issues ~89% `clock_gettime`) otherwise pay a
 //! full KVM exit per clock read (~6µs) where native hardware pays a vDSO read
@@ -17,6 +17,8 @@
 //! also punts (`CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID` and anything
 //! above `CLOCK_MONOTONIC_COARSE`) — so it only ever *adds* a fast path and never
 //! returns a wrong answer for a clock it doesn't truly compute.
+//! KVM and the interpreter use a logical TSC and leave vvar uncalibrated, so
+//! their clock functions take the syscall path.
 //!
 //! Both the code and the vvar page live in the shared control block
 //! ([`super::ctrl`]) mapped user-readable/executable into every address space at

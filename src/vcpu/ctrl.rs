@@ -4,7 +4,7 @@
 //! user memory now lives in real per-process page tables ([`super::pagetable`])
 //! over one shared physical pool ([`super::phys`]). But a KVM guest at CPL3 still
 //! needs a fixed supervisor scaffold to trap syscalls and faults into: a GDT, an
-//! IDT (only `#PF`), a 64-bit TSS (with `RSP0` = the kernel stack top), the
+//! IDT (`#PF`, `#GP`, `#UD`), a 64-bit TSS (with `RSP0` = the kernel stack top), the
 //! `hlt; sysretq` syscall trampoline `IA32_LSTAR` points at, and the `#PF`
 //! trampoline (`hlt`). This module owns that scaffold.
 //!
@@ -60,6 +60,9 @@ pub const GDT_BASE: u64 = CTRL_GPA + GDT_OFF;
 /// The `#PF` trampoline's virtual address (the host recognizes a fault exit by
 /// the vcpu `rip` landing just past it).
 pub const FAULT_TRAMP_VA: u64 = CTRL_GPA + FAULT_TRAMP_OFF;
+/// General-protection and invalid-opcode exception trampolines.
+pub const GP_TRAMP_VA: u64 = FAULT_TRAMP_VA + 0x10;
+pub const UD_TRAMP_VA: u64 = FAULT_TRAMP_VA + 0x20;
 /// Linear address of the IDT and of the TSS.
 #[cfg_attr(
     not(all(target_os = "linux", target_arch = "x86_64")),
@@ -78,8 +81,7 @@ pub const KSTACK_TOP: u64 = CTRL_GPA + KSTACK_OFF + 0x1000;
 ///
 /// This isolates distinct processes (the overwhelmingly common concurrent case).
 /// `CLONE_THREAD` siblings that share one address space still share this frame;
-/// making the kstack fully per-vcpu (a per-vcpu `RSP0`/TSS) is the follow-up for
-/// heavily-threaded SMP guests.
+/// the scheduler serializes their execution under the address-space memory lock.
 pub const KSTACK_PAGE_VA: u64 = CTRL_GPA + KSTACK_OFF;
 
 /// Virtual base of the vDSO ELF image (user-readable/executable) — the value the
@@ -214,19 +216,22 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     phys.write(tss_pa + 4, &KSTACK_TOP.to_le_bytes());
     phys.write(tss_pa + 102, &0x68u16.to_le_bytes()); // iomap base past the TSS
 
-    // IDT entry 14 (#PF) → the fault trampoline (64-bit interrupt gate, CPL0).
-    let off = FAULT_TRAMP_VA;
-    let gate_lo = (off & 0xFFFF)
-        | (u64::from(SEL_KCODE) << 16)
-        | (0x8Eu64 << 40)
-        | (((off >> 16) & 0xFFFF) << 48);
-    let gate_hi = (off >> 32) & 0xFFFF_FFFF;
-    phys.write(idt_pa + 14 * 16, &gate_lo.to_le_bytes());
-    phys.write(idt_pa + 14 * 16 + 8, &gate_hi.to_le_bytes());
+    // 64-bit interrupt gates, CPL0. Exceptions preserve the user state on RSP0.
+    for (vector, off) in [(6, UD_TRAMP_VA), (13, GP_TRAMP_VA), (14, FAULT_TRAMP_VA)] {
+        let gate_lo = (off & 0xFFFF)
+            | (u64::from(SEL_KCODE) << 16)
+            | (0x8Eu64 << 40)
+            | (((off >> 16) & 0xFFFF) << 48);
+        let gate_hi = (off >> 32) & 0xFFFF_FFFF;
+        phys.write(idt_pa + vector * 16, &gate_lo.to_le_bytes());
+        phys.write(idt_pa + vector * 16 + 8, &gate_hi.to_le_bytes());
+    }
 
     // Trampolines: the syscall one (`IA32_LSTAR`) and the #PF one.
     phys.write(tramp_pa, &[0xF4, 0x48, 0x0F, 0x07]); // hlt ; sysretq
     phys.write(fault_pa, &[0xF4]); // hlt
+    phys.write(fault_pa + 0x10, &[0xF4]); // #GP: hlt
+    phys.write(fault_pa + 0x20, &[0xF4]); // #UD: hlt (no CPU error code)
 
     // vDSO ELF image (its clock code reads the vvar page at VVAR_VA). The vvar
     // frame is left zeroed — `mult == 0` makes the vDSO fall back to the syscall

@@ -80,6 +80,11 @@ fn table_index(vaddr: u64, level: u32) -> u64 {
 /// the leaf carries the real protection.
 const INTERIOR: u64 = P | RW | US;
 
+/// Whether an address is canonical under four-level x86-64 paging.
+pub(crate) fn is_canonical(vaddr: u64) -> bool {
+    ((vaddr << 16) as i64 >> 16) as u64 == vaddr
+}
+
 /// PTE flags for a leaf page with protection `prot`. `supervisor` clears `US` so
 /// the page is reachable only from ring 0 (for a supervisor-only control block).
 /// `RW` follows `Prot::WRITE`; `NX` is set unless `Prot::EXEC`.
@@ -249,17 +254,39 @@ impl AddrSpace {
     /// leaf's protection. `None` if any level (including the leaf) is not present.
     #[must_use]
     pub fn translate(&self, vaddr: u64, phys: &PhysMem) -> Option<Translation> {
-        let leaf_pa = self.leaf_pte_pa(phys, vaddr)?;
-        let entry = phys.read_u64(leaf_pa);
-        if entry & P == 0 {
+        Self::translate_cr3(self.pml4, vaddr, phys)
+    }
+
+    /// Walk a cached CR3 without borrowing the owning address space. KVM uses
+    /// this to fetch faulting user instructions on the lockless run path.
+    pub(crate) fn translate_cr3(cr3: u64, vaddr: u64, phys: &PhysMem) -> Option<Translation> {
+        if !is_canonical(vaddr) {
             return None;
         }
-        let frame = entry & ADDR_MASK;
-        Some(Translation {
-            paddr: frame | (vaddr & (PAGE_SIZE - 1)),
-            prot: leaf_prot(entry),
-            supervisor: entry & US == 0,
-        })
+        let mut table = cr3 & ADDR_MASK;
+        let mut effective = INTERIOR;
+        for level in (1..=PML4_LEVEL).rev() {
+            if table.checked_add(PAGE_SIZE)? > phys.len() as u64 {
+                return None;
+            }
+            let entry = Self::entry(phys, table, table_index(vaddr, level));
+            // The address-space builder uses only 4 KiB leaves.
+            if entry & P == 0 || (level > 1 && entry & (1 << 7) != 0) {
+                return None;
+            }
+            effective &= entry | !(RW | US);
+            effective |= entry & NX;
+            table = entry & ADDR_MASK;
+            if level == 1 {
+                let paddr = table | (vaddr & (PAGE_SIZE - 1));
+                return (paddr < phys.len() as u64).then_some(Translation {
+                    paddr,
+                    prot: leaf_prot(effective),
+                    supervisor: effective & US == 0,
+                });
+            }
+        }
+        None
     }
 
     /// Rewrite the permission bits of an existing leaf (same frame). Returns

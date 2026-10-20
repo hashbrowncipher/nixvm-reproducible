@@ -25,13 +25,13 @@ use crate::vcpu::mem::GuestMemory;
 use crate::vcpu::phys::PhysMem;
 use std::ffi::c_int;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // Re-export the control-block virtual addresses and selectors the vcpu wires into
 // its sregs/MSRs, so vcpu.rs keeps importing them from `super::vm`.
 pub use crate::vcpu::ctrl::{
-    FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, IDT_BASE, LSTAR_VA, SEL_TSS, SEL_UCODE, SEL_UDATA,
-    STAR_VALUE, TSS_BASE,
+    FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, GP_TRAMP_VA, IDT_BASE, LSTAR_VA, SEL_TSS, SEL_UCODE,
+    SEL_UDATA, STAR_VALUE, TSS_BASE, UD_TRAMP_VA,
 };
 
 /// An owned Unix fd that closes on drop.
@@ -74,6 +74,9 @@ pub struct Vm {
     /// none). All address spaces share this pool, so it is registered exactly once.
     pool: Mutex<Option<std::sync::Arc<PhysMem>>>,
     next_vcpu_id: AtomicU32,
+    /// Logical time shared by every vcpu and address space in this VM. RDTSC
+    /// and syscall entry each advance it by one tick.
+    tsc: AtomicU64,
 }
 
 // SAFETY: `Vm` is shared (`Arc`) across the vcpus of one kernel. The pool handle
@@ -151,6 +154,7 @@ impl Vm {
             xsave_get,
             pool: Mutex::new(None),
             next_vcpu_id: AtomicU32::new(0),
+            tsc: AtomicU64::new(0),
         })
     }
 
@@ -226,6 +230,10 @@ impl Vm {
 
     pub fn cpuid(&self) -> &sys::kvm_cpuid2 {
         &self.cpuid
+    }
+
+    pub fn tick(&self) -> u64 {
+        self.tsc.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
     pub fn xsave_size(&self) -> usize {
