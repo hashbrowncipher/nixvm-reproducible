@@ -231,6 +231,10 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
         None
     }
+
+    /// Visit every device filesystem whose randomness the kernel binds to its
+    /// shared stream. Composed backends forward the visitor to every child.
+    fn visit_devfs_mut(&mut self, _visitor: &mut dyn FnMut(&mut DevFs)) {}
 }
 
 fn erofs() -> io::Error {

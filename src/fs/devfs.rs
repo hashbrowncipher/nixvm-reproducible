@@ -5,7 +5,7 @@
 //! `kmsg`) plus a handful of extra character devices (`loop-control`, `rtc0`,
 //! `hpet`, `fuse`, `vga_arbiter`) and block devices (`loop0`..`loop7`,
 //! `ram0`), without any real hardware behind them. The backend is otherwise
-//! stateless apart from a small PRNG used to feed `/dev/random` and
+//! stateless apart from a seeded ChaCha20 stream used to feed `/dev/random` and
 //! `/dev/urandom`.
 //!
 //! Also provides the standard `/dev/fd`, `/dev/std{in,out,err}`, `/dev/rtc`
@@ -28,6 +28,8 @@
 //! device names, directories, and symlinks.
 
 use std::io;
+
+use crate::random::RandomSource;
 
 use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime, TmpFs};
 
@@ -127,9 +129,7 @@ const SYMLINKS: &[(&str, u64, &str)] = &[
 /// The synthesized `/dev` backend.
 #[derive(Debug)]
 pub struct DevFs {
-    /// xorshift64 state for `/dev/random` and `/dev/urandom`. `0` means
-    /// "not yet seeded"; seeding happens lazily on first use.
-    rng: u64,
+    random: RandomSource,
     /// The writable tmpfs behind `/dev/shm`.
     shm: TmpFs,
 }
@@ -143,10 +143,25 @@ impl Default for DevFs {
 impl DevFs {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_random_seed([0; 32])
+    }
+
+    /// Seed standalone device reads explicitly. Attaching this filesystem to a
+    /// kernel replaces this source with the kernel's shared randomness stream.
+    #[must_use]
+    pub fn with_random_seed(seed: [u8; 32]) -> Self {
+        Self::with_random_source(RandomSource::new(seed))
+    }
+
+    pub(crate) fn with_random_source(random: RandomSource) -> Self {
         Self {
-            rng: 0,
+            random,
             shm: TmpFs::new(),
         }
+    }
+
+    pub(crate) fn set_random_source(&mut self, random: RandomSource) {
+        self.random = random;
     }
 
     /// The path inside the `/dev/shm` tmpfs for a mount-relative `rel`
@@ -256,31 +271,6 @@ impl DevFs {
             rdev,
         }
     }
-
-    /// Next pseudo-random `u64` from the internal xorshift64 generator, seeding
-    /// lazily from the wall clock on first use.
-    fn next_u64(&mut self) -> u64 {
-        if self.rng == 0 {
-            // wasm32-safe clock (see `crate::clock`).
-            let nanos = crate::clock::now_unix().as_nanos() as u64;
-            // `| 1` guarantees a non-zero seed (xorshift is stuck at 0).
-            self.rng = nanos | 1;
-        }
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.rng = x;
-        x
-    }
-
-    /// Fill `buf` with pseudo-random bytes.
-    fn fill_random(&mut self, buf: &mut [u8]) {
-        for chunk in buf.chunks_mut(8) {
-            let bytes = self.next_u64().to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
-        }
-    }
 }
 
 /// Tag on `/dev/shm` entries' inodes so they never collide with the fixed
@@ -328,6 +318,10 @@ fn eagain() -> io::Error {
 }
 
 impl MountFs for DevFs {
+    fn visit_devfs_mut(&mut self, visitor: &mut dyn FnMut(&mut Self)) {
+        visitor(self);
+    }
+
     fn read_only(&self) -> bool {
         false
     }
@@ -416,7 +410,7 @@ impl MountFs for DevFs {
                 Ok(buf.len())
             }
             "random" | "urandom" => {
-                self.fill_random(buf);
+                self.random.fill(buf);
                 Ok(buf.len())
             }
             // /dev/net/tun: open succeeds, but there is no queued traffic and
@@ -626,6 +620,17 @@ mod tests {
         let mut buf = [0xffu8; 4];
         assert_eq!(fs.read_at("full", 0, &mut buf).unwrap(), 4);
         assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn random_default_replays() {
+        let mut first = DevFs::new();
+        let mut second = DevFs::new();
+        let mut expected = [0; 64];
+        let mut actual = [0; 64];
+        first.read_at("random", 0, &mut expected).unwrap();
+        second.read_at("urandom", 0, &mut actual).unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

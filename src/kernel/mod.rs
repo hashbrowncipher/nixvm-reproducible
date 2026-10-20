@@ -25,6 +25,7 @@ use crate::abi::arch::{self, Sysno};
 use crate::abi::errno::Errno;
 use crate::fs::{Attrs, MountTable, NodeKind};
 use crate::loader::{ProcessSpec, interp_path, load_dynamic, load_static};
+use crate::random::RandomSource;
 use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
@@ -1166,6 +1167,8 @@ impl ServiceCtx {
 #[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub struct Kernel {
     arch: Arch,
+    /// Shared by all tasks, getrandom and device mounts. Its lock is a leaf.
+    random: RandomSource,
     /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
     /// hitting the host `stdin`, so the embedder can pump input in between runs.
@@ -1275,7 +1278,6 @@ pub(super) struct Shared {
     /// The last interactive-stdin read found the buffer empty and parked: the
     /// guest is waiting for the user (see [`Kernel::awaiting_input`]).
     stdin_waiting: bool,
-    rng_state: u64,
     /// The tracked `RLIMIT_NOFILE` `(soft, hard)`. Programs (node/V8) binary-
     /// search `setrlimit` to raise it to the maximum, then loop over `[0,
     /// soft)` marking fds cloexec — so the hard cap must be *bounded* or that
@@ -1582,8 +1584,18 @@ impl Shared {
 impl Kernel {
     #[must_use]
     pub fn new(arch: Arch, mounts: MountTable) -> Self {
+        Self::with_random_seed(arch, mounts, [0; 32])
+    }
+
+    /// Use one explicitly seeded ChaCha20 stream for getrandom and every
+    /// mounted DevFs. The seed is the only initial randomness input.
+    #[must_use]
+    pub fn with_random_seed(arch: Arch, mut mounts: MountTable, seed: [u8; 32]) -> Self {
+        let random = RandomSource::new(seed);
+        mounts.set_random_source(&random);
         Self {
             arch,
+            random,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
             slice_cap: std::env::var("NIXVM_SLICE")
@@ -1608,7 +1620,6 @@ impl Kernel {
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
                 stderr: Box::new(std::io::stderr()),
-                rng_state: 0,
                 rlimit_nofile: (1024, 4096),
                 memfd_seq: 0,
                 umask: 0o022,
@@ -3579,7 +3590,7 @@ impl Kernel {
                     err(Errno::EBADF)
                 }
             }
-            Sysno::Getrandom => self.sys_getrandom(sh, args[0], args[1], args[2], mem),
+            Sysno::Getrandom => self.sys_getrandom(args[0], args[1], args[2], mem),
             // mlock/munlock/mlock2(addr, len[, flags]): nothing is ever paged
             // out, so locking is a no-op — after Linux's checks: the range must
             // be mapped (ENOMEM), mlock2 takes only MLOCK_ONFAULT, and mlockall
@@ -4205,6 +4216,9 @@ impl Kernel {
             vcpu: Some(child_vcpu),
             info,
         }));
+        if flags & CLONE_VM == 0 {
+            self.random.reseed_for_clone(pid);
+        }
         i64::from(pid)
     }
 
@@ -7931,11 +7945,23 @@ impl Kernel {
         // fd fails before we disturb the address space.
         let file_src = if flags & MAP_ANONYMOUS == 0 {
             match cx.cur.fds.get(fd as i32) {
-                // A shared mapping of /dev/zero is anonymous shared memory.
-                Some(Fd::File { path, .. }) if path == "/dev/zero" && flags & MAP_SHARED != 0 => {
-                    None
+                Some(Fd::File { path, .. }) => {
+                    // Random devices have no mappable storage: page caching would
+                    // replay consumed bytes and retain discarded device writes.
+                    if vfs.stat(path).is_some_and(|attrs| {
+                        attrs.kind == NodeKind::CharDevice
+                            && (attrs.rdev == stat::makedev(1, 8)
+                                || attrs.rdev == stat::makedev(1, 9))
+                    }) {
+                        return err(Errno::ENODEV);
+                    }
+                    // A shared mapping of /dev/zero is anonymous shared memory.
+                    if path == "/dev/zero" && flags & MAP_SHARED != 0 {
+                        None
+                    } else {
+                        Some(path.clone())
+                    }
                 }
-                Some(Fd::File { path, .. }) => Some(path.clone()),
                 Some(_) => return err(Errno::EACCES), // mmap of pipe/socket/dir
                 None => return err(Errno::EBADF),
             }
@@ -8160,22 +8186,12 @@ impl Kernel {
     // ---- misc -------------------------------------------------------------
 
     /// `getrandom(buf, len, flags)`.
-    #[allow(clippy::unused_self)]
     ///
     /// The flags are validated (`GRND_NONBLOCK`, `GRND_RANDOM`,
     /// `GRND_INSECURE`; `RANDOM` with `INSECURE` is `EINVAL`); the pool is
-    /// always "initialized", so none of them changes the output. The
-    /// generator is reseeded from the host's entropy (`/dev/urandom`) when one
-    /// is available, so guest keys and nonces aren't predictable from the
-    /// boot time.
-    fn sys_getrandom(
-        &self,
-        sh: &mut Shared,
-        buf: u64,
-        len: u64,
-        flags: u64,
-        mem: &mut GuestMemory,
-    ) -> i64 {
+    /// always initialized. Output comes only from the sandbox's seeded stream,
+    /// shared with /dev/random and /dev/urandom.
+    fn sys_getrandom(&self, buf: u64, len: u64, flags: u64, mem: &mut GuestMemory) -> i64 {
         const GRND_NONBLOCK: u64 = 1;
         const GRND_RANDOM: u64 = 2;
         const GRND_INSECURE: u64 = 4;
@@ -8186,23 +8202,11 @@ impl Kernel {
         }
         // Linux returns at most 32 MiB - 1 per call.
         let len = len.min((1 << 25) - 1);
-        if sh.rng_state == 0 {
-            let now = match crate::clock::now_unix().as_nanos() as u64 {
-                0 => 0x9E37_79B9_7F4A_7C15,
-                n => n,
-            };
-            sh.rng_state = (now ^ host_entropy()) | 1;
+        if len == 0 {
+            return 0;
         }
         let mut out = vec![0u8; len as usize];
-        for chunk in out.chunks_mut(8) {
-            let mut s = sh.rng_state;
-            s ^= s << 13;
-            s ^= s >> 7;
-            s ^= s << 17;
-            sh.rng_state = s;
-            let bytes = s.to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
-        }
+        self.random.fill(&mut out);
         if mem.write(buf, &out).is_err() {
             return err(Errno::EFAULT);
         }
@@ -8609,21 +8613,6 @@ fn rusage_bytes(cpu_ns: u128) -> [u8; 144] {
     ru
 }
 
-/// 64 bits from the host's entropy pool, or 0 where there is none (wasm).
-fn host_entropy() -> u64 {
-    #[cfg(all(unix, not(target_arch = "wasm32")))]
-    {
-        let mut b = [0u8; 8];
-        if std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut b))
-            .is_ok()
-        {
-            return u64::from_le_bytes(b);
-        }
-    }
-    0
-}
-
 /// Encode an errno as a negative syscall return.
 const fn err(e: Errno) -> i64 {
     -(e.0 as i64)
@@ -8796,6 +8785,8 @@ fn write_stat_or_fault(mem: &mut GuestMemory, addr: u64, attrs: &Attrs, arch: Ar
 
 #[cfg(test)]
 mod tests {
+    mod random;
+
     use super::*;
     use crate::fs::TmpFs;
 
@@ -9840,6 +9831,28 @@ mod tests {
             5
         );
         assert_eq!(mem.read_vec(buf, 5).unwrap(), b"piped");
+    }
+
+    #[test]
+    fn getrandom_default_replays() {
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let (k, mut mem, mut v, mut cx) = setup();
+            let buf = 0x1_0000;
+            assert_eq!(
+                call(
+                    &k,
+                    &mut cx,
+                    &mut mem,
+                    &mut v,
+                    Sysno::Getrandom,
+                    [buf, 64, 0, 0, 0, 0]
+                ),
+                64
+            );
+            outputs.push(mem.read_vec(buf, 64).unwrap());
+        }
+        assert_eq!(outputs[0], outputs[1]);
     }
 
     #[test]
