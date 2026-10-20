@@ -61,7 +61,8 @@ remained within the 260-second limit. No downloads or installs were needed.
 - `nm -D --defined-only`: all three executables export getrandom; the cdylib
   does not. Scoped Rust formatting and `git diff --check` passed.
 
-Independent review is pending. Nothing was merged or pushed. Implementation
+The baseline independent review found one P2 errno bug, corrected below.
+At the initial checkpoint nothing had been merged or pushed. Implementation
 agent: Codex, inherited GPT-6 model; exact model variant and per-agent usage
 counters were unavailable. Diff: 12 files, +1,041/-13 versus f903ee4.
 
@@ -73,3 +74,45 @@ Capital notes, ranked:
 2. Host policy spans the stdlib link boundary and exec lifecycle. The committed
    fresh-process probes and narrow process seam now make that boundary
    reviewable and provide a reusable test base for future startup changes.
+
+## Review correction after merging local master
+
+The baseline review of `1bd7d55` found that successful host RNG calls could
+change errno under real mutex contention. Rust's futex lock can leave EAGAIN
+in libc's thread-local errno even when acquisition succeeds. The original
+uncontended ABI check missed this effect. The reviewer observed 275 changed
+errnos in 240,000 successful requests.
+
+The supervisor merged local master `d9a4faa` into the branch at `9fef7f5`.
+Regression commit `8019ecc` then added 12 barrier-synchronized threads making
+240,000 requests to the actual helper, with errno read immediately after each
+call. On that merged baseline, 253 successful requests changed errno and the
+test failed. The count varies with scheduling; zero changed errnos is the
+required result. This strong native reproduction avoided a production test
+hook or a synthetic lock implementation.
+
+The fix captures caller errno before lazy initialization and lock acquisition.
+A separate scope destroys the RNG mutex guard before successful calls restore
+errno, or error calls set their failure errno. It preserves the existing
+zero-length, flag, short-read, guest-stream and startup behavior.
+
+Merged-master validation used the same Rust 1.93.1, sealed offline adapters and
+Cargo commands recorded above. Every operation remained below 260 seconds.
+
+- Full default suite: 846 harness-counted tests passed, 13 inherited ignores,
+  plus the standalone host integration. Library subset: 796 passed / 2 ignored.
+- Full erofs,fstool,tunnel suite: 877 harness-counted tests passed, 13 inherited
+  ignores, plus host integration. Library subset: 809 passed / 2 ignored.
+- Focused host integration and both full suites passed the 240,000-call errno
+  regression with zero changes, alongside the existing ABI/error checks.
+- Strict all-target feature Clippy passed with only the existing
+  `field_reassign_with_default` allowance. wasm32 core and warnings-denied
+  public documentation builds also passed.
+- Scoped Rust formatting and `git diff --check` passed.
+
+Correction diff against `9fef7f5`: 3 files, +111/-7.
+Targeted reviewer recheck is pending; no re-review result is claimed.
+
+The review exposed missing contention coverage around hidden libc effects.
+The committed native regression now covers it without a production test seam.
+No additional capital investment is needed for this narrow correction.

@@ -160,12 +160,30 @@ mod linux {
         // SAFETY: the caller guarantees count writable bytes and exclusive
         // access; count is nonzero and bounded below isize::MAX.
         let output = unsafe { std::slice::from_raw_parts_mut(buffer.cast::<u8>(), count) };
-        // Matching avoids a panic path across the executable's C ABI.
-        if let Some(random) = random().as_mut() {
-            random.stream.fill(output);
-            count as libc::ssize_t
-        } else {
-            failure(libc::EIO)
+        // SAFETY: Linux libc provides a writable errno slot local to this
+        // thread. Its address remains valid through acquisition and release.
+        let errno_location = unsafe { libc::__errno_location() };
+        let caller_errno = unsafe { *errno_location };
+        // Contended mutex futex calls can change errno even on success. Keep
+        // initialization, filling and guard destruction inside this scope so
+        // every errno write below occurs after the final mutex operation.
+        let result = {
+            let mut guard = random();
+            // Matching avoids a panic path across the executable's C ABI.
+            if let Some(random) = guard.as_mut() {
+                random.stream.fill(output);
+                Ok(count as libc::ssize_t)
+            } else {
+                Err(libc::EIO)
+            }
+        };
+        match result {
+            Ok(count) => {
+                // SAFETY: this is the calling thread's live errno slot above.
+                unsafe { *errno_location = caller_errno };
+                count
+            }
+            Err(errno) => failure(errno),
         }
     }
 
