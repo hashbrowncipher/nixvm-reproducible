@@ -196,6 +196,10 @@ fn enotempty() -> io::Error {
 }
 
 impl MountFs for Overlay {
+    fn set_clock(&mut self, clock: std::sync::Arc<crate::clock::VirtualClock>) {
+        self.upper.set_clock(std::sync::Arc::clone(&clock));
+        self.lower.set_clock(clock);
+    }
     fn read_only(&self) -> bool {
         false
     }

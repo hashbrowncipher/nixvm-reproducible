@@ -91,7 +91,8 @@ pub struct Config {
     pub mode: RunMode,
     /// Explicit init binary for [`RunMode::Booted`] (default `/sbin/init`).
     pub init: Option<String>,
-    /// Number of virtual CPUs (host worker threads); `1` is single-threaded.
+    /// Requested scheduler worker count. Current virtual-time execution
+    /// supports `1`; larger counts return an error when the sandbox runs.
     pub ncpus: usize,
     /// Guest memory ceiling in bytes.
     pub mem_bytes: u64,
@@ -145,9 +146,9 @@ impl Default for SandboxBuilder {
                 root: RootSource::Empty,
                 mode: RunMode::Nude,
                 init: None,
-                // NIXVM_CPUS=N runs guest compute on N host worker threads (the
-                // SMP scheduler); unset or unparseable means 1 (serial). An
-                // explicit `.ncpus()` on the builder still overrides this.
+                // NIXVM_CPUS requests the scheduler worker count. Virtual-time
+                // execution supports one; larger requests fail at run time. An
+                // explicit `.ncpus()` on the builder overrides this setting.
                 ncpus: std::env::var("NIXVM_CPUS")
                     .ok()
                     .and_then(|s| s.trim().parse::<usize>().ok())
@@ -282,7 +283,9 @@ impl SandboxBuilder {
         self
     }
 
-    /// Set the number of virtual CPUs (host worker threads for guest compute).
+    /// Request the scheduler worker count; zero means one. Current virtual-time
+    /// execution supports one worker. Larger requests return an error from
+    /// [`Sandbox::run`]. Guest processes and threads share that scheduler CPU.
     #[must_use]
     pub fn ncpus(mut self, n: usize) -> Self {
         self.config.ncpus = n.max(1);
@@ -944,19 +947,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn same_result_on_four_cpus() {
+    fn virtual_execution_rejects_four_cpus() {
         let dir = temp_root("smp");
         std::fs::write(dir.join("init"), build_exit_elf(19)).unwrap();
-        let code = Sandbox::builder()
+        let error = Sandbox::builder()
             .arch(Arch::Aarch64)
             .prefer_interp(true)
             .root_dir(&dir)
             .command(["/init"])
             .ncpus(4)
             .run()
-            .unwrap();
+            .unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(code, 19);
+        assert!(matches!(
+            error,
+            Error::Vcpu(vcpu::VcpuError::Backend(message))
+                if message == "virtual execution requires one scheduler CPU"
+        ));
     }
 
     #[test]

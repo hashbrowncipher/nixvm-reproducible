@@ -433,6 +433,14 @@ impl Kernel {
         };
         // SIGKILL/SIGSTOP can't be waited for.
         let waitable = set & !((1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1)));
+        if cx
+            .cur
+            .wake_deadline
+            .is_some_and(|d| d <= self.clock.now_monotonic().as_nanos())
+        {
+            cx.cur.wake_deadline = None;
+            return err(Errno::EAGAIN);
+        }
         // Dequeue the lowest pending signal in the set.
         let ready = cx.cur.pending & waitable;
         if ready != 0 {
@@ -474,11 +482,13 @@ impl Kernel {
                 if sec == 0 && nsec == 0 {
                     return err(Errno::EAGAIN); // {0,0}: a non-blocking poll
                 }
-                let dl = super::poll::now_ns() + u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+                let dl = self.clock.now_monotonic().as_nanos()
+                    + u128::from(sec) * 1_000_000_000
+                    + u128::from(nsec);
                 cx.cur.wake_deadline = Some(dl);
                 dl
             };
-            if super::poll::now_ns() >= deadline {
+            if self.clock.now_monotonic().as_nanos() >= deadline {
                 cx.cur.wake_deadline = None;
                 return err(Errno::EAGAIN); // timed out
             }
@@ -1091,6 +1101,10 @@ impl Kernel {
         // `rcx`/`r11` with the handler's saved context, leaving the guest resuming
         // the interrupted user code at user privilege rather than supervisor.
         vcpu.settle_syscall_return();
+        let frame = vcpu.sp().wrapping_sub(8);
+        if let Some(deadline) = cx.cur.signal_restart_deadlines.remove(&frame) {
+            cx.cur.wake_deadline = Some(deadline);
+        }
         // On entry to the restorer, rsp pointed at pretcode; its `ret` popped 8,
         // so uc_mcontext is at rsp + (MCTX_OFF - 8).
         let mctx = vcpu.sp().wrapping_add(MCTX_OFF - 8);
@@ -1303,6 +1317,9 @@ impl Kernel {
         mem: &GuestMemory,
     ) {
         let frame = vcpu.sp();
+        if let Some(deadline) = cx.cur.signal_restart_deadlines.remove(&frame) {
+            cx.cur.wake_deadline = Some(deadline);
+        }
         let uc = frame + AA64_SIGINFO_SIZE;
         let mctx = uc + AA64_UC_MCONTEXT_OFF;
         let read = |addr: u64| mem.read_u64(addr).unwrap_or(0);

@@ -58,6 +58,8 @@ mod time;
 #[cfg(test)]
 mod timed_wait_regression;
 mod unavailable;
+#[cfg(test)]
+mod virtual_time_tests;
 mod xattr;
 
 pub use fd::{Fd, FdTable, FileOffset};
@@ -148,6 +150,10 @@ struct ProcInfo {
     futex_pi: bool,
     /// Set by `FUTEX_WAKE` to release a parked waiter on its next slice.
     futex_woken: bool,
+    /// Terminal timeout committed at expiry, before any later wake.
+    futex_timed_out: bool,
+    /// Absolute deadlines saved while an SA_RESTART handler runs, keyed by signal frame.
+    signal_restart_deadlines: BTreeMap<u64, u128>,
     run: RunState,
     /// Job control: set `true` when a posted SIGCONT resumed this task from
     /// `RunState::Stopped`, latching a "continued" event for a
@@ -207,20 +213,12 @@ struct ProcInfo {
     /// `mmap(MAP_SHARED, PROT_WRITE)` → memcpy → `munmap`. Without write-back
     /// the file stays zero-filled at the right size.
     shared_maps: Vec<SharedMap>,
-    /// Absolute wall-clock deadline (ns since the UNIX epoch) at which a timed
-    /// wait (`poll`/`ppoll`/`epoll_pwait` with a finite timeout) gives up and
-    /// returns 0. `None` when the task holds no timed wait. Set on the first
-    /// re-trap of the blocking syscall and checked on each later re-trap; once
-    /// the wall clock passes it, the syscall completes with "timed out" instead
-    /// of re-parking. This is what makes `setTimeout` fire — libuv sleeps in
-    /// `epoll_pwait(timeout)` until the next timer is due.
+    /// Absolute VM monotonic deadline in nanoseconds, seeded once per timed
+    /// wait and retained across retries. None denotes an untimed wait.
     wake_deadline: Option<u128>,
-    /// CPU time consumed by this task, in nanoseconds: the wall time it has spent
-    /// actually executing (each dispatched step's run + service), accumulated by
-    /// the schedulers. A parked/blocked task doesn't advance it — which is what
-    /// makes `CLOCK_THREAD_CPUTIME_ID` (this field) and `CLOCK_PROCESS_CPUTIME_ID`
-    /// (the thread-group sum) measure CPU rather than wall time, per task rather
-    /// than per host process.
+    /// Deterministic execution charged to this task, one nanosecond per
+    /// backend execution unit. Idle jumps and clock observation costs do not
+    /// contribute. CPU clock syscalls and CPU timers use this authority.
     cpu_ns: u128,
     /// Weighted *virtual* runtime for fair scheduling (CFS-style), in nice-0
     /// nanosecond units: each executed step adds its CPU delta scaled by
@@ -235,8 +233,7 @@ struct ProcInfo {
     /// CPU time (ns) of this task's *reaped* children, accumulated on `wait4`/
     /// `waitid` — Linux's `ru_utime` for `RUSAGE_CHILDREN` and `tms_cutime`.
     child_cpu_ns: u128,
-    /// `ITIMER_REAL` (`alarm`/`setitimer`): absolute wall-clock deadline (ns since
-    /// the epoch) at which `SIGALRM` is posted, or `None` when disarmed. The
+    /// `ITIMER_REAL` (`alarm`/`setitimer`): absolute VM monotonic deadline at which `SIGALRM` is posted, or `None` when disarmed. The
     /// scheduler wakes a parked task at this deadline (like [`Self::wake_deadline`])
     /// so a real-time timer can interrupt a blocking syscall.
     alarm_deadline: Option<u128>,
@@ -371,6 +368,8 @@ impl Default for ProcInfo {
             futex_waitv_idx: 0,
             futex_pi: false,
             futex_woken: false,
+            futex_timed_out: false,
+            signal_restart_deadlines: BTreeMap::new(),
             run: RunState::Running,
             continued: false,
             stop_reported: false,
@@ -435,6 +434,31 @@ struct Creds {
     fsgid: u32,
 }
 
+#[derive(Default)]
+struct CpuTimes {
+    tasks: BTreeMap<i32, u128>,
+    groups: BTreeMap<i32, u128>,
+}
+
+impl CpuTimes {
+    fn read(sh: &Shared, current: Option<&ProcInfo>) -> Self {
+        let mut times = Self::default();
+        for info in sh
+            .procs
+            .iter()
+            .flatten()
+            .map(|p| &p.info)
+            .filter(|info| current.is_none_or(|c| c.pid != info.pid))
+            .chain(current)
+        {
+            times.tasks.insert(info.pid, info.cpu_ns);
+            let group = times.groups.entry(info.tgid).or_default();
+            *group = group.saturating_add(info.cpu_ns);
+        }
+        times
+    }
+}
+
 impl ProcInfo {
     /// The earliest real-time timer deadline this task holds — its
     /// `ITIMER_REAL` (`alarm`/`setitimer`) or any armed POSIX timer — which the
@@ -442,7 +466,7 @@ impl ProcInfo {
     fn timer_deadline(&self) -> Option<u128> {
         self.ptimers
             .iter()
-            .filter_map(|t| t.deadline)
+            .filter_map(ptimer::PosixTimer::wall_deadline)
             .chain(self.alarm_deadline)
             .min()
     }
@@ -961,9 +985,9 @@ const HOST_IO_POLL_NS: u128 = 1_000_000; // 1 ms
 /// What the SMP scheduler does when every task is blocked and nothing is in
 /// flight — mirrors the serial scheduler's stall handling.
 enum StallAction {
-    /// A timed wait is pending; sleep the main thread to this absolute deadline
-    /// (ns since the epoch), then force a retry so the waiter re-checks it.
-    SleepUntil(u128),
+    /// Jump to the next VM monotonic event, then retry its waiters.
+    AdvanceTo(u128),
+    HostIo,
     /// No timer, first stall since the last progress: force one retry round to
     /// catch a lost wake / host I/O / a freshly-reaped child.
     Retry,
@@ -995,12 +1019,21 @@ fn run_slice_smp(
     mut vcpu: Box<dyn Vcpu>,
     space: &Arc<Mutex<GuestMemory>>,
 ) -> (usize, Box<dyn Vcpu>, SliceOutcome) {
+    let task = kernel.shared.lock().unwrap().procs[i]
+        .as_ref()
+        .unwrap()
+        .info
+        .pid;
+    vcpu.set_clock(Arc::clone(&kernel.clock), task as u64);
     vcpu.begin_slice();
     let mut count: u32 = 0;
     let mut progressed = false;
     loop {
+        kernel.prepare_time(None);
         // Step start, for CPU-time accounting (charged in `smp_service_step`).
-        let step_start = crate::clock::now_monotonic().as_nanos();
+        let step_start = vcpu
+            .execution_ticks()
+            .map_or(kernel.clock.execution_ns(), u128::from);
         // ---- run phase: no kernel lock held ----
         // Interpreter reads/writes guest memory *through* GuestMemory, so it must
         // hold the memory lock for the whole run. KVM executes against the mapped
@@ -1167,6 +1200,7 @@ impl ServiceCtx {
 /// locks.
 #[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub struct Kernel {
+    clock: Arc<crate::clock::VirtualClock>,
     arch: Arch,
     /// Interactive mode (the browser terminal): guest reads of fd 0 draw from
     /// `Shared::stdin_buf` and *block* (re-trap) when it is empty rather than
@@ -1267,6 +1301,7 @@ pub struct Kernel {
 /// so a field here is reached as `sh.<field>` instead of `self.<field>`.
 #[allow(clippy::struct_excessive_bools)] // independent one-shot flags, not a state enum
 pub(super) struct Shared {
+    clock: Arc<crate::clock::VirtualClock>,
     stdin: Box<dyn Read + Send>,
     stdout: Box<dyn Write + Send>,
     stderr: Box<dyn Write + Send>,
@@ -1387,32 +1422,6 @@ impl Shared {
             .any(|p| p.info.run == RunState::Running)
     }
 
-    /// If any live task holds a timed-wait deadline, sleep the host thread until
-    /// the earliest one (so the wall clock actually advances) and return `true`;
-    /// the caller re-sweeps and the waiter, re-checking its now-passed deadline,
-    /// returns "timed out". Returns `false` when nothing is timed — a genuine
-    /// deadlock. This is what lets a fully-parked machine make `setTimeout`
-    /// progress instead of being declared deadlocked.
-    fn wait_for_timer(&self) -> bool {
-        let now = poll::now_ns();
-        let Some(dl) = self
-            .procs
-            .iter()
-            .flatten()
-            .filter(|p| p.info.run == RunState::Running)
-            .flat_map(|p| [p.info.wake_deadline, p.info.timer_deadline()])
-            .flatten()
-            .min()
-        else {
-            return false;
-        };
-        if dl > now {
-            let ns = (dl - now).min(3_600_000_000_000) as u64; // cap at 1h
-            std::thread::sleep(std::time::Duration::from_nanos(ns));
-        }
-        true
-    }
-
     /// True if every live, non-zombie task is parked (blocked). Used to break
     /// out of the unpark/re-sweep loop when a re-check produced no progress.
     fn everything_parked(&self) -> bool {
@@ -1445,9 +1454,36 @@ impl Shared {
         any
     }
 
-    /// The earliest absolute wake deadline (ns since the epoch) held by any live
-    /// task, or `None` if no task holds a timed wait — the SMP twin of
-    /// [`Shared::wait_for_timer`]'s deadline scan.
+    fn open_timerfds(&self) -> BTreeSet<usize> {
+        let mut timers = BTreeSet::new();
+        for process in self
+            .procs
+            .iter()
+            .flatten()
+            .filter(|p| !matches!(p.info.run, RunState::Zombie(_)))
+        {
+            for table in [
+                Some(&process.info.fds),
+                self.file_tables
+                    .get(process.info.files)
+                    .and_then(Option::as_ref),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                timers.extend(table.iter().filter_map(|(_, fd)| {
+                    if let Fd::Timerfd(i) = fd {
+                        Some(*i)
+                    } else {
+                        None
+                    }
+                }));
+            }
+        }
+        timers
+    }
+
+    /// Earliest VM monotonic wait or non-CPU signal-timer deadline.
     fn earliest_deadline(&self) -> Option<u128> {
         self.procs
             .iter()
@@ -1477,16 +1513,10 @@ impl Shared {
     }
 
     fn wake_expired_waiters(&mut self) {
-        // A due waiter retries its syscall to observe the timeout. Check at
-        // kernel boundaries so a current runnable task cannot hide its peer.
-        let now = poll::now_ns();
+        let now = self.clock.now_monotonic().as_nanos();
+        let cpu = CpuTimes::read(self, None);
         for p in self.procs.iter_mut().flatten() {
-            if p.info.parked
-                && (p.info.wake_deadline.is_some_and(|d| d <= now)
-                    || p.info.timer_deadline().is_some_and(|d| d <= now))
-            {
-                p.info.parked = false;
-            }
+            expire_task_waits(&mut p.info, now, &cpu);
         }
     }
 
@@ -1583,8 +1613,11 @@ impl Shared {
 
 impl Kernel {
     #[must_use]
-    pub fn new(arch: Arch, mounts: MountTable) -> Self {
+    pub fn new(arch: Arch, mut mounts: MountTable) -> Self {
+        let clock = Arc::new(crate::clock::VirtualClock::new());
+        mounts.set_clock(Arc::clone(&clock));
         Self {
+            clock: Arc::clone(&clock),
             arch,
             trace: std::env::var_os("NIXVM_TRACE").is_some(),
             schedtrace: std::env::var_os("NIXVM_SCHEDTRACE").is_some(),
@@ -1607,6 +1640,7 @@ impl Kernel {
             orphan_seq: AtomicU64::new(0),
             locks: Mutex::new(fcntl::FileLocks::default()),
             shared: Mutex::new(Shared {
+                clock: Arc::clone(&clock),
                 stdin: Box::new(std::io::stdin()),
                 stdout: Box::new(std::io::stdout()),
                 stderr: Box::new(std::io::stderr()),
@@ -1633,7 +1667,7 @@ impl Kernel {
                 domainname: "(none)".to_string(),
                 sealed: Vec::new(),
                 membarrier: BTreeMap::new(),
-                ipc: ipc::Ipc::default(),
+                ipc: ipc::Ipc::with_clock(clock),
             }),
         }
     }
@@ -1702,23 +1736,22 @@ impl Kernel {
         self.seed.cmdline = cmdline_bytes(&argv);
     }
 
-    /// Set the number of virtual CPUs (host worker threads that run guest
-    /// compute in parallel). `0` is treated as `1`. With more than one CPU the
-    /// SMP scheduler runs; guest compute for independent tasks proceeds on
-    /// separate host threads while syscalls are serviced serially on the main
-    /// thread (a big-kernel-lock model that maps cleanly onto KVM/HVF later).
+    /// Set the scheduler worker count; zero means one. Measured virtual-time
+    /// backends require one worker, and `run` rejects larger counts. The pool
+    /// remains available for unmeasured custom backends.
     pub fn set_ncpus(&mut self, n: usize) {
         self.ncpus = n.max(1);
     }
 
-    /// Run the machine: `vcpu`/`mem` become the initial process (pid 1), then
+    /// Run the machine. Virtual execution requires one scheduler CPU.
+    /// `vcpu`/`mem` become the initial process (pid 1), then
     /// the scheduler drives all processes until pid 1 exits. Returns pid 1's
     /// exit code.
     pub fn run(&mut self, vcpu: Box<dyn Vcpu>, mem: GuestMemory) -> Result<i32, VcpuError> {
         let ncpus = self.ncpus;
-        if ncpus > 1 && vcpu.retired_branches().is_some() {
+        if ncpus > 1 && vcpu.execution_ticks().is_some() {
             return Err(VcpuError::Backend(
-                "PMU scheduling requires one scheduler CPU".into(),
+                "virtual execution requires one scheduler CPU".into(),
             ));
         }
         let mut info = std::mem::take(&mut self.seed);
@@ -1775,7 +1808,7 @@ impl Kernel {
             // the re-run of that task's wait sees its deadline passed and
             // returns) or it's a genuine deadlock.
             if !self.serial_sweep()? && self.shared.lock().unwrap().everything_parked() {
-                if self.shared.lock().unwrap().wait_for_timer() {
+                if self.advance_idle_time() {
                     continue;
                 }
                 // A live host connection may still deliver data asynchronously;
@@ -1812,6 +1845,7 @@ impl Kernel {
     /// per-address-space memory lock (outermost), so a syscall's own per-handler
     /// locks nest correctly under it.
     fn serial_sweep(&self) -> Result<bool, VcpuError> {
+        self.prepare_time(None);
         let mut progressed = false;
         loop {
             // The embedder's time budget (`pump_for`) is spent: hand back.
@@ -1944,8 +1978,7 @@ impl Kernel {
     /// holds, since nothing wakes the cooperative loop from outside.
     #[must_use]
     pub fn has_pending_work(&self) -> bool {
-        self.shared.lock().unwrap().earliest_deadline().is_some()
-            || self.net.lock().unwrap().has_pending_host_io()
+        self.next_deadline().is_some() || self.net.lock().unwrap().has_pending_host_io()
     }
 
     /// Seed the initial process (pid 1) without running it, for the incremental
@@ -1991,7 +2024,7 @@ impl Kernel {
     /// guest. The running vcpu notices the deadline within a few thousand
     /// instructions; its task stays runnable and resumes on the next call.
     pub fn pump_for(&self, budget: std::time::Duration) -> Result<Pumped, VcpuError> {
-        crate::vcpu::set_yield_deadline(Some(crate::clock::now_monotonic() + budget));
+        crate::vcpu::set_yield_deadline(Some(crate::clock::host_monotonic() + budget));
         let r = self.pump_inner();
         crate::vcpu::set_yield_deadline(None);
         r
@@ -2021,11 +2054,11 @@ impl Kernel {
             if self.shared.lock().unwrap().unpark_all() && self.serial_sweep()? {
                 continue;
             }
-            // Genuinely parked. A task holding a timed-wait deadline (setTimeout
-            // → epoll_pwait) isn't waiting for input — it just needs the wall
-            // clock to advance. We don't sleep here (this drives the single-
-            // threaded wasm terminal too), so the embedder must re-pump; each
-            // re-pump re-checks the deadline and fires the timer once it passes.
+            // Every guest is parked: jump directly to the next VM timer.
+            // Without a timer, input or external I/O must make progress.
+            if self.advance_idle_time() {
+                continue;
+            }
             let sh = self.shared.lock().unwrap();
             return Ok(if sh.any_running() {
                 Pumped::Blocked
@@ -2033,6 +2066,93 @@ impl Kernel {
                 Pumped::Exited(sh.pid1_code().unwrap_or(0))
             });
         }
+    }
+
+    /// Process every event due at the current VM instant before another guest
+    /// operation. Timerfd readiness wakes poll/read waiters even with no timeout.
+    fn prepare_time(&self, mut current: Option<&mut ProcInfo>) {
+        let now = self.clock.now_monotonic().as_nanos();
+        let mut sh = self.shared.lock().unwrap();
+        let cpu = CpuTimes::read(&sh, current.as_deref());
+        for process in sh.procs.iter_mut().flatten() {
+            expire_task_waits(&mut process.info, now, &cpu);
+        }
+        if let Some(info) = current.as_deref_mut() {
+            expire_task_waits(info, now, &cpu);
+        }
+        let cpu_deadline = current.as_deref().and_then(|running| {
+            sh.procs
+                .iter()
+                .flatten()
+                .flat_map(|p| p.info.ptimers.iter())
+                .chain(running.ptimers.iter())
+                .filter_map(|timer| timer.execution_remaining(running, &cpu))
+                .min()
+                .map(|remaining| now.saturating_add(remaining))
+        });
+        let mut timerfds = sh.open_timerfds();
+        let current_deadline = current.and_then(|info| {
+            timerfds.extend(info.fds.iter().filter_map(|(_, fd)| {
+                if let Fd::Timerfd(i) = fd {
+                    Some(*i)
+                } else {
+                    None
+                }
+            }));
+            [info.wake_deadline, info.timer_deadline()]
+                .into_iter()
+                .flatten()
+                .filter(|d| *d > now)
+                .min()
+        });
+        let net = self.net.lock().unwrap();
+        timerfds.extend(net.queued_timerfds());
+        let mut pf = self.pollfds.lock().unwrap();
+        for (i, timer) in pf.timerfds.iter_mut().enumerate() {
+            if !timerfds.contains(&i) {
+                timer.expiry_ns = None;
+            }
+        }
+        let timerfd_due = pf
+            .timerfds
+            .iter()
+            .any(|t| t.expiry_ns.is_some_and(|d| d <= now));
+        for i in 0..pf.timerfds.len() {
+            self.update_timerfd(&mut pf, i);
+        }
+        if timerfd_due {
+            sh.unpark_all();
+        }
+        let deadline = [
+            sh.earliest_deadline(),
+            current_deadline,
+            pf.next_deadline(),
+            cpu_deadline,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|d| *d > now)
+        .min();
+        self.clock.set_deadline(deadline);
+    }
+
+    fn next_deadline(&self) -> Option<u128> {
+        let sh = self.shared.lock().unwrap();
+        let pf = self.pollfds.lock().unwrap();
+        [sh.earliest_deadline(), pf.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// With no runnable guest, time passes directly to the next VM event.
+    fn advance_idle_time(&self) -> bool {
+        let Some(deadline) = self.next_deadline() else {
+            return false;
+        };
+        self.clock.advance_to(deadline);
+        self.prepare_time(None);
+        true
     }
 
     /// Run one process until it blocks or exits. Returns whether it made
@@ -2043,36 +2163,31 @@ impl Kernel {
         vcpu: &mut Box<dyn Vcpu>,
         mem: &mut GuestMemory,
     ) -> Result<bool, VcpuError> {
+        vcpu.set_clock(Arc::clone(&self.clock), cx.cur.pid as u64);
         vcpu.begin_slice();
         let mut progressed = false;
         loop {
-            if vcpu.retired_branches().is_some() {
-                let required = self.shared.lock().unwrap().has_runnable_peer(cx.cur.pid);
-                vcpu.set_preemption_required(required);
-            }
+            self.prepare_time(Some(&mut cx.cur));
+            let required = self.shared.lock().unwrap().has_runnable_peer(cx.cur.pid);
+            vcpu.set_preemption_required(required);
             let branches_before = vcpu.retired_branches();
-            // Charge this step's wall time (guest execution + syscall servicing)
-            // to the task's CPU total — a blocked task ends its slice here and
-            // stops accruing, so this tracks CPU rather than wall time.
-            let step_start = crate::clock::now_monotonic().as_nanos();
+            let execution_before = vcpu.execution_ticks();
+            // Charge only this backend's execution, excluding read/idle jumps.
+            let step_start = self.clock.execution_ns();
             let exit = vcpu.run(mem)?;
             // A time-quantum interrupt (mid-compute preemption) ends the slice,
             // as on the SMP path: otherwise a syscall-free hot loop keeps the
             // single CPU forever and its siblings — Go's sysmon, the thread a
             // `kill` woke, a timer's sleeper — never run.
             let is_interrupt = matches!(exit, Exit::Interrupted);
-            // Fire a due ITIMER_REAL / POSIX timer before servicing, so a
-            // blocking syscall this step sees its signal pending and is
-            // interrupted.
-            if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
-                fire_timers_if_due(&mut cx.cur, poll::now_ns());
-            }
-            let flow = self.service(cx, exit, vcpu.as_mut(), mem);
-            let delta = crate::clock::now_monotonic()
-                .as_nanos()
-                .saturating_sub(step_start);
+            let delta = execution_before.zip(vcpu.execution_ticks()).map_or_else(
+                || self.clock.execution_ns().saturating_sub(step_start),
+                |(before, after)| u128::from(after.saturating_sub(before)),
+            );
             cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
             charge_execution(&mut cx.cur, delta, branches_before, vcpu.retired_branches());
+            self.prepare_time(Some(&mut cx.cur));
+            let flow = self.service(cx, exit, vcpu.as_mut(), mem);
             match flow {
                 Serviced::SetRet => {
                     // The result was already written to the vcpu inside `service`
@@ -2141,10 +2256,17 @@ impl Kernel {
                 } else {
                     None
                 };
+                if !matches!(
+                    sys,
+                    Sysno::ClockGettime | Sysno::Gettimeofday | Sysno::Time | Sysno::ClockGetres
+                ) {
+                    self.clock.reset_observations(cx.cur.pid as u64);
+                }
                 let mut ret = match verdict {
                     Some(r) => r,
                     None => self.dispatch(cx, sys, raw, &args, vcpu, mem),
                 };
+                self.prepare_time(Some(&mut cx.cur));
                 // A syscall that wants to block but has a signal with a real
                 // handler pending must not park — POSIX requires it to either
                 // restart after the handler (`SA_RESTART`) or fail with `-EINTR`,
@@ -2157,8 +2279,8 @@ impl Kernel {
                     cx.block = false;
                     if cx.cur.handlers[sig].flags & SA_RESTART != 0 && cx.restartable {
                         // Re-run the `syscall` once the handler returns; the
-                        // re-run re-establishes any wait bookkeeping (e.g. a
-                        // futex's), so leave it in place.
+                        // re-run re-establishes the wait after restoring its
+                        // original deadline from the signal frame record.
                         cx.restart_syscall = true;
                     } else {
                         ret = err(Errno::EINTR);
@@ -2171,6 +2293,7 @@ impl Kernel {
                         cx.cur.futex_waitv.clear();
                         cx.cur.futex_pi = false;
                         cx.cur.futex_woken = false;
+                        cx.cur.futex_timed_out = false;
                     }
                 }
                 // Land the syscall's result in the vcpu *before* delivering any
@@ -2185,6 +2308,18 @@ impl Kernel {
                     vcpu.set_syscall_ret(ret as u64);
                 }
                 let delivered = self.deliver_pending_signals(cx, vcpu, mem);
+                if delivered && cx.restart_syscall {
+                    if let Some(deadline) = cx.cur.wake_deadline.take() {
+                        cx.cur.signal_restart_deadlines.insert(vcpu.sp(), deadline);
+                    }
+                    // The handler has its own waits; the interrupted futex is
+                    // compared and registered again after sigreturn.
+                    cx.cur.futex_wait = None;
+                    cx.cur.futex_waitv.clear();
+                    cx.cur.futex_pi = false;
+                    cx.cur.futex_woken = false;
+                    cx.cur.futex_timed_out = false;
+                }
                 // Flush the running vcpu's TLB if the page tables were edited in
                 // place — so it can't keep serving a stale entry for a now-
                 // unmapped, re-protected, or CoW-replaced page. This MUST run
@@ -2203,8 +2338,11 @@ impl Kernel {
                 // A syscall that returns (didn't re-block) has consumed any
                 // timed-wait deadline it set; the next blocking syscall starts
                 // a fresh one.
-                if !cx.block {
+                if !cx.block && !cx.restart_syscall && !matches!(sys, Sysno::RtSigreturn) {
                     cx.cur.wake_deadline = None;
+                }
+                if cx.block || cx.yield_now {
+                    self.clock.reset_observations(cx.cur.pid as u64);
                 }
                 self.watch_code(vcpu, mem, sys);
                 if let RunState::Zombie(_) = cx.cur.run {
@@ -2523,11 +2661,16 @@ impl Kernel {
                             break Ok(sh.pid1_code().unwrap_or(0));
                         }
                         // A pending timed wait (poll/epoll timeout, setTimeout)
-                        // isn't a deadlock — it just needs the wall clock to
-                        // advance. Sleep to the earliest deadline, then force a
-                        // retry so the waiter re-checks its now-passed deadline.
-                        if let Some(dl) = sh.earliest_deadline() {
-                            StallAction::SleepUntil(dl)
+                        // advances directly to its VM deadline before retrying.
+                        if let Some(dl) = [
+                            sh.earliest_deadline(),
+                            self.pollfds.lock().unwrap().next_deadline(),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                        {
+                            StallAction::AdvanceTo(dl)
                         } else if self.net.lock().unwrap().has_pending_host_io() {
                             // A live host connection may still deliver data
                             // asynchronously (an in-flight HTTP response). There
@@ -2535,7 +2678,7 @@ impl Kernel {
                             // so poll for it — a short sleep, then a retry round
                             // that re-checks socket readiness — rather than
                             // mistaking the wait for a deadlock.
-                            StallAction::SleepUntil(poll::now_ns() + HOST_IO_POLL_NS)
+                            StallAction::HostIo
                         } else if !stalled {
                             // No timer: catch a lost futex wake / a child that
                             // became a zombie with one forced retry round before
@@ -2546,12 +2689,16 @@ impl Kernel {
                         }
                     };
                     match action {
-                        StallAction::SleepUntil(dl) => {
-                            let now = poll::now_ns();
-                            if dl > now {
-                                let ns = (dl - now).min(3_600_000_000_000) as u64;
-                                std::thread::sleep(std::time::Duration::from_nanos(ns));
-                            }
+                        StallAction::AdvanceTo(dl) => {
+                            self.clock.advance_to(dl);
+                            self.prepare_time(None);
+                            stalled = false;
+                            epoch += 1;
+                        }
+                        StallAction::HostIo => {
+                            std::thread::sleep(std::time::Duration::from_nanos(
+                                HOST_IO_POLL_NS as u64,
+                            ));
                             stalled = false;
                             epoch += 1;
                         }
@@ -2684,17 +2831,14 @@ impl Kernel {
             let (pending, ppid) = (cx.cur.pending, cx.cur.ppid);
             (proc, cx, pending, ppid)
         };
-        if cx.cur.alarm_deadline.is_some() || !cx.cur.ptimers.is_empty() {
-            fire_timers_if_due(&mut cx.cur, poll::now_ns());
-        }
-        let flow = self.service(&mut cx, exit, vcpu, mem);
-        // Charge this step's wall time (run + service) to the task's CPU total,
-        // and its nice-weighted share to the fair-scheduling virtual runtime.
-        let delta = crate::clock::now_monotonic()
-            .as_nanos()
+        let delta = vcpu
+            .execution_ticks()
+            .map_or(self.clock.execution_ns(), u128::from)
             .saturating_sub(step_start);
         cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
         charge_vruntime(&mut cx.cur, delta);
+        self.prepare_time(Some(&mut cx.cur));
+        let flow = self.service(&mut cx, exit, vcpu, mem);
         {
             let mut sh = self.shared.lock().unwrap();
             // Fold in what other workers did to the stand-in meanwhile: signals
@@ -3054,15 +3198,15 @@ impl Kernel {
                 self.dispatch_pollfds(&mut pf, cx, sys, args, mem)
             }
             // Pure clock/time reads: they touch no shared kernel state (only the
-            // host wall clock and the caller's buffer), so they take NO lock.
+            // VM clock and the caller's buffer), so they take NO shared lock.
             // These dominate the syscall stream of clock-polling runtimes
             // (Bun/JSC issues ~89% `clock_gettime`), where routing each through
             // the big `sh` lock cost an acquire/release on the hot path and
             // needless cross-thread contention under SMP.
             Sysno::ClockGettime => self.sys_clock_gettime(cx, args[0], args[1], mem),
-            Sysno::Gettimeofday => time::sys_gettimeofday(args[0], mem),
+            Sysno::Gettimeofday => time::sys_gettimeofday(self, cx, args[0], mem),
             Sysno::ClockGetres => time::sys_clock_getres(args[1], mem),
-            Sysno::Time => time::sys_time(args[0], mem),
+            Sysno::Time => time::sys_time(self, cx, args[0], mem),
             // everything else: a single `sh` lock, running the B1 syscall table.
             _ => {
                 let mut sh = self.shared.lock().unwrap();
@@ -3728,7 +3872,7 @@ impl Kernel {
             Sysno::SchedGetPriorityMax => self.sys_sched_priority_bound(args[0], true),
             Sysno::SchedGetPriorityMin => self.sys_sched_priority_bound(args[0], false),
             Sysno::Getrusage => self.sys_getrusage(sh, cx, args[0], args[1], mem),
-            Sysno::Sysinfo => sys_misc::sys_sysinfo(args[0], mem),
+            Sysno::Sysinfo => sys_misc::sys_sysinfo(self.clock.now_monotonic().as_secs(), args[0], mem),
             Sysno::Times => self.sys_times(sh, cx, args[0], mem),
             Sysno::Getcpu => sys_misc::sys_getcpu(args[0], args[1], mem),
             Sysno::Capget => self.sys_capget(sh, cx, args[0], args[1], mem),
@@ -5637,11 +5781,11 @@ impl Kernel {
         let deadline = if let Some(dl) = cx.cur.wake_deadline {
             dl
         } else {
-            let dl = poll::now_ns() + u128::from(vtime_ds) * 100_000_000; // deciseconds → ns
+            let dl = self.clock.now_monotonic().as_nanos() + u128::from(vtime_ds) * 100_000_000; // deciseconds → ns
             cx.cur.wake_deadline = Some(dl);
             dl
         };
-        if poll::now_ns() >= deadline {
+        if self.clock.now_monotonic().as_nanos() >= deadline {
             // Timed out: return whatever is buffered (0 for VMIN==0).
             cx.cur.wake_deadline = None;
             let data = self
@@ -8189,7 +8333,7 @@ impl Kernel {
         // Linux returns at most 32 MiB - 1 per call.
         let len = len.min((1 << 25) - 1);
         if sh.rng_state == 0 {
-            let now = match crate::clock::now_unix().as_nanos() as u64 {
+            let now = match self.clock.now_unix().as_nanos() as u64 {
                 0 => 0x9E37_79B9_7F4A_7C15,
                 n => n,
             };
@@ -8319,15 +8463,8 @@ fn host_tty_ioctl(_host_fd: i32, _req: u32, _arg: u64, _mem: &mut GuestMemory) -
 }
 
 impl Kernel {
-    /// `clock_gettime(clk_id, timespec)`. Each Linux clock id is served from the
-    /// matching source so the guest sees genuine wall / monotonic / CPU time — not
-    /// wall time for all of them. `CLOCK_MONOTONIC` agrees with the vDSO fast path
-    /// (both use [`crate::clock::now_monotonic`]); the CPU-time clocks the vDSO
-    /// never fast-paths land here and read the scheduler's per-task accounting
-    /// ([`ProcInfo::cpu_ns`]) — `CLOCK_THREAD_CPUTIME_ID` is this task, and
-    /// `CLOCK_PROCESS_CPUTIME_ID` sums its whole thread group — so each guest
-    /// process sees only its own CPU, not the host's. An unrecognized id falls
-    /// back to the wall clock rather than failing.
+    /// Read the VM clock or deterministic per-task/thread-group CPU usage.
+    /// All clock getters share the task's observation streak with RDTSC.
     fn sys_clock_gettime(
         &self,
         cx: &ServiceCtx,
@@ -8341,16 +8478,15 @@ impl Kernel {
         const MONOTONIC_RAW: u64 = 4;
         const MONOTONIC_COARSE: u64 = 6;
         const BOOTTIME: u64 = 7;
+        self.clock.observe(cx.cur.pid as u64);
         let cpu = |ns: u128| std::time::Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX));
         let now = match clk_id {
-            MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => {
-                crate::clock::now_monotonic()
-            }
+            MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => self.clock.now_monotonic(),
             THREAD_CPUTIME => cpu(cx.cur.cpu_ns),
             // Sum the thread group. No `sh` is held on this call path (the fast
             // dispatch table reaches here without it), so lock it here.
             PROCESS_CPUTIME => cpu(process_cpu_ns(&self.shared.lock().unwrap(), cx)),
-            _ => crate::clock::now_unix(), // REALTIME(0)/REALTIME_COARSE(5)/TAI(11)/…
+            _ => self.clock.now_unix(), // REALTIME(0)/REALTIME_COARSE(5)/TAI(11)/…
         };
         let mut b = [0u8; 16];
         b[0..8].copy_from_slice(&(now.as_secs()).to_le_bytes());
@@ -8366,7 +8502,7 @@ impl Kernel {
     /// none). `alarm(0)` cancels.
     #[allow(clippy::unused_self)]
     fn sys_alarm(&self, cx: &mut ServiceCtx, seconds: u64) -> i64 {
-        let now = poll::now_ns();
+        let now = self.clock.now_monotonic().as_nanos();
         let remaining = cx
             .cur
             .alarm_deadline
@@ -8393,7 +8529,7 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         const ITIMER_REAL: u64 = 0;
-        let now = poll::now_ns();
+        let now = self.clock.now_monotonic().as_nanos();
         // Report the previous timer into `old` if requested (only ITIMER_REAL is
         // modeled; VIRTUAL/PROF read back as disarmed).
         if old != 0
@@ -8455,7 +8591,13 @@ impl Kernel {
         const ITIMER_REAL: u64 = 0;
         if curr != 0
             && self
-                .write_itimer(cx, curr, poll::now_ns(), which == ITIMER_REAL, mem)
+                .write_itimer(
+                    cx,
+                    curr,
+                    self.clock.now_monotonic().as_nanos(),
+                    which == ITIMER_REAL,
+                    mem,
+                )
                 .is_err()
         {
             return err(Errno::EFAULT);
@@ -8465,7 +8607,7 @@ impl Kernel {
 
     /// `nanosleep`/`clock_nanosleep` — genuinely suspend the caller until the
     /// deadline, using the scheduler's timed wait ([`ProcInfo::wake_deadline`]),
-    /// instead of returning instantly. The absolute wall-clock deadline is seeded
+    /// The absolute VM monotonic deadline is seeded
     /// on the first entry and reused on every re-trap (the guest PC never advanced
     /// past the syscall), so a relative sleep converges instead of resetting.
     ///
@@ -8484,10 +8626,9 @@ impl Kernel {
         mem: &mut GuestMemory,
     ) -> i64 {
         const TIMER_ABSTIME: u64 = 1;
-        const CLOCK_REALTIME: u64 = 0;
         let abstime = flags & TIMER_ABSTIME != 0;
 
-        // Seed the absolute wall-clock deadline once; re-traps reuse it.
+        // Seed the absolute VM monotonic deadline once; retries reuse it.
         let deadline = if let Some(dl) = cx.cur.wake_deadline {
             dl
         } else {
@@ -8498,28 +8639,28 @@ impl Kernel {
                 return err(Errno::EINVAL);
             }
             let want = u128::from(sec) * 1_000_000_000 + u128::from(nsec);
-            let now_wall = poll::now_ns();
+            let now = self.clock.now_monotonic().as_nanos();
             let dl = if abstime {
                 // `want` is an absolute time on `clock_id`; convert to how long
-                // remains, then to a wall-clock deadline the scheduler tracks.
-                let clock_now = if clock_id == CLOCK_REALTIME {
-                    crate::clock::now_unix()
+                // remains, then to the monotonic deadline the scheduler tracks.
+                let clock_now = if matches!(clock_id, 0 | 8 | 11) {
+                    self.clock.now_unix()
                 } else {
-                    crate::clock::now_monotonic()
+                    self.clock.now_monotonic()
                 }
                 .as_nanos();
                 if want <= clock_now {
                     return 0; // the absolute deadline already passed
                 }
-                now_wall + (want - clock_now)
+                now + (want - clock_now)
             } else {
-                now_wall + want
+                now + want
             };
             cx.cur.wake_deadline = Some(dl);
             dl
         };
 
-        let now = poll::now_ns();
+        let now = self.clock.now_monotonic().as_nanos();
         if now >= deadline {
             cx.cur.wake_deadline = None;
             if !abstime && rem != 0 {
@@ -8560,22 +8701,35 @@ fn process_cpu_ns(sh: &Shared, cx: &ServiceCtx) -> u128 {
         + sh.procs
             .iter()
             .flatten()
-            .filter(|p| p.info.tgid == tgid)
+            .filter(|p| p.info.tgid == tgid && p.info.pid != cx.cur.pid)
             .map(|p| p.info.cpu_ns)
             .sum::<u128>()
 }
 
-/// Fire every real-time timer of `info` due at `now`: `ITIMER_REAL` and the
-/// POSIX timers (see [`ptimer::fire_ptimers`]).
-fn fire_timers_if_due(info: &mut ProcInfo, now: u128) {
+/// Commit timeout before wake syscalls at the same timestamp can run.
+fn expire_task_waits(info: &mut ProcInfo, now: u128, cpu: &CpuTimes) {
+    if info.run != RunState::Running {
+        return;
+    }
     fire_alarm_if_due(info, now);
-    if !info.ptimers.is_empty() {
-        ptimer::fire_ptimers(info, now);
+    ptimer::fire_ptimers_with_cpu(info, now, cpu);
+    if info.wake_deadline.is_some_and(|d| d <= now) {
+        info.parked = false;
+        if !info.futex_woken && (info.futex_wait.is_some() || !info.futex_waitv.is_empty()) {
+            info.futex_timed_out = true;
+            info.futex_wait = None;
+            info.futex_waitv.clear();
+            info.futex_pi = false;
+            info.wake_deadline = None;
+        }
+    }
+    if info.pending & !info.blocked != 0 {
+        info.parked = false;
     }
 }
 
 /// Post `SIGALRM` to `info` if its `ITIMER_REAL` deadline has passed at `now`
-/// (wall ns), re-arming a periodic timer or disarming a one-shot. Un-parks the
+/// (VM monotonic ns), re-arming a periodic timer or disarming a one-shot. Un-parks the
 /// task so a blocking syscall wakes to take the signal. Returns whether it fired.
 fn fire_alarm_if_due(info: &mut ProcInfo, now: u128) -> bool {
     let Some(dl) = info.alarm_deadline else {
@@ -9014,7 +9168,7 @@ mod tests {
             }));
         }
         assert!(!shared.has_runnable_peer(1));
-        shared.procs[1].as_mut().unwrap().info.wake_deadline = Some(1);
+        shared.procs[1].as_mut().unwrap().info.wake_deadline = Some(0);
         assert!(shared.has_runnable_peer(1), "a due sleeper needs a turn");
         shared.procs[1].as_mut().unwrap().info.parked = true;
         shared.procs[1].as_mut().unwrap().info.wake_deadline = None;
@@ -10952,12 +11106,11 @@ mod tests {
     }
 
     #[test]
-    fn futex_wait_single_thread_does_not_deadlock() {
+    fn futex_wait_single_thread_parks_until_explicit_completion() {
         let (k, mut mem, mut v, mut cx) = setup();
         let uaddr = 0x1_0000;
         mem.write_init(uaddr, &42u32.to_le_bytes()).unwrap();
-        // Value matches and no other task could wake us: report a spurious wake
-        // rather than parking (which would be a false deadlock).
+        // Even without a peer, an untimed matching wait must remain parked.
         let r = call(
             &k,
             &mut cx,
@@ -10967,7 +11120,9 @@ mod tests {
             [uaddr, 0, 42, 0, 0, 0],
         );
         assert_eq!(r, 0);
-        assert!(!cx.block, "lone waiter is not parked");
+        assert!(cx.block, "lone waiter remains parked");
+        cx.cur.futex_wait = None;
+        cx.block = false;
         // A mismatched value is EAGAIN.
         let r = call(
             &k,
@@ -11202,7 +11357,7 @@ mod tests {
         assert_eq!(mem.read_u64(res).unwrap(), 0);
         assert_eq!(mem.read_u64(res + 8).unwrap(), 1);
 
-        // nanosleep now genuinely suspends the caller: the first entry seeds the
+        // The first nanosleep entry seeds the
         // deadline and parks (`cx.block`); a re-trap after it elapses completes,
         // writing rem = {0, 0}.
         let req = 0x1_2000;
@@ -11227,10 +11382,8 @@ mod tests {
         );
         assert!(cx.block, "nanosleep parks the caller until its deadline");
         assert!(cx.cur.wake_deadline.is_some());
-        // Let the (20 ms) deadline pass, then re-trap: it completes. (A
-        // sub-microsecond sleep could expire before the first check under a
-        // loaded parallel test run, so the "parks" assertion raced.)
-        std::thread::sleep(std::time::Duration::from_millis(30));
+        // Advance to the virtual deadline, then retry.
+        k.clock.advance_to(cx.cur.wake_deadline.unwrap());
         cx.block = false;
         assert_eq!(
             call(
@@ -11909,7 +12062,7 @@ mod tests {
         let (mut k, _mem, _v, _cx) = setup();
         let sh = k.shared.get_mut().unwrap();
         sh.procs.clear();
-        for (pid, parked, deadline) in [(1, false, None), (2, true, Some(1)), (3, true, None)] {
+        for (pid, parked, deadline) in [(1, false, None), (2, true, Some(0)), (3, true, None)] {
             let info = ProcInfo {
                 pid,
                 run: RunState::Running,

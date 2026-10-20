@@ -127,6 +127,7 @@ const SYMLINKS: &[(&str, u64, &str)] = &[
 /// The synthesized `/dev` backend.
 #[derive(Debug)]
 pub struct DevFs {
+    clock: std::sync::Arc<crate::clock::VirtualClock>,
     /// xorshift64 state for `/dev/random` and `/dev/urandom`. `0` means
     /// "not yet seeded"; seeding happens lazily on first use.
     rng: u64,
@@ -144,6 +145,7 @@ impl DevFs {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            clock: std::sync::Arc::default(),
             rng: 0,
             shm: TmpFs::new(),
         }
@@ -258,11 +260,11 @@ impl DevFs {
     }
 
     /// Next pseudo-random `u64` from the internal xorshift64 generator, seeding
-    /// lazily from the wall clock on first use.
+    /// lazily from the VM clock on first use.
     fn next_u64(&mut self) -> u64 {
         if self.rng == 0 {
             // wasm32-safe clock (see `crate::clock`).
-            let nanos = crate::clock::now_unix().as_nanos() as u64;
+            let nanos = self.clock.now_unix().as_nanos() as u64;
             // `| 1` guarantees a non-zero seed (xorshift is stuck at 0).
             self.rng = nanos | 1;
         }
@@ -328,6 +330,10 @@ fn eagain() -> io::Error {
 }
 
 impl MountFs for DevFs {
+    fn set_clock(&mut self, clock: std::sync::Arc<crate::clock::VirtualClock>) {
+        self.shm.set_clock(std::sync::Arc::clone(&clock));
+        self.clock = clock;
+    }
     fn read_only(&self) -> bool {
         false
     }

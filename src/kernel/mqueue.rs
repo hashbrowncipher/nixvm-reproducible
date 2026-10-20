@@ -14,7 +14,7 @@
 //! nobody is waiting on, then deregisters — POSIX's one-shot rule.
 
 use super::poll::PollFds;
-use super::{Fd, Kernel, QueuedSig, ServiceCtx, Shared, err, poll};
+use super::{Fd, Kernel, QueuedSig, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -107,7 +107,12 @@ fn mq_fd(cx: &ServiceCtx, fd: u64) -> Result<(usize, bool, bool, bool), i64> {
 /// Turn an absolute `CLOCK_REALTIME` timeout (`struct timespec *`, NULL =
 /// none) into the wall deadline the scheduler tracks, seeding it once per
 /// blocking call.
-fn deadline(cx: &mut ServiceCtx, ts: u64, mem: &GuestMemory) -> Result<Option<u128>, i64> {
+fn deadline(
+    clock: &crate::clock::VirtualClock,
+    cx: &mut ServiceCtx,
+    ts: u64,
+    mem: &GuestMemory,
+) -> Result<Option<u128>, i64> {
     if ts == 0 {
         return Ok(None);
     }
@@ -120,7 +125,8 @@ fn deadline(cx: &mut ServiceCtx, ts: u64, mem: &GuestMemory) -> Result<Option<u1
     if (s as i64) < 0 || n >= 1_000_000_000 {
         return Err(err(Errno::EINVAL));
     }
-    let dl = u128::from(s) * 1_000_000_000 + u128::from(n);
+    let want = u128::from(s) * 1_000_000_000 + u128::from(n);
+    let dl = clock.now_monotonic().as_nanos() + want.saturating_sub(clock.now_unix().as_nanos());
     cx.cur.wake_deadline = Some(dl);
     Ok(Some(dl))
 }
@@ -231,7 +237,15 @@ impl Kernel {
         if prio >= MQ_PRIO_MAX {
             return err(Errno::EINVAL);
         }
-        let dl = match deadline(cx, ts, mem) {
+        if cx
+            .cur
+            .wake_deadline
+            .is_some_and(|d| d <= self.clock.now_monotonic().as_nanos())
+        {
+            cx.cur.wake_deadline = None;
+            return err(Errno::ETIMEDOUT);
+        }
+        let dl = match deadline(&self.clock, cx, ts, mem) {
             Ok(d) => d,
             Err(e) => return e,
         };
@@ -244,7 +258,7 @@ impl Kernel {
             if nonblock {
                 return err(Errno::EAGAIN);
             }
-            if dl.is_some_and(|d| poll::now_ns() >= d) {
+            if dl.is_some_and(|d| self.clock.now_monotonic().as_nanos() >= d) {
                 cx.cur.wake_deadline = None;
                 return err(Errno::ETIMEDOUT);
             }
@@ -297,7 +311,15 @@ impl Kernel {
         if !readable {
             return err(Errno::EBADF);
         }
-        let dl = match deadline(cx, ts, mem) {
+        if cx
+            .cur
+            .wake_deadline
+            .is_some_and(|d| d <= self.clock.now_monotonic().as_nanos())
+        {
+            cx.cur.wake_deadline = None;
+            return err(Errno::ETIMEDOUT);
+        }
+        let dl = match deadline(&self.clock, cx, ts, mem) {
             Ok(d) => d,
             Err(e) => return e,
         };
@@ -310,7 +332,7 @@ impl Kernel {
             if nonblock {
                 return err(Errno::EAGAIN);
             }
-            if dl.is_some_and(|d| poll::now_ns() >= d) {
+            if dl.is_some_and(|d| self.clock.now_monotonic().as_nanos() >= d) {
                 cx.cur.wake_deadline = None;
                 return err(Errno::ETIMEDOUT);
             }

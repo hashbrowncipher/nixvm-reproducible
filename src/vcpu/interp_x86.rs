@@ -48,10 +48,12 @@
 
 use crate::abi::Arch;
 
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+
+use crate::clock::VirtualClock;
 
 use super::softfloat::F80;
-use super::{Backend, Exit, GuestMemory, Vcpu, VcpuError};
+use super::{Backend, ExecutionClock, Exit, GuestMemory, Vcpu, VcpuError};
 
 mod sse;
 #[doc(hidden)]
@@ -63,11 +65,7 @@ mod x87math;
 /// mirrors [`super::interp`]'s guard against a runaway guest loop.
 const MAX_STEPS: u64 = 50_000_000;
 
-/// How often (in instructions) [`X86Interp::run`] polls the wall clock for a
-/// time-quantum expiry. A clock read per instruction would dominate the
-/// interpreter's cost, so we amortize it: a power of two makes the test a cheap
-/// mask. The residual overrun (up to this many instructions past the deadline)
-/// is negligible next to a millisecond quantum.
+/// Host-budget polling stride, used only to return control to the embedder.
 const QUANTUM_STRIDE: u64 = 4096;
 
 /// The architectural maximum instruction length; anything longer is `#GP`.
@@ -129,11 +127,15 @@ const XCR0: u64 = if AVX { 0b111 } else { 0b11 };
 #[derive(Debug)]
 pub struct X86Backend {
     guest: Arch,
+    clock: Arc<VirtualClock>,
 }
 
 impl X86Backend {
     pub fn new(guest: Arch) -> Result<Self, VcpuError> {
-        Ok(Self { guest })
+        Ok(Self {
+            guest,
+            clock: Arc::new(VirtualClock::new()),
+        })
     }
 }
 
@@ -148,7 +150,11 @@ impl Backend for X86Backend {
 
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
         match self.guest {
-            Arch::X86_64 => Ok(Box::new(X86Interp::new(entry, stack))),
+            Arch::X86_64 => {
+                let mut cpu = X86Interp::new(entry, stack);
+                cpu.set_clock(self.clock.clone(), self.clock.allocate_observer());
+                Ok(Box::new(cpu))
+            }
             Arch::Aarch64 => Err(VcpuError::Backend(
                 "interp-x86 backend only supports x86-64 guests".into(),
             )),
@@ -546,20 +552,16 @@ struct X86Interp {
     fpu_fop: u16,
     fpu_fip: u64,
     fpu_fdp: u64,
-    /// Free-running counter behind `RDTSC`/`RDTSCP` — see
-    /// [`X86Interp::rdtsc_tick`].
-    tsc: u64,
+    /// Virtual time advances by retired conditional branches (taken or not).
+    /// Unconditional-only loops consume no execution time under this metric.
+    time: ExecutionClock,
+    /// Whether the current instruction retired a conditional branch.
+    conditional_branch: bool,
     /// PRNG state behind `RDRAND` — see [`X86Interp::rdrand`].
     prng: u64,
     /// The SSE control/status register (`LDMXCSR`/`STMXCSR`): rounding control,
     /// `FTZ`/`DAZ`, exception masks and sticky exception flags.
     mxcsr: u32,
-    /// Wall-clock preemption quantum: [`X86Interp::run`] returns
-    /// [`Exit::Interrupted`] once this much time has elapsed since it started,
-    /// so a compute-bound guest that never syscalls still yields the CPU. `None`
-    /// disables it. Cached from `NIXVM_QUANTUM_MS` at construction (see
-    /// [`super::preempt_quantum`]); a `fork` clone inherits it.
-    quantum: Option<Duration>,
 }
 
 impl X86Interp {
@@ -594,10 +596,10 @@ impl X86Interp {
             fpu_fop: 0,
             fpu_fip: 0,
             fpu_fdp: 0,
-            tsc: 0,
+            time: ExecutionClock::new(),
+            conditional_branch: false,
             prng: 0x9E37_79B9_7F4A_7C15, // arbitrary nonzero seed (golden-ratio constant)
             mxcsr: 0x1f80,               // the power-on default (all exceptions masked)
-            quantum: super::preempt_quantum(),
         }
     }
 
@@ -1866,12 +1868,9 @@ impl X86Interp {
         self.gpr[RDX] = u64::from(entry.edx);
     }
 
-    /// Advance and return the free-running counter behind `RDTSC`/`RDTSCP`:
-    /// incrementing on every read (rather than tracking real elapsed time)
-    /// guarantees a guest spin-loop that polls it for elapsed time terminates.
+    /// Timestamp reads observe the same per-VM clock as syscall getters.
     fn rdtsc_tick(&mut self) -> u64 {
-        self.tsc = self.tsc.wrapping_add(1);
-        self.tsc
+        self.time.observe()
     }
 
     // ---- string instructions --------------------------------------------------
@@ -2100,6 +2099,7 @@ impl X86Interp {
     /// Execute one instruction.
     #[allow(clippy::too_many_lines)]
     fn step(&mut self, mem: &mut GuestMemory) -> Step {
+        self.conditional_branch = false;
         if let Err(s) = self.fill_ibuf(mem) {
             return s;
         }
@@ -2189,6 +2189,7 @@ impl X86Interp {
             0x6C..=0x6F => Step::Trap(Trap::Protection),
             0x70..=0x7F => {
                 let (rel, end) = fetch!(self.fetch_i8(pc));
+                self.conditional_branch = true;
                 if self.cond_holds(op) {
                     self.jump(end.wrapping_add(i64::from(rel) as u64))
                 } else {
@@ -2421,6 +2422,7 @@ impl X86Interp {
             0xE0..=0xE3 => {
                 // LOOPNE/LOOPE/LOOP/JrCXZ rel8 (ECX under 0x67).
                 let (rel, end) = fetch!(self.fetch_i8(pc));
+                self.conditional_branch = true;
                 let take = if op == 0xE3 {
                     self.sreg(RCX) == 0
                 } else {
@@ -2542,6 +2544,7 @@ impl X86Interp {
             }
             0x80..=0x8F => {
                 let (rel, end) = fetch!(self.fetch_i32(pc));
+                self.conditional_branch = true;
                 if self.cond_holds(op) {
                     self.jump(end.wrapping_add(i64::from(rel) as u64))
                 } else {
@@ -2979,30 +2982,53 @@ impl X86Interp {
 
 impl Vcpu for X86Interp {
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError> {
-        // Time-based preemption deadline, computed once. A compute-bound guest
-        // that never syscalls would otherwise run the whole MAX_STEPS budget and
-        // starve its siblings; expiring the quantum ends the slice as
-        // Interrupted (the scheduler keeps the task runnable and resumes it).
-        let deadline = self.quantum.map(|q| Instant::now() + q);
+        self.time.enter();
         // The kernel may have remapped or rewritten memory since the last run.
         self.code_page = NO_PAGE;
-        for i in 0..MAX_STEPS {
-            match self.step(mem) {
-                Step::Next | Step::Branched => {}
-                Step::Syscall => return Ok(Exit::Syscall),
-                Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.rip }),
-                Step::Fault { addr, write } => return Ok(Exit::MemFault { addr, write }),
-                Step::Trap(t) => return Ok(self.trap_exit(t)),
+        let exit = 'run: {
+            for i in 0..MAX_STEPS {
+                if self.time.exhausted() || (i & (QUANTUM_STRIDE - 1) == 0 && super::yield_due()) {
+                    break 'run Exit::Interrupted;
+                }
+                match self.step(mem) {
+                    Step::Next | Step::Branched => {
+                        if self.conditional_branch {
+                            self.time.account();
+                        }
+                    }
+                    Step::Syscall => {
+                        self.time.syscall(self.rip);
+                        break 'run Exit::Syscall;
+                    }
+                    Step::Illegal => break 'run Exit::IllegalInstruction { pc: self.rip },
+                    Step::Fault { addr, write } => break 'run Exit::MemFault { addr, write },
+                    Step::Trap(t) => break 'run self.trap_exit(t),
+                }
             }
-            // Poll the wall clock only every QUANTUM_STRIDE instructions — a read
-            // per instruction would swamp the interpreter's per-op cost.
-            if i & (QUANTUM_STRIDE - 1) == 0
-                && (deadline.is_some_and(|d| Instant::now() >= d) || super::yield_due())
-            {
-                return Ok(Exit::Interrupted);
-            }
-        }
-        Ok(Exit::Interrupted)
+            Exit::Interrupted
+        };
+        self.time.flush();
+        Ok(exit)
+    }
+
+    fn set_clock(&mut self, clock: Arc<VirtualClock>, task: u64) {
+        self.time.bind(clock, task);
+    }
+
+    fn set_execution_limit(&mut self, remaining: Option<u64>) {
+        self.time.set_limit(remaining);
+    }
+
+    fn begin_slice(&mut self) {
+        self.time.begin_slice();
+    }
+
+    fn set_preemption_required(&mut self, required: bool) {
+        self.time.set_preemption_required(required);
+    }
+
+    fn retired_branches(&self) -> Option<u64> {
+        Some(self.time.total())
     }
 
     fn syscall_nr(&self) -> u64 {
@@ -3021,6 +3047,7 @@ impl Vcpu for X86Interp {
     }
 
     fn set_syscall_ret(&mut self, value: u64) {
+        self.time.complete_syscall();
         self.gpr[RAX] = value;
         self.rip = self.rip.wrapping_add(2); // `syscall` is always the 2-byte 0F 05
     }
@@ -3040,6 +3067,7 @@ impl Vcpu for X86Interp {
     }
 
     fn set_pc(&mut self, pc: u64) {
+        self.time.complete_syscall();
         self.rip = pc;
     }
 
@@ -3113,10 +3141,14 @@ impl Vcpu for X86Interp {
     }
 
     fn fork(&self) -> Box<dyn Vcpu> {
-        Box::new(self.clone())
+        let mut child = self.clone();
+        child.time = self.time.fork();
+        Box::new(child)
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {
+        self.time.complete_syscall();
+        self.time.reset_observations();
         self.gpr = [0; 16];
         self.xmm = [0; 16];
         self.ymm_hi = [0; 16];
@@ -5450,45 +5482,97 @@ mod tests {
     }
 
     #[test]
-    fn time_quantum_preempts_a_syscall_free_hot_loop() {
-        // A guest that spins forever with no syscall (`jmp $`, the archetypal
-        // JIT hot loop / GC sweep) must still hand the CPU back on the wall-clock
-        // quantum. Without time-based preemption `run` would spin the whole
-        // MAX_STEPS budget (tens of millions of iterations) before yielding.
+    fn virtual_deadline_preempts_solo_compute_without_observations() {
         let mut m = mem();
-        m.write_init(CODE, &[0xEB, 0xFE]).unwrap(); // jmp $ (rel8 = -2)
+        m.write_init(CODE, &[0x75, 0xFE]).unwrap(); // jnz $ (ZF is clear)
         let mut cpu = X86Interp::new(CODE, STACK);
-        let quantum = Duration::from_millis(20);
-        cpu.quantum = Some(quantum);
-
-        let started = Instant::now();
-        let exit = cpu.run(&mut m).unwrap();
-        let elapsed = started.elapsed();
-
-        assert_eq!(exit, Exit::Interrupted, "the quantum ends the slice");
-        assert_eq!(cpu.rip, CODE, "still parked on the self-loop, resumable");
-        // It ran until (roughly) the quantum, not instantly and not for the
-        // whole MAX_STEPS budget: the upper bound is far below the time tens of
-        // millions of interpreted `jmp`s take, so a broken quantum fails here.
-        assert!(
-            elapsed >= quantum,
-            "slice lasted at least the quantum: {elapsed:?}"
-        );
-        assert!(
-            elapsed < quantum * 15,
-            "slice ended near the quantum, not at MAX_STEPS: {elapsed:?}"
-        );
+        let clock = Arc::new(VirtualClock::new());
+        cpu.set_clock(clock.clone(), 7);
+        cpu.set_preemption_required(false);
+        clock.set_deadline(Some(123));
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Interrupted);
+        assert_eq!(cpu.rip, CODE);
+        assert_eq!(clock.now_monotonic().as_nanos(), 123);
+        assert_eq!(clock.execution_ns(), 123);
+        assert_eq!(cpu.retired_branches(), Some(123));
     }
 
     #[test]
-    fn no_quantum_runs_to_max_steps_on_a_hot_loop() {
-        // With time-based preemption disabled the same self-loop still
-        // terminates — via the MAX_STEPS runaway guard — so `run` never hangs.
-        let mut m = mem();
-        m.write_init(CODE, &[0xEB, 0xFE]).unwrap();
+    fn new_contention_gets_full_quantum_after_solo_execution() {
+        let mut memory = mem();
+        memory.write_init(CODE, &[0x75, 0xFE]).unwrap(); // jnz .
         let mut cpu = X86Interp::new(CODE, STACK);
-        cpu.quantum = None;
+        let clock = Arc::new(VirtualClock::new());
+        cpu.set_clock(clock.clone(), 7);
+        cpu.time.quantum = 3;
+        cpu.set_preemption_required(false);
+        clock.set_deadline(Some(100));
+        assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+        assert_eq!(cpu.retired_branches(), Some(100));
+        clock.set_deadline(None);
+        cpu.set_preemption_required(true);
+        assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+        assert_eq!(cpu.retired_branches(), Some(103));
+        // An incidental repeat of the policy keeps the remaining quantum.
+        cpu.set_preemption_required(true);
+        assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+        assert_eq!(cpu.retired_branches(), Some(103));
+    }
+
+    #[test]
+    fn fairness_budget_survives_syscall_exits() {
+        let mut m = mem();
+        // jnz next; syscall; jnz $ (both branches retire, taken or not).
+        m.write_init(CODE, &[0x75, 0x00, 0x0F, 0x05, 0x75, 0xFE])
+            .unwrap();
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.time.quantum = 3;
+        cpu.begin_slice();
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Syscall);
+        cpu.set_syscall_ret(0);
         assert_eq!(cpu.run(&mut m).unwrap(), Exit::Interrupted);
+        assert_eq!(cpu.retired_branches(), Some(3));
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Interrupted);
+        assert_eq!(cpu.retired_branches(), Some(3));
+        cpu.begin_slice();
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Interrupted);
+        assert_eq!(cpu.retired_branches(), Some(6));
+    }
+
+    #[test]
+    fn rdtsc_polling_hands_off_at_timer_boundary() {
+        let mut m = mem();
+        m.write_init(CODE, &[0x0F, 0x31, 0xEB, 0xFC]).unwrap(); // rdtsc; jmp back
+        let clock = Arc::new(VirtualClock::new());
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.set_clock(clock.clone(), 7);
+        clock.set_deadline(Some(100));
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Interrupted);
+        assert_eq!(
+            cpu.rip,
+            CODE + 2,
+            "stop immediately after observing the deadline"
+        );
+        assert_eq!(clock.now_monotonic().as_nanos(), 100);
+        assert_eq!(clock.execution_ns(), 0);
+    }
+
+    #[test]
+    fn syscall_retries_do_not_advance_time_and_getters_share_read_streak() {
+        let mut m = mem();
+        m.write_init(CODE, &[0x0F, 0x31, 0x0F, 0x05]).unwrap();
+        let clock = Arc::new(VirtualClock::new());
+        let mut cpu = X86Interp::new(CODE, STACK);
+        cpu.set_clock(clock.clone(), 7);
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Syscall);
+        assert_eq!(clock.now_monotonic().as_nanos(), 2); // first read + entry
+        assert_eq!(clock.observe(7).as_nanos(), 4); // syscall getter's second read
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Syscall);
+        assert_eq!(clock.now_monotonic().as_nanos(), 4);
+        cpu.set_syscall_ret(0);
+        cpu.set_pc(CODE);
+        assert_eq!(cpu.run(&mut m).unwrap(), Exit::Syscall);
+        assert_eq!(clock.now_monotonic().as_nanos(), 9); // third read + new entry
     }
 
     /// Coverage scan: execute every instruction encoding listed in the file
@@ -5899,7 +5983,7 @@ mod tests {
         m.write_init(CODE, &[0xC6, 0x05, 0, 0, 0, 0, 0x90, 0xCC, 0x0F, 0x05])
             .unwrap();
         let mut c = X86Interp::new(CODE, STACK);
-        c.quantum = None;
+        c.set_preemption_required(false);
         assert_eq!(c.run(&mut m).unwrap(), Exit::Syscall);
         assert_eq!(c.rip, CODE + 8);
     }

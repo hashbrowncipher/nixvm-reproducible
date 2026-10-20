@@ -56,7 +56,7 @@ pub enum Outcome {
 /// unmodified pre-instruction state — x86 faults are precise).
 pub fn step(mem: &mut GuestMemory, st: &mut CpuState) -> Outcome {
     let mut cpu = X86Interp::new(st.rip, st.gpr[4]);
-    cpu.quantum = None;
+    cpu.time.set_preemption_required(false);
     cpu.gpr = st.gpr;
     cpu.set_rflags_user(st.rflags);
     cpu.fs_base = st.fs_base;
