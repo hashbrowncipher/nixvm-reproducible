@@ -108,6 +108,7 @@ mod linux {
             }
             Ok("abi") => abi_probe(),
             Ok("concurrent") => concurrent_probe(),
+            Ok("errno-contention") => errno_contention_probe(),
             _ => {
                 checked(
                     command("premain")
@@ -119,6 +120,7 @@ mod linux {
                 invalid_seed_is_rejected_after_prestartup_randomness();
                 abi_conventions();
                 checked(command("concurrent").output().unwrap());
+                checked(command("errno-contention").output().unwrap());
                 layout_reexec_preserves_process_state();
                 binary_startup();
                 println!("host determinism integration checks passed");
@@ -304,6 +306,47 @@ mod linux {
         assert_eq!(
             actual, expected,
             "concurrent initial calls must consume one complete stream"
+        );
+    }
+
+    fn errno_contention_probe() {
+        use std::sync::{Arc, Barrier};
+
+        let barrier = Arc::new(Barrier::new(12));
+        let workers: Vec<_> = (0..12)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut bytes = [0; 256];
+                    let mut changed = 0usize;
+                    barrier.wait();
+                    for _ in 0..20_000 {
+                        // SAFETY: the thread owns both its errno slot and all 256
+                        // writable bytes. No other operation intervenes between
+                        // setting errno, invoking the helper and reading errno.
+                        unsafe {
+                            *libc::__errno_location() = libc::E2BIG;
+                            let count = nixvm::host::prepared_getrandom(
+                                bytes.as_mut_ptr().cast(),
+                                bytes.len(),
+                                0,
+                            );
+                            let after = *libc::__errno_location();
+                            assert_eq!(count, 256);
+                            changed += usize::from(after != libc::E2BIG);
+                        }
+                    }
+                    changed
+                })
+            })
+            .collect();
+        let changed: usize = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .sum();
+        assert_eq!(
+            changed, 0,
+            "successful calls must preserve errno under real mutex contention"
         );
     }
 
