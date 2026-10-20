@@ -257,3 +257,40 @@ fn precision_tail_steps_multiple_branches_after_a_syscall_return() {
         "host TF must not leak to the guest"
     );
 }
+
+#[test]
+#[ignore = "requires KVM and guest-only perf counters on a supported Intel CPU"]
+fn unconfined_pmu_restores_the_callers_affinity_and_signal_mask() {
+    fn state() -> ([u64; 16], i32) {
+        let mut affinity = [0; 16];
+        let mut mask = std::mem::MaybeUninit::<libc::sigset_t>::uninit();
+        // SAFETY: complete CPU/signal-set buffers for the calling thread.
+        unsafe {
+            assert!(libc::syscall(libc::SYS_sched_getaffinity, 0, 128, affinity.as_mut_ptr()) >= 0);
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), mask.as_mut_ptr()),
+                0
+            );
+            (affinity, libc::sigismember(&mask.assume_init(), 41))
+        }
+    }
+    let before = state();
+    let backend = KvmBackend::with_branch_quantum(16).unwrap();
+    let mut memory = GuestMemory::new(BASE, 64 * 1024);
+    memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+    memory
+        .write_init(BASE, &[0x48, 0xff, 0xc3, 0x48, 0x85, 0xdb, 0x75, 0xf8])
+        .unwrap();
+    let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+    cpu.set_preemption_required(true);
+    assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+    assert_eq!(
+        state(),
+        before,
+        "host state must be restored before run returns"
+    );
+    drop(cpu);
+    drop(backend);
+    drop(memory);
+    assert_eq!(state(), before);
+}

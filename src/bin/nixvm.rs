@@ -16,6 +16,10 @@ use std::process::ExitCode;
 
 use nixvm::{Arch, Sandbox};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[path = "nixvm/host_random.rs"]
+mod host_random;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -38,7 +42,8 @@ fn main() -> ExitCode {
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
-    let mut builder = Sandbox::builder();
+    let mut builder =
+        Sandbox::builder().confine_host(cfg!(all(target_os = "linux", target_arch = "x86_64")));
     let mut erofs_layers = Vec::new();
     let mut directory_root = false;
     let mut i = 0;
@@ -60,6 +65,18 @@ fn cmd_run(args: &[String]) -> ExitCode {
                     return ExitCode::FAILURE;
                 };
                 builder = builder.random_seed(seed);
+                i += 2;
+            }
+            Some("--vcpu-capacity") => {
+                let Some(capacity) = args
+                    .get(i + 1)
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .filter(|value| (1..=1024).contains(value))
+                else {
+                    eprintln!("nixvm: --vcpu-capacity needs a number in 1..=1024");
+                    return ExitCode::FAILURE;
+                };
+                builder = builder.vcpu_capacity(capacity);
                 i += 2;
             }
             Some("--workdir") => {
@@ -124,6 +141,11 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if !erofs_layers.is_empty() {
         builder = builder.root_erofs_layers(erofs_layers);
     }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Err(error) = host_random::prepare() {
+        eprintln!("nixvm: prepare host randomness: {error}");
+        return ExitCode::FAILURE;
+    }
     match builder.command(command).run() {
         Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1)),
         Err(e) => {
@@ -165,7 +187,11 @@ fn print_usage() {
                    [--env KEY=VAL]... -- <cmd> [args...]\n    \
          nixvm shell\n    \
          nixvm version\n\n\
-         The current directory is exposed inside the sandbox at /work.\n\
+         --workdir explicitly exposes a host directory at /work.\n\
+         --vcpu-capacity bounds simultaneous guest CPUs (default 128).\n\
+         Linux x86-64 runs irreversibly confine the host process before parsing guest files.\n\
+         Host-directory symlinks and metadata changes are unavailable when confined;\n\
+         EROFS guest symlinks remain supported. Host networking is unavailable.\n\
          --root uses an extracted host rootfs directory as the guest root.\n\
          --erofs loads root layers in base-to-top order (repeat for more layers;\n\
          requires the erofs feature). Guest writes use an ephemeral tmpfs upper.\n\

@@ -1,4 +1,6 @@
 /target
+/.scratch/
+/.venv
 **/*.rs.bk
 *.pdb
 

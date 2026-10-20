@@ -40,6 +40,9 @@ pub struct Fd(pub c_int);
 
 impl Drop for Fd {
     fn drop(&mut self) {
+        if self.0 < 0 || crate::confinement::retained(self.0) {
+            return;
+        }
         // SAFETY: `self.0` is a live fd owned by this value, closed only here.
         unsafe { sys::close(self.0) };
     }
@@ -62,7 +65,7 @@ pub fn check(ret: c_int, what: &str) -> Result<c_int, VcpuError> {
 /// single memslot it registered.
 #[derive(Debug)]
 pub struct Vm {
-    _sys_fd: Fd,
+    system_fd: Fd,
     fd: Fd,
     vcpu_mmap_size: usize,
     cpuid: Box<sys::kvm_cpuid2>,
@@ -77,6 +80,15 @@ pub struct Vm {
     /// Logical time shared by every vcpu and address space in this VM. RDTSC,
     /// RDTSCP and syscall entry each advance it by one tick.
     tsc: AtomicU64,
+    slots: Mutex<Option<Vec<Slot>>>,
+    event_flags: AtomicU32,
+}
+
+#[derive(Debug)]
+struct Slot {
+    fd: c_int,
+    run: usize,
+    reset: sys::kvm_sregs,
 }
 
 // SAFETY: `Vm` is shared (`Arc`) across the vcpus of one kernel. The pool handle
@@ -146,7 +158,7 @@ impl Vm {
         };
 
         Ok(Self {
-            _sys_fd: sys_fd,
+            system_fd: sys_fd,
             fd,
             vcpu_mmap_size,
             cpuid,
@@ -155,6 +167,8 @@ impl Vm {
             pool: Mutex::new(None),
             next_vcpu_id: AtomicU32::new(0),
             tsc: AtomicU64::new(0),
+            slots: Mutex::new(None),
+            event_flags: AtomicU32::new(0),
         })
     }
 
@@ -199,6 +213,54 @@ impl Vm {
 
     /// Create a vcpu: its fd and the shared `kvm_run` page.
     pub fn create_vcpu(&self) -> Result<(Fd, *mut sys::kvm_run), VcpuError> {
+        let mut slots = self.slots.lock().unwrap();
+        if let Some(pool) = slots.as_mut() {
+            let slot = pool
+                .pop()
+                .ok_or_else(|| VcpuError::Backend("guest vCPU capacity exhausted".into()))?;
+            let fd = Fd(slot.fd);
+            let events = sys::kvm_vcpu_events {
+                flags: self.event_flags.load(Ordering::Relaxed),
+                ..Default::default()
+            };
+            let debugregs = sys::kvm_debugregs {
+                dr6: 0xffff_0ff0,
+                dr7: 0x400,
+                ..Default::default()
+            };
+            // SAFETY: pool slots remain mapped and open throughout the run.
+            unsafe {
+                check(
+                    sys::ioctl(fd.0, sys::KVM_SET_VCPU_EVENTS, &events),
+                    "reset pooled events",
+                )?;
+                check(
+                    sys::ioctl(fd.0, sys::KVM_SET_DEBUGREGS, &debugregs),
+                    "reset pooled debug registers",
+                )?;
+                check(
+                    sys::ioctl(fd.0, sys::KVM_SET_MP_STATE, &0u32),
+                    "reset pooled MP state",
+                )?;
+                check(
+                    sys::ioctl(fd.0, sys::KVM_SET_SREGS, &slot.reset),
+                    "reset pooled sregs",
+                )?;
+                check(
+                    sys::ioctl(
+                        fd.0,
+                        sys::KVM_SET_GUEST_DEBUG,
+                        &sys::kvm_guest_debug::default(),
+                    ),
+                    "reset pooled debugger",
+                )?;
+            }
+            return Ok((fd, slot.run as *mut sys::kvm_run));
+        }
+        self.create_raw_vcpu()
+    }
+
+    fn create_raw_vcpu(&self) -> Result<(Fd, *mut sys::kvm_run), VcpuError> {
         let id = self.next_vcpu_id.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `KVM_CREATE_VCPU` takes the vcpu id; the fd is owned below.
         let raw = unsafe { sys::ioctl(self.fd.0, sys::KVM_CREATE_VCPU, u64::from(id)) };
@@ -222,6 +284,60 @@ impl Vm {
             )));
         }
         Ok((fd, run.cast()))
+    }
+
+    pub fn prepare_pool(
+        &self,
+        capacity: usize,
+    ) -> Result<crate::confinement::Resources, VcpuError> {
+        if capacity == 0 || capacity > 1024 {
+            return Err(VcpuError::Backend(
+                "vCPU capacity must be in 1..=1024".into(),
+            ));
+        }
+        let mut resources = crate::confinement::Resources::default();
+        resources.protected.extend([self.system_fd.0, self.fd.0]);
+        let mut slots = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            let (fd, run) = self.create_raw_vcpu()?;
+            let mut reset = sys::kvm_sregs::default();
+            let mut events = sys::kvm_vcpu_events::default();
+            // SAFETY: live preallocated vCPU and writable ABI-sized buffer.
+            check(
+                unsafe { sys::ioctl(fd.0, sys::KVM_GET_SREGS, &raw mut reset) },
+                "snapshot pooled sregs",
+            )?;
+            // The getter returns this VM's supported event-validity flags;
+            // enabling unsupported optional event fields would fail reset.
+            check(
+                unsafe { sys::ioctl(fd.0, sys::KVM_GET_VCPU_EVENTS, &raw mut events) },
+                "snapshot pooled event flags",
+            )?;
+            self.event_flags.store(events.flags, Ordering::Relaxed);
+            resources.vcpus.push(fd.0);
+            resources.protected.push(fd.0);
+            slots.push(Slot {
+                fd: fd.0,
+                run: run as usize,
+                reset,
+            });
+            std::mem::forget(fd);
+        }
+        *self.slots.lock().unwrap() = Some(slots);
+        Ok(resources)
+    }
+
+    pub fn recycle(&self, fd: i32, run: *mut sys::kvm_run, reset: &sys::kvm_sregs) -> bool {
+        if let Some(pool) = self.slots.lock().unwrap().as_mut() {
+            pool.push(Slot {
+                fd,
+                run: run as usize,
+                reset: *reset,
+            });
+            true
+        } else {
+            false
+        }
     }
 
     pub fn vcpu_mmap_size(&self) -> usize {
@@ -304,8 +420,10 @@ mod tests {
     use crate::vcpu::cpuid::ENTRIES;
 
     fn supported_profile() -> sys::kvm_cpuid2 {
-        let mut supported = sys::kvm_cpuid2::default();
-        supported.nent = ENTRIES.len() as u32;
+        let mut supported = sys::kvm_cpuid2 {
+            nent: ENTRIES.len() as u32,
+            ..Default::default()
+        };
         for (target, source) in supported.entries.iter_mut().zip(ENTRIES) {
             target.function = source.leaf;
             target.index = source.subleaf;

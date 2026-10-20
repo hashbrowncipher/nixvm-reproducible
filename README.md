@@ -244,11 +244,45 @@ reads and clone order; host scheduling, clocks and external I/O remain separate.
 ELF `AT_RANDOM` and CPU randomness instructions retain their own deterministic
 policies.
 
+## Linux host confinement
+
+The Linux x86-64 CLI confines its host process before parsing guest files or
+decompressing images. It opens images and KVM resources first, prepares worker
+threads, timers and perf counters, closes inherited descriptors above stderr,
+and drops capabilities, dumpability and new privileges. Landlock restricts file
+contents and seccomp applies to every worker. Landlock ABI 5, close_range and
+seccomp thread synchronization are required;
+confinement setup errors stop the run.
+
+No host directory is mounted by default. `--workdir DIR` explicitly mounts
+`DIR` at `/work`; `--root DIR` supplies a read-only directory root. Library
+bind mounts are also explicit. Without directories, the syscall policy denies
+all path opens, directory enumeration and filesystem metadata operations.
+With passthrough mounts, `newfstatat` permits pathname metadata, including
+information about open descriptors such as EROFS archive timestamps. Landlock
+does not restrict that metadata. Host symlink following and metadata changes
+are unavailable in this profile; EROFS guest symlinks remain supported.
+
+`--vcpu-capacity N` bounds simultaneous live guest vCPUs (default 128).
+Preopened KVM slots are reset and reused, so the limit does not bound lifetime
+forks. Exhaustion returns guest EAGAIN. Host networking is unavailable.
+`--mem` bounds the guest RAM pool (default 8 GiB; for example, `--mem 512M`),
+not total host allocations; tmpfs, caches
+and host bookkeeping have no cgroup memory cap.
+
+The embeddable library remains unconfined unless the caller explicitly sets
+`Sandbox::builder().confine_host(true)` and calls `run`. This requires a
+dedicated single-threaded process and irreversibly changes it. Requested
+confinement fails on unsupported targets; the CLI on other targets retains
+its existing unconfined behavior. The CLI's host entropy hook is linked only
+into the executable: it seeds a separate ChaCha20 generator before confinement
+for std's hash keys. It does not change the guest's seeded stream.
+
 ## Default sandbox layout
 
 ```
 /           tmpfs by default; overlay(read-only root, tmpfs) when selected
-/work       the host's current working directory, passed through read-write
+/work       a host directory only when explicitly selected with --workdir
 /tmp,/dev,  synthesized in-sandbox (tmpfs / devfs / procfs / sysfs)
 /proc,/sys
 ```
@@ -259,9 +293,9 @@ policies.
   crate (`abi`, `vcpu`, `loader`, `fs`, `kernel`, `image`, `sandbox`) instead
   of a workspace; heavy or platform-specific dependencies are opt-in cargo
   features (`hvf`, `kvm`, `interp`, `fstool`, `wasm`, `cli`) rather than
-  separate crates. The core builds fully offline with zero third-party
-  dependencies.
-- **`unsafe` policy.** `unsafe` is confined to four documented sites; the
+  separate crates. Linux confinement dependencies are target-gated.
+- **`unsafe` policy.** Host confinement and the executable entropy hook join
+  the documented host FFI sites below; the
   interpreter and kernel paths have none. (1) `vcpu::hvf` — the
   Hypervisor.framework FFI (`hv_vm_*`/`hv_vcpu_*`) — and `vcpu::kvm`, its
   Linux equivalent (hand-rolled `/dev/kvm` ioctls, structs verified against

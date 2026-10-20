@@ -166,6 +166,36 @@ pub const KVM_GUESTDBG_ENABLE: u32 = 0x0000_0001;
 pub const KVM_GUESTDBG_SINGLESTEP: u32 = 0x0000_0002;
 pub const KVM_GUESTDBG_BLOCKIRQ: u32 = 0x0010_0000;
 pub const KVM_SET_SIGNAL_MASK: c_ulong = 0x4004_ae8b;
+pub const KVM_SET_MP_STATE: c_ulong = 0x4004_ae99;
+pub const KVM_SET_VCPU_EVENTS: c_ulong = 0x4040_aea0;
+pub const KVM_GET_VCPU_EVENTS: c_ulong = 0x8040_ae9f;
+pub const KVM_SET_DEBUGREGS: c_ulong = 0x4080_aea2;
+
+/// linux/asm/kvm.h event state, including pending fault and interrupt state.
+#[repr(C)]
+#[derive(Default)]
+pub struct kvm_vcpu_events {
+    pub exception: [u8; 8],
+    pub interrupt: [u8; 4],
+    pub nmi: [u8; 4],
+    pub sipi_vector: u32,
+    pub flags: u32,
+    pub smi: [u8; 4],
+    pub triple_fault: u8,
+    pub reserved: [u8; 26],
+    pub exception_has_payload: u8,
+    pub exception_payload: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct kvm_debugregs {
+    pub db: [u64; 4],
+    pub dr6: u64,
+    pub dr7: u64,
+    pub flags: u64,
+    pub reserved: [u64; 9],
+}
 
 /// KVM uses an eight-byte kernel signal set, preceded by its length.
 #[repr(C)]

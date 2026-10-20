@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 /// A `KvmVcpu` can migrate between the SMP worker threads, so the timer is a
 /// thread-local keyed to the thread that actually runs the guest, created lazily
 /// and re-armed around each `KVM_RUN`.
-mod preempt {
+pub(super) mod preempt {
     use super::sys;
     use std::cell::Cell;
     use std::sync::Once;
@@ -123,6 +123,15 @@ mod preempt {
         })
     }
 
+    pub fn prepare() -> Result<(), crate::vcpu::VcpuError> {
+        thread_timer().map(|_| ()).ok_or_else(|| {
+            crate::vcpu::VcpuError::Backend(format!(
+                "prepare preemption timer: {}",
+                std::io::Error::last_os_error()
+            ))
+        })
+    }
+
     /// Arm this thread's timer to fire once after `d` (a zero `it_interval`
     /// makes it one-shot). Call immediately before `KVM_RUN`.
     pub fn arm(d: Duration) {
@@ -189,6 +198,7 @@ const EFER_LONG: u64 = 0xD01;
 
 #[allow(clippy::struct_excessive_bools)] // independent per-vcpu flags
 pub struct KvmVcpu {
+    initial_sregs: sys::kvm_sregs,
     vm: Arc<Vm>,
     fd: super::vm::Fd,
     /// Kernel-shared run page, mapped for the fd's lifetime.
@@ -397,7 +407,9 @@ impl KvmVcpu {
         }
         let watchpoint = watchpoints;
 
-        Ok(Self {
+        let initial_sregs = sregs;
+        let vcpu = Self {
+            initial_sregs,
             vm,
             fd,
             run,
@@ -414,7 +426,15 @@ impl KvmVcpu {
             tlb_flush_pending: false,
             phys: None,
             kstack_pa: 0,
-        })
+        };
+        // Reset all guest-visible floating point state when a pool slot changes
+        // owner. The full host XSAVE buffer is zeroed by write_xsave.
+        let mut state = vec![0; crate::vcpu::X86_XSAVE_SIZE];
+        state[..2].copy_from_slice(&0x037fu16.to_le_bytes());
+        state[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        state[512..520].copy_from_slice(&3u64.to_le_bytes());
+        vcpu.write_xsave(&state)?;
+        Ok(vcpu)
     }
 
     /// Point the vcpu's `sregs.cr3` at `mem`'s address space if it isn't already —
@@ -605,6 +625,12 @@ impl KvmVcpu {
                 continue;
             };
             if exit == Exit::Syscall {
+                if pmu_enabled {
+                    // SYSCALL copies KVM's host single-step TF into R11. It is
+                    // not guest state and must not survive the return to CPL3.
+                    self.regs.r11 &= !0x100;
+                    self.regs_dirty = true;
+                }
                 // Count actual guest entry once. A blocked syscall is delivered
                 // again through in_syscall without running or ticking here.
                 self.vm.tick();
@@ -991,6 +1017,12 @@ impl Vcpu for KvmVcpu {
         self.regs.rax = value;
         self.regs_dirty = true;
         self.in_syscall = false;
+        if self.pmu.is_some() {
+            // Hardware SYSRET loads R11 into RFLAGS and clears KVM's temporary
+            // single-step TF. Finish the return here so the precision tail
+            // steps user instructions one at a time across syscall boundaries.
+            self.settle_syscall_return();
+        }
     }
 
     fn reg(&self, idx: usize) -> u64 {
@@ -1066,13 +1098,16 @@ impl Vcpu for KvmVcpu {
     }
 
     fn fork(&self) -> Box<dyn Vcpu> {
+        self.try_fork().expect("create KVM vcpu (fork)")
+    }
+
+    fn try_fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
         // A sibling vcpu in the same VM, cloned from the cached (just
         // refreshed) register state — including the mid-trap CPL0 segment
         // state, so the child's resume path is identical to the parent's. The
         // child re-issues the guest slot for its own (forked) memory on its
         // first `run` via the backing-generation seam.
-        let mut child = Self::create(self.vm.clone(), self.pmu.as_ref().map(pmu::Pmu::quantum))
-            .expect("create KVM vcpu (fork)");
+        let mut child = Self::create(self.vm.clone(), self.pmu.as_ref().map(pmu::Pmu::quantum))?;
         child.regs = self.regs;
         child.regs_dirty = true;
         child.sregs = self.sregs;
@@ -1083,9 +1118,9 @@ impl Vcpu for KvmVcpu {
         child.cur_cr3 = None;
         // XSAVE includes the upper YMM halves and the component presence bits
         // needed to restore the complete x87/SSE/AVX register file.
-        let state = self.read_xsave().expect("read XSAVE state (fork)");
-        child.write_xsave(&state).expect("write XSAVE state (fork)");
-        Box::new(child)
+        let state = self.read_xsave()?;
+        child.write_xsave(&state)?;
+        Ok(Box::new(child))
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {
@@ -1153,6 +1188,10 @@ impl Vcpu for KvmVcpu {
 
 impl Drop for KvmVcpu {
     fn drop(&mut self) {
+        if self.vm.recycle(self.fd.0, self.run, &self.initial_sregs) {
+            self.fd.0 = -1;
+            return;
+        }
         // SAFETY: `run` is the live mapping created in `Vm::create_vcpu`,
         // unmapped exactly once here; the fd closes via its own Drop.
         unsafe { sys::munmap(self.run.cast(), self.vm.vcpu_mmap_size()) };

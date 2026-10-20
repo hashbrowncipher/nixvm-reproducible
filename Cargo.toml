@@ -2,10 +2,8 @@
 #
 # One crate. Internal structure (abi / vcpu / kernel / fs / loader / image /
 # sandbox) lives as modules, and heavy or platform-specific dependencies are
-# feature-gated rather than split into separate crates. `unsafe` is confined to
-# four documented sites: `vcpu::hvf` (Hypervisor.framework FFI), `vcpu::kvm`
-# (/dev/kvm ioctl FFI), `vcpu::region` (page-aligned guest-RAM allocation), and
-# `fs::passthrough` (*at(2) FFI). See ROADMAP.md for the plan.
+# feature/target-gated. Host FFI lives in the hardware backends, guest-memory
+# allocation, filesystem passthrough, Linux confinement, and CLI entropy hook.
 
 [package]
 name = "nixvm"
@@ -114,6 +112,9 @@ toml = { version = "=0.8.23", default-features = false, features = ["parse"] }
 
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder"] }
+landlock = "=0.4.7"
+libc = "=0.2.186"
+seccompiler = "=0.5.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Only pulled in on wasm32, and only linked when the `wasm` feature is on

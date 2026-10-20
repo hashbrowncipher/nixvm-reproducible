@@ -9,6 +9,7 @@ use super::{
     vm::{Fd, check},
 };
 use crate::vcpu::VcpuError;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 const SIGNAL: i32 = 41;
@@ -223,70 +224,128 @@ fn install_handler() -> Result<(), VcpuError> {
         .map_err(error)
 }
 
-struct Affinity([u64; 16]);
+thread_local! {
+    // One counter belongs to the host worker, while guest budgets belong to vCPUs.
+    static WORKER: RefCell<Option<Counter>> = const { RefCell::new(None) };
+    static PREPARED: Cell<bool> = const { Cell::new(false) };
+}
 
-impl Affinity {
-    fn pin() -> Result<Self, VcpuError> {
-        let mut original = [0; 16];
-        // SAFETY: buffers hold a 1024-bit cpu_set_t; pid 0 means this thread.
+struct HostScope {
+    affinity: [u64; 16],
+    mask: [u64; 16],
+    restore: bool,
+}
+
+impl HostScope {
+    fn acquire() -> Result<Self, VcpuError> {
+        let mut scope = Self {
+            affinity: [0; 16],
+            mask: [0; 16],
+            restore: false,
+        };
+        // SAFETY: a complete cpu_set_t and pid zero for this thread.
         check(
-            unsafe { sys::sched_getaffinity(0, 128, &raw mut original) },
+            unsafe { sys::sched_getaffinity(0, 128, &raw mut scope.affinity) },
             "PMU get affinity",
         )?;
-        // SAFETY: sched_getcpu takes no pointers.
+        // SAFETY: no arguments.
         let cpu = check(unsafe { sys::sched_getcpu() }, "PMU current CPU")? as usize;
         if cpu >= 1024 {
             return Err(error("CPU id exceeds affinity mask"));
         }
-        let mut pinned = [0; 16];
+        let mut pinned = [0u64; 16];
         pinned[cpu / 64] = 1 << (cpu % 64);
-        // SAFETY: valid CPU set, confined to the caller's allowed CPU.
+        // SAFETY: this CPU belongs to the caller's original mask.
         check(
             unsafe { sys::sched_setaffinity(0, 128, &raw const pinned) },
             "PMU pin CPU",
         )?;
-        Ok(Self(original))
-    }
-}
-
-impl Drop for Affinity {
-    fn drop(&mut self) {
-        // SAFETY: restore this thread's saved CPU set.
-        unsafe {
-            sys::sched_setaffinity(0, 128, &raw const self.0);
+        // First read the mask, so error cleanup can restore both resources.
+        let result = unsafe { sys::pthread_sigmask(0, std::ptr::null(), &raw mut scope.mask) };
+        if result != 0 {
+            unsafe {
+                sys::sched_setaffinity(0, 128, &raw const scope.affinity);
+            }
+            return Err(error(std::io::Error::from_raw_os_error(result).to_string()));
         }
-    }
-}
-
-struct SignalMask([u64; 16]);
-
-impl SignalMask {
-    fn block() -> Result<Self, VcpuError> {
-        let mut original = [0; 16];
-        let mut blocked = [0; 16];
+        scope.restore = true;
+        let mut blocked = [0u64; 16];
         blocked[0] = 1 << (SIGNAL - 1);
-        // SAFETY: libc signal sets are 128 bytes; SIG_BLOCK=0.
-        let result = unsafe { sys::pthread_sigmask(0, &raw const blocked, &raw mut original) };
+        // SAFETY: valid libc signal sets; SIG_BLOCK is zero.
+        let result = unsafe { sys::pthread_sigmask(0, &raw const blocked, std::ptr::null_mut()) };
         if result != 0 {
             return Err(error(std::io::Error::from_raw_os_error(result).to_string()));
         }
-        Ok(Self(original))
+        Ok(scope)
+    }
+
+    fn restore(&mut self) -> Result<(), VcpuError> {
+        if !self.restore {
+            return Ok(());
+        }
+        // SAFETY: restore this same thread's saved state; attempt both on error.
+        let signal = unsafe { sys::pthread_sigmask(2, &raw const self.mask, std::ptr::null_mut()) };
+        let affinity = unsafe { sys::sched_setaffinity(0, 128, &raw const self.affinity) };
+        if signal != 0 {
+            return Err(error(std::io::Error::from_raw_os_error(signal).to_string()));
+        }
+        check(affinity, "PMU restore affinity")?;
+        self.restore = false;
+        Ok(())
+    }
+}
+impl Drop for HostScope {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 
-impl Drop for SignalMask {
-    fn drop(&mut self) {
-        // SAFETY: restore the calling thread's saved mask; SIG_SETMASK=2.
-        unsafe {
-            sys::pthread_sigmask(2, &raw const self.0, std::ptr::null_mut());
+fn ensure_counter(mask: u64) -> Result<(), VcpuError> {
+    let profile = Profile::detect()?;
+    WORKER.with(|slot| {
+        let mut counter = slot.borrow_mut();
+        if counter
+            .as_ref()
+            .is_none_or(|counter| counter.profile != profile)
+        {
+            // SAFETY: gettid takes no arguments.
+            *counter = Some(Counter::open(unsafe { sys::gettid() }, profile)?);
         }
+        counter.as_mut().unwrap().guest_mask = mask & !(1 << (SIGNAL - 1));
+        Ok(())
+    })
+}
+
+pub(super) fn prepare_thread() -> Result<(), VcpuError> {
+    if PREPARED.get() {
+        return Ok(());
     }
+    let mut scope = HostScope::acquire()?;
+    ensure_counter(scope.mask[0])?;
+    // Dedicated confined workers retain their pin and blocked overflow signal.
+    // Every preparation error above restores the caller through HostScope.
+    scope.restore = false;
+    PREPARED.set(true);
+    Ok(())
+}
+
+pub(super) fn worker_fd() -> Option<i32> {
+    WORKER.with(|slot| slot.borrow().as_ref().map(|counter| counter.fd.0))
+}
+
+pub(super) fn clear_inactive_thread_resources() {
+    // A previous unconfined VM may have populated the thread cache. Drop it
+    // before inherited-FD cleanup can close and reuse its numeric descriptor.
+    WORKER.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    PREPARED.set(false);
 }
 
 struct Counter {
     fd: Fd,
-    thread: i32,
     profile: Profile,
+    guest_mask: u64,
 }
 
 impl Counter {
@@ -318,8 +377,8 @@ impl Counter {
         }
         Ok(Self {
             fd,
-            thread,
             profile,
+            guest_mask: 0,
         })
     }
 }
@@ -327,7 +386,6 @@ impl Counter {
 pub(super) struct Pmu {
     enabled: bool,
     budget: Budget,
-    counter: Option<Counter>,
 }
 
 impl Pmu {
@@ -339,7 +397,6 @@ impl Pmu {
                 used: 0,
                 total: 0,
             },
-            counter: None,
         }
     }
     pub fn quantum(&self) -> u64 {
@@ -368,32 +425,29 @@ impl Pmu {
         if !self.enabled {
             return Ok(None);
         }
-        let affinity = Affinity::pin()?;
-        let profile = Profile::detect()?;
-        // SAFETY: gettid has no arguments.
-        let thread = unsafe { sys::gettid() };
-        if self
-            .counter
-            .as_ref()
-            .is_none_or(|counter| counter.thread != thread || counter.profile != profile)
-        {
-            self.counter = Some(Counter::open(thread, profile)?);
-        }
-        let signal = SignalMask::block()?;
+        let host = if PREPARED.get() {
+            None
+        } else {
+            let scope = HostScope::acquire()?;
+            ensure_counter(scope.mask[0])?;
+            Some(scope)
+        };
+        let (counter, guest_mask) = WORKER.with(|slot| {
+            let counter = slot.borrow();
+            let counter = counter.as_ref().unwrap();
+            (counter.fd.0, counter.guest_mask)
+        });
         let stepping = self.budget.remaining() <= SKID;
-        let counter = self.counter.as_ref().unwrap().fd.0;
         let guard = RunGuard {
             counter,
             vcpu,
             stepping,
-            signal,
-            affinity,
+            host,
         };
-        // Block overflow outside KVM_RUN and atomically unblock it on entry.
-        // This closes the arm/entry race, including queued stale overflows.
+        // Overflow stays blocked on the host, and KVM unblocks it only in guest.
         let mask = sys::kvm_signal_mask {
             len: 8,
-            mask: (guard.signal.0[0] & !(1 << (SIGNAL - 1))).to_ne_bytes(),
+            mask: guest_mask.to_ne_bytes(),
         };
         let debug = sys::kvm_guest_debug {
             control: if stepping {
@@ -427,7 +481,7 @@ impl Pmu {
         Ok(Some(guard))
     }
 
-    pub fn finish(&mut self, guard: RunGuard) -> Result<(), VcpuError> {
+    pub fn finish(&mut self, mut guard: RunGuard) -> Result<(), VcpuError> {
         // SAFETY: the guard keeps the descriptor live and the CPU pinned.
         check(
             unsafe { sys::ioctl(guard.counter, DISABLE, 0) },
@@ -449,33 +503,20 @@ impl Pmu {
             unsafe { sys::ioctl(guard.vcpu, sys::KVM_SET_GUEST_DEBUG, &debug) },
             "PMU clear single step",
         )?;
-        // Normal completion checks restoration too. Drop retries cleanup on
-        // errors, but a failed restoration must not permit another guest run.
-        // SAFETY: restore the saved libc signal set on the same host thread.
-        let signal_result =
-            unsafe { sys::pthread_sigmask(2, &raw const guard.signal.0, std::ptr::null_mut()) };
-        if signal_result != 0 {
-            return Err(error(
-                std::io::Error::from_raw_os_error(signal_result).to_string(),
-            ));
+        if let Some(host) = guard.host.as_mut() {
+            host.restore()?;
         }
-        // SAFETY: the guard holds this thread's saved CPU affinity.
-        check(
-            unsafe { sys::sched_setaffinity(0, 128, &raw const guard.affinity.0) },
-            "PMU restore affinity",
-        )?;
         drop(guard);
         result
     }
 }
 
-/// Owns all temporary thread and vcpu state, including error paths.
+/// Owns temporary vCPU debugger state, including error paths.
 pub(super) struct RunGuard {
     counter: i32,
     vcpu: i32,
     pub stepping: bool,
-    signal: SignalMask,
-    affinity: Affinity,
+    host: Option<HostScope>,
 }
 
 impl Drop for RunGuard {

@@ -1154,6 +1154,116 @@ impl ServiceCtx {
     }
 }
 
+enum Work {
+    Run(usize, Box<dyn Vcpu>, Arc<Mutex<GuestMemory>>),
+    Kernel(Arc<Kernel>),
+    Stop,
+    #[cfg(test)]
+    Probe(Box<dyn FnOnce() + Send>),
+}
+type Done = (usize, Box<dyn Vcpu>, SliceOutcome);
+type WorkQueue = Arc<(Mutex<VecDeque<Work>>, Condvar)>;
+
+pub(crate) struct PreparedWorkers {
+    queues: Vec<WorkQueue>,
+    done: mpsc::Receiver<Done>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl PreparedWorkers {
+    pub(crate) fn new(
+        count: usize,
+        kvm: bool,
+        pmu: bool,
+    ) -> Result<(Self, Vec<i32>), crate::Error> {
+        let (done_tx, done) = mpsc::channel();
+        let (ready_tx, ready) = mpsc::channel();
+        let mut workers = Self {
+            queues: Vec::new(),
+            done,
+            threads: Vec::new(),
+        };
+        for _ in 0..count {
+            let queue: WorkQueue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+            workers.queues.push(queue.clone());
+            let out = done_tx.clone();
+            let prepared = ready_tx.clone();
+            workers.threads.push(std::thread::spawn(move || {
+                let prep = (|| {
+                    let _ = std::collections::hash_map::RandomState::new();
+                    if kvm {
+                        crate::vcpu::kvm::prepare_thread(pmu)?;
+                    }
+                    crate::confinement::drop_thread_privileges()?;
+                    Ok::<_, crate::Error>(crate::vcpu::kvm::perf_fd())
+                })();
+                let failed = prep.is_err();
+                if prepared.send(prep).is_err() || failed {
+                    return;
+                }
+                let mut kernel: Option<Arc<Kernel>> = None;
+                loop {
+                    let work = {
+                        let mut queue_guard = queue.0.lock().unwrap();
+                        while queue_guard.is_empty() {
+                            queue_guard = queue.1.wait(queue_guard).unwrap();
+                        }
+                        queue_guard.pop_front().unwrap()
+                    };
+                    match work {
+                        #[cfg(test)]
+                        Work::Probe(probe) => probe(),
+                        Work::Stop => break,
+                        Work::Kernel(context) => kernel = Some(context),
+                        Work::Run(id, vcpu, memory) => {
+                            let kernel = kernel.as_ref().expect("prepared kernel context");
+                            if out
+                                .send(run_slice_smp(kernel, kernel.slice_cap, id, vcpu, &memory))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }));
+        }
+        let mut fds = Vec::new();
+        for _ in 0..count {
+            if let Some(fd) = ready
+                .recv()
+                .map_err(|_| crate::Error::Config("worker preparation failed".into()))??
+            {
+                fds.push(fd);
+            }
+        }
+        Ok((workers, fds))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn probe(&self, probe: impl FnOnce() + Send + 'static) {
+        self.queues[0]
+            .0
+            .lock()
+            .unwrap()
+            .push_back(Work::Probe(Box::new(probe)));
+        self.queues[0].1.notify_one();
+    }
+}
+
+impl Drop for PreparedWorkers {
+    fn drop(&mut self) {
+        for queue in &self.queues {
+            queue.0.lock().unwrap().push_back(Work::Stop);
+            queue.1.notify_one();
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// The kernel: immutable-during-servicing config plus the coarse lock over all
 /// mutable state (`Shared`).
 ///
@@ -1730,6 +1840,15 @@ impl Kernel {
                 "PMU scheduling requires one scheduler CPU".into(),
             ));
         }
+        self.start(vcpu, mem);
+        if ncpus > 1 {
+            self.schedule_smp()
+        } else {
+            self.schedule_serial()
+        }
+    }
+
+    fn start(&mut self, vcpu: Box<dyn Vcpu>, mem: GuestMemory) {
         let mut info = std::mem::take(&mut self.seed);
         {
             let sh = self.shared.get_mut().unwrap();
@@ -1750,11 +1869,29 @@ impl Kernel {
                 info,
             }));
         }
-        if ncpus > 1 {
-            self.schedule_smp()
-        } else {
-            self.schedule_serial()
+    }
+
+    pub(crate) fn run_prepared(
+        mut self,
+        vcpu: Box<dyn Vcpu>,
+        mem: GuestMemory,
+        workers: &PreparedWorkers,
+    ) -> Result<i32, VcpuError> {
+        if self.ncpus > 1 && vcpu.retired_branches().is_some() {
+            return Err(VcpuError::Backend(
+                "PMU scheduling requires one scheduler CPU".into(),
+            ));
         }
+        self.start(vcpu, mem);
+        if self.ncpus == 1 {
+            return self.schedule_serial();
+        }
+        let kernel = Arc::new(self);
+        for q in &workers.queues {
+            q.0.lock().unwrap().push_back(Work::Kernel(kernel.clone()));
+            q.1.notify_one();
+        }
+        kernel.schedule_smp_dispatch(&workers.queues, &workers.done)
     }
 
     /// Cooperative single-CPU round-robin scheduler.
@@ -2423,14 +2560,6 @@ impl Kernel {
     /// slices. In-place servicing makes that automatic within a slice.
     #[allow(clippy::too_many_lines)] // the worker pool + scheduler loop reads best as one unit
     fn schedule_smp(&self) -> Result<i32, VcpuError> {
-        // Work handed to a worker: run a slice for this vcpu on this address
-        // space. `Stop` drains the pool at shutdown.
-        enum Work {
-            Run(usize, Box<dyn Vcpu>, Arc<Mutex<GuestMemory>>),
-            Stop,
-        }
-        type Done = (usize, Box<dyn Vcpu>, SliceOutcome);
-
         let nworkers = self.ncpus;
         // `slice_cap` is fixed for the run; snapshot it so workers need no lock
         // to read it.
@@ -2467,7 +2596,10 @@ impl Kernel {
                             }
                         };
                         match work {
+                            #[cfg(test)]
+                            Work::Probe(probe) => probe(),
                             Work::Stop => break,
+                            Work::Kernel(_) => unreachable!("scoped worker already has kernel"),
                             Work::Run(id, vcpu, space) => {
                                 let done = run_slice_smp(kernel, slice_cap, id, vcpu, &space);
                                 if out.send(done).is_err() {
@@ -2480,172 +2612,179 @@ impl Kernel {
             }
             drop(done_tx);
 
-            // Route a run to its home worker (`task index % nworkers`).
-            let push_run = |i: usize, vcpu, space| {
-                let (lock, cv) = &*queues[i % nworkers];
-                lock.lock().unwrap().push_back(Work::Run(i, vcpu, space));
-                cv.notify_one();
-            };
+            self.schedule_smp_dispatch(&queues, &done_rx)
+        })
+    }
 
-            // A task that blocked records the progress epoch at which it did; it
-            // is not re-dispatched until the epoch advances (some other slice
-            // made real progress that might satisfy its wait) — avoiding a busy
-            // spin. `stalled` guards the deadlock/timer path: it is cleared by
-            // any real progress and set once we force a no-timer retry round, so
-            // a genuinely deadlocked machine is detected after exactly one
-            // fruitless retry instead of spinning or erroring prematurely.
-            let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
-            let mut epoch: u64 = 0;
-            let mut inflight = 0usize;
-            let mut stalled = false;
-            let outcome = loop {
-                // Fill idle workers with runnable tasks (kernel lock held only
-                // for the dispatch decision, not while awaiting results).
-                let dispatch = {
-                    let mut sh = self.shared.lock().unwrap();
-                    if let Some(code) = sh.pid1_code() {
-                        break Ok(code);
-                    }
-                    let mut batch = Vec::new();
-                    while inflight + batch.len() < nworkers {
-                        let Some(i) = sh.pick_smp_runnable(&blocked_at, epoch) else {
-                            break;
-                        };
-                        let mm = sh.procs[i].as_ref().unwrap().info.mm;
-                        let space = Arc::clone(&sh.spaces[mm]);
-                        let vcpu = sh.procs[i].as_mut().unwrap().vcpu.take().unwrap();
-                        batch.push((i, vcpu, space));
-                    }
-                    batch
-                };
-                for (i, vcpu, space) in dispatch {
-                    push_run(i, vcpu, space);
-                    inflight += 1;
-                }
+    fn schedule_smp_dispatch(
+        &self,
+        queues: &[WorkQueue],
+        done_rx: &mpsc::Receiver<Done>,
+    ) -> Result<i32, VcpuError> {
+        let nworkers = queues.len();
+        // Route a run to its home worker (`task index % nworkers`).
+        let push_run = |i: usize, vcpu, space| {
+            let (lock, cv) = &*queues[i % nworkers];
+            lock.lock().unwrap().push_back(Work::Run(i, vcpu, space));
+            cv.notify_one();
+        };
 
-                if inflight == 0 {
-                    // Nothing runnable and nothing in flight. Decide under the
-                    // kernel lock, mirroring the serial scheduler's stall logic.
-                    let action = {
-                        let sh = self.shared.lock().unwrap();
-                        if !sh.any_running() {
-                            break Ok(sh.pid1_code().unwrap_or(0));
-                        }
-                        // A pending timed wait (poll/epoll timeout, setTimeout)
-                        // isn't a deadlock — it just needs the wall clock to
-                        // advance. Sleep to the earliest deadline, then force a
-                        // retry so the waiter re-checks its now-passed deadline.
-                        if let Some(dl) = sh.earliest_deadline() {
-                            StallAction::SleepUntil(dl)
-                        } else if self.net.lock().unwrap().has_pending_host_io() {
-                            // A live host connection may still deliver data
-                            // asynchronously (an in-flight HTTP response). There
-                            // is no host-side wakeup into this cooperative loop,
-                            // so poll for it — a short sleep, then a retry round
-                            // that re-checks socket readiness — rather than
-                            // mistaking the wait for a deadlock.
-                            StallAction::SleepUntil(poll::now_ns() + HOST_IO_POLL_NS)
-                        } else if !stalled {
-                            // No timer: catch a lost futex wake / a child that
-                            // became a zombie with one forced retry round before
-                            // declaring deadlock.
-                            StallAction::Retry
-                        } else {
-                            StallAction::Deadlock
-                        }
-                    };
-                    match action {
-                        StallAction::SleepUntil(dl) => {
-                            let now = poll::now_ns();
-                            if dl > now {
-                                let ns = (dl - now).min(3_600_000_000_000) as u64;
-                                std::thread::sleep(std::time::Duration::from_nanos(ns));
-                            }
-                            stalled = false;
-                            epoch += 1;
-                        }
-                        StallAction::Retry => {
-                            stalled = true;
-                            epoch += 1;
-                        }
-                        StallAction::Deadlock => {
-                            break Err(VcpuError::Backend(
-                                "deadlock: every task is blocked".into(),
-                            ));
-                        }
-                    }
-                    continue;
-                }
-
-                // Await one slice result (kernel lock released while we wait, so
-                // other workers keep servicing).
-                let (i, vcpu, out) = done_rx.recv().expect("workers outlive the scheduler");
-                inflight -= 1;
+        // A task that blocked records the progress epoch at which it did; it
+        // is not re-dispatched until the epoch advances (some other slice
+        // made real progress that might satisfy its wait) — avoiding a busy
+        // spin. `stalled` guards the deadlock/timer path: it is cleared by
+        // any real progress and set once we force a no-timer retry round, so
+        // a genuinely deadlocked machine is detected after exactly one
+        // fruitless retry instead of spinning or erroring prematurely.
+        let mut blocked_at: BTreeMap<usize, u64> = BTreeMap::new();
+        let mut epoch: u64 = 0;
+        let mut inflight = 0usize;
+        let mut stalled = false;
+        let outcome = loop {
+            // Fill idle workers with runnable tasks (kernel lock held only
+            // for the dispatch decision, not while awaiting results).
+            let dispatch = {
                 let mut sh = self.shared.lock().unwrap();
-                // Re-attach the vcpu to its task slot — unless the task was
-                // *reaped while in flight*. A task's own worker services its
-                // `exit` in place, marking it a `Zombie` under the kernel lock
-                // before shipping the vcpu back here; in that window a sibling's
-                // `wait4`/`waitid` (also under the kernel lock) can reap the
-                // zombie and clear its slot to `None`. The orphaned vcpu is then
-                // simply dropped: the task is gone. Only a just-exited task can
-                // hit this (a runnable/blocked task is never a reap target), but
-                // guarding every arm keeps the invariant local.
-                let reattach = |sh: &mut Shared, vcpu| {
-                    if let Some(p) = sh.procs[i].as_mut() {
-                        p.vcpu = Some(vcpu);
+                if let Some(code) = sh.pid1_code() {
+                    break Ok(code);
+                }
+                let mut batch = Vec::new();
+                while inflight + batch.len() < nworkers {
+                    let Some(i) = sh.pick_smp_runnable(&blocked_at, epoch) else {
+                        break;
+                    };
+                    let mm = sh.procs[i].as_ref().unwrap().info.mm;
+                    let space = Arc::clone(&sh.spaces[mm]);
+                    let vcpu = sh.procs[i].as_mut().unwrap().vcpu.take().unwrap();
+                    batch.push((i, vcpu, space));
+                }
+                batch
+            };
+            for (i, vcpu, space) in dispatch {
+                push_run(i, vcpu, space);
+                inflight += 1;
+            }
+
+            if inflight == 0 {
+                // Nothing runnable and nothing in flight. Decide under the
+                // kernel lock, mirroring the serial scheduler's stall logic.
+                let action = {
+                    let sh = self.shared.lock().unwrap();
+                    if !sh.any_running() {
+                        break Ok(sh.pid1_code().unwrap_or(0));
+                    }
+                    // A pending timed wait (poll/epoll timeout, setTimeout)
+                    // isn't a deadlock — it just needs the wall clock to
+                    // advance. Sleep to the earliest deadline, then force a
+                    // retry so the waiter re-checks its now-passed deadline.
+                    if let Some(dl) = sh.earliest_deadline() {
+                        StallAction::SleepUntil(dl)
+                    } else if self.net.lock().unwrap().has_pending_host_io() {
+                        // A live host connection may still deliver data
+                        // asynchronously (an in-flight HTTP response). There
+                        // is no host-side wakeup into this cooperative loop,
+                        // so poll for it — a short sleep, then a retry round
+                        // that re-checks socket readiness — rather than
+                        // mistaking the wait for a deadlock.
+                        StallAction::SleepUntil(poll::now_ns() + HOST_IO_POLL_NS)
+                    } else if !stalled {
+                        // No timer: catch a lost futex wake / a child that
+                        // became a zombie with one forced retry round before
+                        // declaring deadlock.
+                        StallAction::Retry
+                    } else {
+                        StallAction::Deadlock
                     }
                 };
-                match out {
-                    SliceOutcome::Err(e) => {
-                        reattach(&mut sh, vcpu);
-                        break Err(e);
-                    }
-                    SliceOutcome::Blocked(made_progress) => {
-                        reattach(&mut sh, vcpu);
-                        if made_progress {
-                            epoch += 1;
-                            stalled = false;
+                match action {
+                    StallAction::SleepUntil(dl) => {
+                        let now = poll::now_ns();
+                        if dl > now {
+                            let ns = (dl - now).min(3_600_000_000_000) as u64;
+                            std::thread::sleep(std::time::Duration::from_nanos(ns));
                         }
-                        // Parked at the (post-progress) epoch: it won't re-run
-                        // until some *later* progress advances the epoch.
-                        blocked_at.insert(i, epoch);
-                    }
-                    SliceOutcome::Ended => {
-                        reattach(&mut sh, vcpu);
-                        epoch += 1;
                         stalled = false;
-                    }
-                    SliceOutcome::Yielded | SliceOutcome::Preempted => {
-                        // Still runnable; make it immediately re-dispatchable.
-                        reattach(&mut sh, vcpu);
-                        blocked_at.remove(&i);
                         epoch += 1;
-                        stalled = false;
+                    }
+                    StallAction::Retry => {
+                        stalled = true;
+                        epoch += 1;
+                    }
+                    StallAction::Deadlock => {
+                        break Err(VcpuError::Backend("deadlock: every task is blocked".into()));
                     }
                 }
-            };
+                continue;
+            }
 
-            // Drain any still-in-flight slices so their vcpus are returned and
-            // the workers go idle before we stop them (a slice that errored/
-            // exited may have left siblings running). A drained task may already
-            // have been reaped (see the re-attach note above), so tolerate a
-            // `None` slot.
-            while inflight > 0 {
-                if let Ok((i, vcpu, _)) = done_rx.recv()
-                    && let Some(p) = self.shared.lock().unwrap().procs[i].as_mut()
-                {
+            // Await one slice result (kernel lock released while we wait, so
+            // other workers keep servicing).
+            let (i, vcpu, out) = done_rx.recv().expect("workers outlive the scheduler");
+            inflight -= 1;
+            let mut sh = self.shared.lock().unwrap();
+            // Re-attach the vcpu to its task slot — unless the task was
+            // *reaped while in flight*. A task's own worker services its
+            // `exit` in place, marking it a `Zombie` under the kernel lock
+            // before shipping the vcpu back here; in that window a sibling's
+            // `wait4`/`waitid` (also under the kernel lock) can reap the
+            // zombie and clear its slot to `None`. The orphaned vcpu is then
+            // simply dropped: the task is gone. Only a just-exited task can
+            // hit this (a runnable/blocked task is never a reap target), but
+            // guarding every arm keeps the invariant local.
+            let reattach = |sh: &mut Shared, vcpu| {
+                if let Some(p) = sh.procs[i].as_mut() {
                     p.vcpu = Some(vcpu);
                 }
-                inflight -= 1;
+            };
+            match out {
+                SliceOutcome::Err(e) => {
+                    reattach(&mut sh, vcpu);
+                    break Err(e);
+                }
+                SliceOutcome::Blocked(made_progress) => {
+                    reattach(&mut sh, vcpu);
+                    if made_progress {
+                        epoch += 1;
+                        stalled = false;
+                    }
+                    // Parked at the (post-progress) epoch: it won't re-run
+                    // until some *later* progress advances the epoch.
+                    blocked_at.insert(i, epoch);
+                }
+                SliceOutcome::Ended => {
+                    reattach(&mut sh, vcpu);
+                    epoch += 1;
+                    stalled = false;
+                }
+                SliceOutcome::Yielded | SliceOutcome::Preempted => {
+                    // Still runnable; make it immediately re-dispatchable.
+                    reattach(&mut sh, vcpu);
+                    blocked_at.remove(&i);
+                    epoch += 1;
+                    stalled = false;
+                }
             }
-            // One Stop per worker, into its own queue; the scope joins them.
-            for q in &queues {
-                q.0.lock().unwrap().push_back(Work::Stop);
-                q.1.notify_one();
+        };
+
+        // Drain any still-in-flight slices so their vcpus are returned and
+        // the workers go idle before we stop them (a slice that errored/
+        // exited may have left siblings running). A drained task may already
+        // have been reaped (see the re-attach note above), so tolerate a
+        // `None` slot.
+        while inflight > 0 {
+            if let Ok((i, vcpu, _)) = done_rx.recv()
+                && let Some(p) = self.shared.lock().unwrap().procs[i].as_mut()
+            {
+                p.vcpu = Some(vcpu);
             }
-            outcome
-        })
+            inflight -= 1;
+        }
+        // One Stop per worker, into its own queue; the scope joins them.
+        for q in queues {
+            q.0.lock().unwrap().push_back(Work::Stop);
+            q.1.notify_one();
+        }
+        outcome
     }
 
     /// Service one guest exit for task `i` **in place** on an SMP worker: swap
@@ -3990,6 +4129,9 @@ impl Kernel {
         // threads spawn and rarely change afterward); true live sharing would need
         // a handler table like `file_tables` and is deferred.
 
+        let Ok(mut child_vcpu) = vcpu.try_fork() else {
+            return err(Errno::EAGAIN);
+        };
         let pid = sh.next_pid;
         sh.next_pid += 1;
         let mut info = cx.cur.clone();
@@ -4175,7 +4317,6 @@ impl Kernel {
             sh.spaces.push(Arc::new(Mutex::new(cm)));
         }
 
-        let mut child_vcpu = vcpu.fork();
         if stack != 0 {
             child_vcpu.set_sp(stack);
         }

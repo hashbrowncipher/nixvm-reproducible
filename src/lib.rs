@@ -16,14 +16,16 @@
 //! * [`image`]  — guest root-image resolve/download/cache.
 //! * [`sandbox`]— the public [`Sandbox`] builder that wires it all together.
 //!
-//! `unsafe` is confined to the hardware backends (`vcpu::hvf`, `vcpu::kvm`);
-//! everything else is safe Rust.
+//! Host FFI lives in the hardware backends, guest-memory allocation,
+//! filesystem passthrough, and Linux process confinement. The CLI also owns
+//! its executable-only getrandom interposition.
 //!
 //! ```no_run
 //! use nixvm::Sandbox;
 //!
 //! // Run `npm install` in a sandbox with the cwd mounted at /work.
 //! let status = Sandbox::builder()
+//!     .work_dir(".")
 //!     .command(["npm", "install"])
 //!     .run()?;
 //! std::process::exit(status);
@@ -32,6 +34,8 @@
 
 pub mod abi;
 pub mod clock;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub mod confinement;
 pub mod fs;
 pub mod image;
 pub mod kernel;

@@ -299,6 +299,11 @@ pub trait Vcpu: Send {
     /// return value and advances its PC.
     fn fork(&self) -> Box<dyn Vcpu>;
 
+    /// Fallible guest clone. Resource-limited backends override this method.
+    fn try_fork(&self) -> Result<Box<dyn Vcpu>, VcpuError> {
+        Ok(self.fork())
+    }
+
     /// Reset every register for `execve`: clear general/SIMD registers, flags,
     /// and TLS, then set the entry PC and initial SP for the new image.
     fn reset(&mut self, entry: u64, sp: u64);
@@ -359,6 +364,15 @@ pub trait Backend {
     /// address space is provided to [`Vcpu::run`], not here, so one backend can
     /// spawn several vcpus over the same memory.
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError>;
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn prepare_confinement(
+        &self,
+        _capacity: usize,
+        _mem: &GuestMemory,
+    ) -> Result<crate::confinement::Resources, VcpuError> {
+        Ok(crate::confinement::Resources::default())
+    }
 }
 
 // Behind the `hvf` feature: the backend still maps guest RAM as one flat,

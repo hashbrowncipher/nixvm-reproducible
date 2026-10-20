@@ -63,7 +63,9 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
@@ -302,6 +304,11 @@ fn to_timespec(t: SetTime) -> Timespec {
 /// symlink (the confined walk has already done any following the guest asked
 /// for).
 fn raw_utimensat(dirfd: RawFd, name: &CStr, atime: SetTime, mtime: SetTime) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if crate::confinement::active() {
+        return Err(io::Error::from_raw_os_error(1));
+    }
+
     let times = [to_timespec(atime), to_timespec(mtime)];
     let r = unsafe {
         utimensat(
@@ -319,6 +326,11 @@ fn raw_utimensat(dirfd: RawFd, name: &CStr, atime: SetTime, mtime: SetTime) -> i
 }
 
 fn raw_fchmodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if crate::confinement::active() {
+        return Err(io::Error::from_raw_os_error(1));
+    }
+
     // The confined resolution already followed any symlink the guest wanted
     // followed, so the final component is a concrete node; flags = 0.
     let r = unsafe { fchmodat(dirfd, name.as_ptr(), mode & 0o7777, 0) };
@@ -330,6 +342,11 @@ fn raw_fchmodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
 }
 
 fn raw_fchownat(dirfd: RawFd, name: &CStr, uid: Option<u32>, gid: Option<u32>) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if crate::confinement::active() {
+        return Err(io::Error::from_raw_os_error(1));
+    }
+
     // A `-1` (u32::MAX) owner/group means "leave unchanged", matching chown(2).
     let owner = uid.unwrap_or(u32::MAX);
     let group = gid.unwrap_or(u32::MAX);
@@ -342,6 +359,10 @@ fn raw_fchownat(dirfd: RawFd, name: &CStr, uid: Option<u32>, gid: Option<u32>) -
 }
 
 fn raw_mknodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if crate::confinement::active() {
+        return Err(io::Error::from_raw_os_error(1));
+    }
     let r = unsafe { mknodat(dirfd, name.as_ptr(), mode, 0) };
     if r < 0 {
         Err(normalize_errno(io::Error::last_os_error()))
@@ -351,6 +372,10 @@ fn raw_mknodat(dirfd: RawFd, name: &CStr, mode: u32) -> io::Result<()> {
 }
 
 fn raw_openat(dirfd: RawFd, name: &CStr, flags: c_int, mode: u32) -> io::Result<OwnedFd> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if crate::confinement::active() && flags & sys::O_PATH != 0 {
+        return Err(io::Error::from_raw_os_error(1));
+    }
     let fd = unsafe { openat(dirfd, name.as_ptr(), flags | sys::O_CLOEXEC, mode) };
     if fd < 0 {
         Err(io::Error::last_os_error())
@@ -362,6 +387,10 @@ fn raw_openat(dirfd: RawFd, name: &CStr, flags: c_int, mode: u32) -> io::Result<
 /// `Ok(Some(target))` if `name` is a symlink, `Ok(None)` if it exists but
 /// isn't one (`EINVAL`), `Err` for any other failure (including not found).
 fn raw_readlinkat(dirfd: RawFd, name: &CStr) -> io::Result<Option<String>> {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if crate::confinement::active() {
+        return Err(io::Error::from_raw_os_error(1));
+    }
     let mut buf = [0u8; 4096];
     let n = unsafe {
         readlinkat(
@@ -514,13 +543,13 @@ fn list_dir_fd(fd: OwnedFd) -> io::Result<Vec<DirEntry>> {
             sys::O_RDONLY | sys::O_NOFOLLOW | sys::O_NONBLOCK,
             0,
         ) {
-            Ok(entry_fd) => match fs::File::from(entry_fd).metadata() {
-                Ok(m) => (kind_of(&m), m.ino()),
+            Ok(entry_fd) => match fd_attrs(&fs::File::from(entry_fd)) {
+                Ok(m) => (m.kind, m.inode),
                 Err(_) => (NodeKind::File, 0),
             },
             Err(e) if e.raw_os_error() == Some(sys::ELOOP) => {
-                match open_symlink_itself(raw, &cname).and_then(|f| fs::File::from(f).metadata()) {
-                    Ok(m) => (kind_of(&m), m.ino()),
+                match open_symlink_itself(raw, &cname).and_then(|f| fd_attrs(&fs::File::from(f))) {
+                    Ok(m) => (m.kind, m.inode),
                     Err(_) => (NodeKind::Symlink, 0),
                 }
             }
@@ -537,6 +566,7 @@ fn list_dir_fd(fd: OwnedFd) -> io::Result<Vec<DirEntry>> {
 pub struct Passthrough {
     root: PathBuf,
     read_only: bool,
+    pinned: Option<std::sync::Arc<fs::File>>,
 }
 
 impl Passthrough {
@@ -546,6 +576,7 @@ impl Passthrough {
         Self {
             root: root.into(),
             read_only: false,
+            pinned: None,
         }
     }
 
@@ -555,7 +586,26 @@ impl Passthrough {
         Self {
             root: root.into(),
             read_only: true,
+            pinned: None,
         }
+    }
+
+    /// Pin a configured directory before host confinement. Every later lookup
+    /// starts from this descriptor, even if the host renames the directory.
+    pub(crate) fn prepared(root: PathBuf, read_only: bool) -> io::Result<Self> {
+        let pinned = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(sys::O_DIRECTORY | sys::O_NOFOLLOW)
+            .open(&root)?;
+        Ok(Self {
+            root,
+            read_only,
+            pinned: Some(std::sync::Arc::new(pinned)),
+        })
+    }
+
+    pub(crate) fn pinned_root(&self) -> std::sync::Arc<fs::File> {
+        self.pinned.as_ref().expect("prepared passthrough").clone()
     }
 
     fn deny_if_ro(&self) -> io::Result<()> {
@@ -572,6 +622,14 @@ impl Passthrough {
     /// *beneath* it is then walked component-by-component via `openat` and
     /// never rejoined into a string for the kernel to re-resolve.
     fn root_fd(&self) -> io::Result<OwnedFd> {
+        if let Some(root) = &self.pinned {
+            return raw_openat(
+                root.as_raw_fd(),
+                c".",
+                sys::O_RDONLY | sys::O_DIRECTORY | sys::O_NOFOLLOW,
+                0,
+            );
+        }
         let f = fs::OpenOptions::new()
             .read(true)
             .custom_flags(sys::O_DIRECTORY)
@@ -732,6 +790,7 @@ impl Passthrough {
     }
 }
 
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn kind_of(m: &fs::Metadata) -> NodeKind {
     let t = m.file_type();
     if t.is_dir() {
@@ -751,6 +810,7 @@ fn kind_of(m: &fs::Metadata) -> NodeKind {
     }
 }
 
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 fn attrs_of(m: &fs::Metadata) -> Attrs {
     Attrs {
         kind: kind_of(m),
@@ -766,6 +826,43 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
     }
 }
 
+/// Obtain descriptor metadata through the platform's libc wrapper.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn fd_attrs(file: &fs::File) -> io::Result<Attrs> {
+    let mut raw = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes exactly one stat structure to this buffer.
+    if unsafe { libc::fstat(file.as_raw_fd(), raw.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let raw = unsafe { raw.assume_init() };
+    let kind = match raw.st_mode & libc::S_IFMT {
+        libc::S_IFREG => NodeKind::File,
+        libc::S_IFDIR => NodeKind::Dir,
+        libc::S_IFLNK => NodeKind::Symlink,
+        libc::S_IFIFO => NodeKind::Fifo,
+        libc::S_IFSOCK => NodeKind::Socket,
+        libc::S_IFBLK => NodeKind::BlockDevice,
+        _ => NodeKind::CharDevice,
+    };
+    Ok(Attrs {
+        kind,
+        size: raw.st_size as u64,
+        mode: raw.st_mode,
+        uid: raw.st_uid,
+        gid: raw.st_gid,
+        atime: raw.st_atime,
+        mtime: raw.st_mtime,
+        inode: raw.st_ino,
+        nlink: raw.st_nlink as u32,
+        rdev: raw.st_rdev,
+    })
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+fn fd_attrs(file: &fs::File) -> io::Result<Attrs> {
+    file.metadata().map(|meta| attrs_of(&meta))
+}
+
 impl MountFs for Passthrough {
     fn read_only(&self) -> bool {
         self.read_only
@@ -774,8 +871,8 @@ impl MountFs for Passthrough {
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         if rel.is_empty() || rel == "." {
             let fd = self.root_fd().ok()?;
-            let m = fs::File::from(fd).metadata().ok()?;
-            return Some(attrs_of(&m));
+            let m = fd_attrs(&fs::File::from(fd)).ok()?;
+            return Some(m);
         }
         let (parent, name) = self.resolve(rel, false, false).ok()?;
         let cname = cstr(&name).ok()?;
@@ -788,15 +885,15 @@ impl MountFs for Passthrough {
             0,
         ) {
             Ok(fd) => {
-                let m = fs::File::from(fd).metadata().ok()?;
-                Some(attrs_of(&m))
+                let m = fd_attrs(&fs::File::from(fd)).ok()?;
+                Some(m)
             }
             Err(e) if e.raw_os_error() == Some(sys::ELOOP) => {
                 // The final component is itself a symlink: describe the
                 // link (matches `symlink_metadata`/`lstat`), not its target.
                 let fd = open_symlink_itself(parent.as_raw_fd(), &cname).ok()?;
-                let m = fs::File::from(fd).metadata().ok()?;
-                Some(attrs_of(&m))
+                let m = fd_attrs(&fs::File::from(fd)).ok()?;
+                Some(m)
             }
             Err(_) => None,
         }
@@ -935,7 +1032,7 @@ impl MountFs for Passthrough {
             &cname,
             sys::O_RDONLY | sys::O_NOFOLLOW,
             0,
-        ) && fs::File::from(fd).metadata().is_ok_and(|m| m.is_dir())
+        ) && fd_attrs(&fs::File::from(fd)).is_ok_and(|m| m.kind == NodeKind::Dir)
         {
             return Err(io::Error::from_raw_os_error(21)); // EISDIR
         }
@@ -965,15 +1062,15 @@ impl MountFs for Passthrough {
         )
         .map_err(normalize_errno)?;
         let file = fs::File::from(fd);
-        let meta = file.metadata()?;
-        if meta.is_dir() {
+        let meta = fd_attrs(&file)?;
+        if meta.kind == NodeKind::Dir {
             // Defensive: opening a directory O_WRONLY already fails EISDIR
             // on both supported platforms (verified empirically), so this
             // is never actually reached, but it keeps the invariant
             // explicit rather than implicit in open()'s behavior.
             return Err(io::Error::from_raw_os_error(21)); // EISDIR
         }
-        if !meta.file_type().is_file() {
+        if meta.kind != NodeKind::File {
             return Err(io::Error::from_raw_os_error(22)); // EINVAL: ftruncate is only meaningful on a regular file
         }
         file.set_len(len)

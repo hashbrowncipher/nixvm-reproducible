@@ -68,6 +68,14 @@ impl KvmBackend {
 }
 
 impl Backend for KvmBackend {
+    fn prepare_confinement(
+        &self,
+        capacity: usize,
+        mem: &super::GuestMemory,
+    ) -> Result<crate::confinement::Resources, VcpuError> {
+        self.vm.ensure_memslot(mem)?;
+        self.vm.prepare_pool(capacity)
+    }
     fn name(&self) -> &'static str {
         "kvm"
     }
@@ -79,6 +87,43 @@ impl Backend for KvmBackend {
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
         vcpu::KvmVcpu::new(self.vm.clone(), entry, stack, self.branch_quantum)
     }
+}
+
+pub(crate) fn prepare_thread(pmu: bool) -> Result<(), VcpuError> {
+    vcpu::preempt::prepare()?;
+    if pmu {
+        pmu::prepare_thread()?;
+    }
+    Ok(())
+}
+
+pub(crate) fn perf_fd() -> Option<i32> {
+    pmu::worker_fd()
+}
+
+pub(crate) fn clear_inactive_thread_resources() {
+    pmu::clear_inactive_thread_resources();
+}
+
+pub(crate) fn runtime_requests() -> Vec<u64> {
+    vec![
+        sys::KVM_RUN,
+        sys::KVM_GET_REGS,
+        sys::KVM_SET_REGS,
+        sys::KVM_GET_SREGS,
+        sys::KVM_SET_SREGS,
+        sys::KVM_SET_MSRS,
+        sys::KVM_SET_CPUID2,
+        sys::KVM_SET_XCRS,
+        sys::KVM_GET_XSAVE,
+        sys::KVM_GET_XSAVE2,
+        sys::KVM_SET_XSAVE,
+        sys::KVM_SET_GUEST_DEBUG,
+        sys::KVM_SET_SIGNAL_MASK,
+        sys::KVM_SET_VCPU_EVENTS,
+        sys::KVM_SET_DEBUGREGS,
+        sys::KVM_SET_MP_STATE,
+    ]
 }
 
 #[cfg(test)]

@@ -81,8 +81,8 @@ const GUEST_VSIZE: u64 = 32 * 1024 * 1024 * 1024;
 pub struct Config {
     /// argv of the command to run inside the sandbox.
     pub command: Vec<String>,
-    /// Host directory mounted at `/work` (defaults to the current dir).
-    pub work_dir: PathBuf,
+    /// Optional host directory mounted at `/work`; absent by default.
+    pub work_dir: Option<PathBuf>,
     /// The guest root image (used when `root` is [`RootSource::Image`]).
     pub image: ImageRef,
     /// Where the read-only root filesystem comes from.
@@ -115,6 +115,10 @@ pub struct Config {
     /// Extra `KEY=VALUE` entries appended to the guest environment, overriding
     /// the preconfigured defaults on a key collision.
     pub env: Vec<String>,
+    /// Irreversibly confine this host process. Requires single-threaded entry.
+    pub confine_host: bool,
+    /// Maximum simultaneous guest vCPUs in a confined KVM run.
+    pub vcpu_capacity: usize,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -143,7 +147,7 @@ impl Default for SandboxBuilder {
         Self {
             config: Config {
                 command: Vec::new(),
-                work_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                work_dir: None,
                 image: ImageRef::default_for(arch),
                 root: RootSource::Empty,
                 mode: RunMode::Nude,
@@ -162,6 +166,8 @@ impl Default for SandboxBuilder {
                 prefer_interp: false,
                 binds: Vec::new(),
                 env: Vec::new(),
+                confine_host: false,
+                vcpu_capacity: 128,
             },
         }
     }
@@ -182,7 +188,25 @@ impl SandboxBuilder {
     /// Set the host directory exposed as `/work`.
     #[must_use]
     pub fn work_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.config.work_dir = dir.into();
+        self.config.work_dir = Some(dir.into());
+        self
+    }
+
+    /// Restrict this process's files, descriptors, privileges and syscalls before
+    /// parsing guest files. This is irreversible and closes inherited fds above
+    /// stderr. Call from a dedicated, single-threaded process only. The CLI
+    /// enables this by default; embedders must explicitly opt in.
+    #[must_use]
+    pub fn confine_host(mut self, yes: bool) -> Self {
+        self.config.confine_host = yes;
+        self
+    }
+
+    /// Bound simultaneous guest vCPUs in a confined run. Slots are reused after
+    /// task destruction; exhaustion makes guest clone/fork return EAGAIN.
+    #[must_use]
+    pub fn vcpu_capacity(mut self, capacity: usize) -> Self {
+        self.config.vcpu_capacity = capacity;
         self
     }
 
@@ -332,6 +356,12 @@ pub struct Sandbox {
     config: Config,
 }
 
+struct PreparedRuntime {
+    backend: Box<dyn Backend>,
+    mem: GuestMemory,
+    workers: crate::kernel::PreparedWorkers,
+}
+
 impl Sandbox {
     #[must_use]
     pub fn builder() -> SandboxBuilder {
@@ -354,7 +384,17 @@ impl Sandbox {
     /// `root_squashfs`). The binary must be a static ELF today — dynamic linking
     /// is not yet wired.
     pub fn run(&self) -> Result<i32, Error> {
-        let mut mounts = self.build_mounts()?;
+        if self.config.confine_host {
+            return self.run_confined();
+        }
+        self.run_mounts(self.build_mounts()?, None)
+    }
+
+    fn run_mounts(
+        &self,
+        mut mounts: MountTable,
+        prepared: Option<PreparedRuntime>,
+    ) -> Result<i32, Error> {
         preconfigure(&mut mounts);
 
         let (path, argv) = self.pid1_program(&mut mounts);
@@ -365,11 +405,27 @@ impl Sandbox {
         })?;
 
         let arch = self.guest_arch(&elf, &path)?;
-        let mut mem = GuestMemory::new_split(
-            GUEST_BASE,
-            GUEST_VSIZE,
-            round_up_page(self.config.mem_bytes),
-        );
+        let (backend, mut mem, workers) = if let Some(prepared) = prepared {
+            let backend = if prepared.backend.guest_arch() == arch {
+                prepared.backend
+            } else {
+                if std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
+                    return Err(Error::Config("PMU requires an x86-64 guest".into()));
+                }
+                Box::new(InterpBackend::new(arch)?) as Box<dyn Backend>
+            };
+            (backend, prepared.mem, Some(prepared.workers))
+        } else {
+            (
+                self.backend(arch)?,
+                GuestMemory::new_split(
+                    GUEST_BASE,
+                    GUEST_VSIZE,
+                    round_up_page(self.config.mem_bytes),
+                ),
+                None,
+            )
+        };
         let spec = ProcessSpec {
             argv: argv.clone(),
             envp: self.env(),
@@ -389,7 +445,6 @@ impl Sandbox {
         };
         let mid = page_align_down(img.program_break + (img.stack_bottom - img.program_break) / 2);
 
-        let backend = self.backend(arch)?;
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
         let mut kernel = Kernel::with_random_seed(arch, mounts, self.config.random_seed);
@@ -409,7 +464,206 @@ impl Sandbox {
         // ENETUNREACH). No-op unless the env var is set.
         crate::vm::install_egress(&mut kernel);
         calibrate_vdso(vcpu.as_ref(), &mem);
-        Ok(kernel.run(vcpu, mem)?)
+        if let Some(workers) = workers {
+            Ok(kernel.run_prepared(vcpu, mem, &workers)?)
+        } else {
+            Ok(kernel.run(vcpu, mem)?)
+        }
+    }
+
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    fn run_confined(&self) -> Result<i32, Error> {
+        Err(Error::Config(
+            "host confinement requires Linux x86-64".into(),
+        ))
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn run_confined(&self) -> Result<i32, Error> {
+        use crate::confinement;
+        let mut sandbox = self.clone();
+        // Resolve operator paths before discarding cwd authority.
+        let absolute = |path: &Path| {
+            std::path::absolute(path).map_err(|error| Error::Config(error.to_string()))
+        };
+        if let Some(work) = sandbox.config.work_dir.as_mut() {
+            *work = absolute(work)?;
+        }
+        for bind in &mut sandbox.config.binds {
+            bind.host = absolute(&bind.host)?;
+        }
+        match &mut sandbox.config.root {
+            RootSource::Dir(path) | RootSource::Squashfs(path) => *path = absolute(path)?,
+            RootSource::Erofs(paths) => {
+                for path in paths {
+                    *path = absolute(path)?;
+                }
+            }
+            RootSource::Image(_) => {
+                return Err(Error::Config(
+                    "confined runs require an explicit root image file".into(),
+                ));
+            }
+            RootSource::Empty => (),
+        }
+        if crate::vm::egress_enabled() {
+            return Err(Error::Config(
+                "host networking is unavailable in confined runs".into(),
+            ));
+        }
+        confinement::begin()?;
+        let backend = sandbox.backend(sandbox.config.arch)?;
+        let kvm = backend.name() == "kvm";
+        let pmu = std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some();
+        if pmu && sandbox.config.ncpus != 1 {
+            return Err(Error::Config(
+                "PMU scheduling requires one scheduler CPU".into(),
+            ));
+        }
+        let mem = GuestMemory::new_split(
+            GUEST_BASE,
+            GUEST_VSIZE,
+            round_up_page(sandbox.config.mem_bytes),
+        );
+        let mut resources = backend.prepare_confinement(sandbox.config.vcpu_capacity, &mem)?;
+        if kvm {
+            crate::vcpu::kvm::prepare_thread(pmu)?;
+        }
+        if let Some(fd) = crate::vcpu::kvm::perf_fd() {
+            resources.perf.push(fd);
+        }
+        let mut directories = Vec::new();
+        let mut mounts = MountTable::new();
+        let directory_lower = match &sandbox.config.root {
+            RootSource::Dir(path) => {
+                let mount = Passthrough::prepared(path.clone(), true)
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                directories.push((mount.pinned_root(), true));
+                Some(Box::new(mount) as Box<dyn MountFs>)
+            }
+            _ => None,
+        };
+        if let Some(work) = &sandbox.config.work_dir {
+            let mount = Passthrough::prepared(work.clone(), false)
+                .map_err(|error| Error::Config(error.to_string()))?;
+            directories.push((mount.pinned_root(), false));
+            mounts.mount("/work", Box::new(mount));
+        }
+        for bind in &sandbox.config.binds {
+            let mount = Passthrough::prepared(bind.host.clone(), bind.read_only)
+                .map_err(|error| Error::Config(error.to_string()))?;
+            directories.push((mount.pinned_root(), bind.read_only));
+            mounts.mount(&bind.guest, Box::new(mount));
+        }
+        let squashfs = match &sandbox.config.root {
+            RootSource::Squashfs(path) => {
+                Some(std::fs::read(path).map_err(|error| Error::Config(error.to_string()))?)
+            }
+            _ => None,
+        };
+        #[cfg(feature = "erofs")]
+        let erofs = match &sandbox.config.root {
+            RootSource::Erofs(paths) => {
+                if paths.is_empty() {
+                    return Err(Error::Config(
+                        "an EROFS root needs at least one image".into(),
+                    ));
+                }
+                let before = confinement::descriptors()?;
+                let devices = paths
+                    .iter()
+                    .map(|path| {
+                        fs_core::FileDevice::open(path).map(|device| {
+                            std::sync::Arc::new(device) as std::sync::Arc<dyn fs_core::BlockRead>
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                resources.images = confinement::descriptors()?
+                    .into_iter()
+                    .filter(|fd| !before.contains(fd))
+                    .collect();
+                devices
+            }
+            _ => Vec::new(),
+        };
+        #[cfg(not(feature = "erofs"))]
+        if matches!(sandbox.config.root, RootSource::Erofs(_)) {
+            return Err(Error::Config(
+                "an EROFS root requires the `erofs` feature".into(),
+            ));
+        }
+        confinement::restrict_filesystem(&directories)?;
+        let count = if sandbox.config.ncpus > 1 {
+            sandbox.config.ncpus
+        } else {
+            0
+        };
+        let (workers, perf) = crate::kernel::PreparedWorkers::new(count, kvm, pmu)?;
+        resources.perf.extend(perf);
+        confinement::drop_thread_privileges()?;
+        resources.install(!directories.is_empty())?;
+        // No guest parsing or decompression occurs above this boundary.
+        let lower = if let Some(directory) = directory_lower {
+            Some(directory)
+        } else if let Some(bytes) = squashfs {
+            #[cfg(feature = "fstool")]
+            {
+                Some(Box::new(
+                    crate::fs::FsToolMount::open_squashfs_bytes(&bytes)
+                        .map_err(|error| Error::Config(error.to_string()))?,
+                ) as Box<dyn MountFs>)
+            }
+            #[cfg(not(feature = "fstool"))]
+            {
+                let _ = bytes;
+                return Err(Error::Config(
+                    "a squashfs root requires the `fstool` feature".into(),
+                ));
+            }
+        } else {
+            #[cfg(feature = "erofs")]
+            if erofs.is_empty() {
+                None
+            } else {
+                let layers = erofs
+                    .into_iter()
+                    .map(|device| {
+                        crate::fs::ErofsMount::from_device(device)
+                            .map(|mount| Box::new(mount) as Box<dyn MountFs>)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| Error::Config(error.to_string()))?;
+                Some(Box::new(
+                    crate::fs::LayerStack::new(layers)
+                        .map_err(|error| Error::Config(error.to_string()))?,
+                ) as Box<dyn MountFs>)
+            }
+            #[cfg(not(feature = "erofs"))]
+            {
+                None
+            }
+        };
+        if let Some(lower) = lower {
+            mounts.mount("/", Box::new(Overlay::new(lower, Box::new(TmpFs::new()))));
+        } else {
+            mounts.mount("/", Box::new(TmpFs::new()));
+        }
+        mounts.mount("/tmp", Box::new(TmpFs::new()));
+        mounts.mount(
+            "/dev",
+            Box::new(DevFs::with_random_seed(sandbox.config.random_seed)),
+        );
+        mounts.mount("/proc", Box::new(ProcFs::new(sandbox.config.ncpus)));
+        mounts.mount("/sys", Box::new(SysFs::new(sandbox.config.ncpus)));
+        sandbox.run_mounts(
+            mounts,
+            Some(PreparedRuntime {
+                backend,
+                mem,
+                workers,
+            }),
+        )
     }
 
     /// PID 1's path and argv. Booted mode runs init (config override, else
@@ -476,6 +730,9 @@ impl Sandbox {
     /// the target binary out of the guest root. Exposed now so it's testable
     /// and embeddable ahead of that.
     pub fn exec_elf(&self, elf: &[u8]) -> Result<i32, Error> {
+        if self.config.confine_host {
+            return Err(Error::Config("host confinement is supported through Sandbox::run; exec_elf cannot bypass preparation".into()));
+        }
         let arch = self.guest_arch(elf, "ELF image")?;
         let mut mem = GuestMemory::new_split(
             GUEST_BASE,
@@ -506,7 +763,11 @@ impl Sandbox {
             Kernel::with_random_seed(arch, self.build_mounts()?, self.config.random_seed);
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
-        kernel.set_cwd("/work");
+        kernel.set_cwd(if self.config.work_dir.is_some() {
+            "/work"
+        } else {
+            "/"
+        });
         kernel.set_cmdline(argv);
         kernel.set_heap(img.program_break, mid);
         kernel.set_mmap_area(img.stack_bottom, mid);
@@ -574,10 +835,9 @@ impl Sandbox {
 
         #[cfg(unix)]
         {
-            mounts.mount(
-                "/work",
-                Box::new(Passthrough::new(self.config.work_dir.clone())),
-            );
+            if let Some(work) = &self.config.work_dir {
+                mounts.mount("/work", Box::new(Passthrough::new(work.clone())));
+            }
             for b in &self.config.binds {
                 let pt = if b.read_only {
                     Passthrough::read_only(b.host.clone())
