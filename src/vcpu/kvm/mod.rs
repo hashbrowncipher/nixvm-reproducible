@@ -78,6 +78,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fork_preserves_upper_ymm_registers() {
+        let Some(backend) = backend_or_skip() else {
+            return;
+        };
+        let base = 0x1_0000u64;
+        let data = base + PAGE_SIZE;
+        let mut mem = GuestMemory::new(base, 64 * 1024);
+        mem.map(base, 2 * PAGE_SIZE, Prot::rwx()).unwrap();
+        let expected: Vec<u8> = (1..=32).collect();
+        mem.write_init(data, &expected).unwrap();
+        let mut code = vec![0x48, 0xbb]; // mov rbx, data
+        code.extend_from_slice(&data.to_le_bytes());
+        code.extend_from_slice(&[
+            0xc5, 0xfe, 0x6f, 0x03, // vmovdqu ymm0, [rbx]
+            0x0f, 0x05, // syscall
+            0xc5, 0xfe, 0x7f, 0x43, 0x20, // vmovdqu [rbx+32], ymm0
+            0x0f, 0x05, // syscall
+        ]);
+        mem.write_init(base, &code).unwrap();
+        let mut parent = backend.new_vcpu(base, base + 0x8000).unwrap();
+        while parent.run(&mut mem).unwrap() == Exit::Interrupted {}
+        let mut child = parent.fork();
+        child.set_syscall_ret(0);
+        loop {
+            match child.run(&mut mem).unwrap() {
+                Exit::Interrupted => {}
+                Exit::Syscall => break,
+                other => panic!("unexpected fork child exit: {other:?}"),
+            }
+        }
+        assert_eq!(mem.read_vec(data + 32, 32).unwrap(), expected);
+    }
+
     /// Drive a guest CPL3 program through the full `Vcpu` surface: two
     /// `syscall`s with a `set_syscall_ret` in between. Proves the
     /// syscall→LSTAR-trampoline→HLT trap, the number/argument reads off the
