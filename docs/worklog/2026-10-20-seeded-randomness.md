@@ -65,7 +65,7 @@ Validation used the same sealed offline environment and Rust 1.93.1:
 - Strict all-target Clippy passed with only the known existing
   `field_reassign_with_default` lint allowed. wasm32 core, public rustdoc with
   warnings denied, scoped root-crate Rust formatting and `git diff --check` passed.
-- Independent re-review of these corrections remains a separate pending step.
+- Independent re-review closed both findings at `6b06ea8`.
 
 Capital notes, ranked:
 
@@ -78,3 +78,27 @@ Capital notes, ranked:
 
 Fix agent: GPT-6 family; exact model identifier and token/tool counters were not
 exposed. The correction changed nine files (342 insertions, 19 deletions).
+
+## Independent review outcome
+
+A separate reviewer audited `3e25af8..4f90a46`, reproduced both findings through
+public APIs, and independently passed the original 796-test default suite. A
+different agent added the failing regressions and implemented the corrections.
+The original reviewer then audited `4f90a46..6b06ea8` and closed both findings.
+Its three original stream-sharing probes, three adapted mapping/control probes
+(72 configurations), and 12 focused regression tests passed. The reviewer found
+no additional actionable defect in the correction. It did not repeat the broad
+feature, portability, lint or documentation checks recorded above.
+
+The expanded probes exposed a separate existing composition limitation: writing
+through an embedder-provided writable Overlay with DevFs in its lower subtree
+copies the special node into an ordinary upper file. This does not affect the
+default direct DevFs mount or guest-created devtmpfs. Preserving special-device
+semantics in arbitrary writable compositions is a separate filesystem follow-up;
+the current correction does not claim to provide that behavior.
+
+Reviewer: GPT-6 family; exact model identifier and token/tool counters were not
+exposed. The initial review covered 15 files (810 insertions, 88 deletions); the
+re-review covered the nine-file correction. Both reviews left source unchanged.
+Detailed reports and independent probe sources are retained in the review
+scratch directory. No merge or push was performed.
