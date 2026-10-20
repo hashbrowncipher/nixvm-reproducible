@@ -111,7 +111,13 @@ Cargo commands recorded above. Every operation remained below 260 seconds.
 - Scoped Rust formatting and `git diff --check` passed.
 
 Correction diff against `9fef7f5`: 3 files, +111/-7.
-Targeted reviewer recheck is pending; no re-review result is claimed.
+Independent targeted review returned MERGE for source checkpoint
+`61c6e94d91f385a163dab20fefc919a94b8c90e2`, with no remaining actionable
+findings. The canonical independent probe completed 240,000 successful calls
+with zero errno changes; focused host integration and all three host unit tests
+independently passed. Merge-overlap inspection found no host-policy changes
+from local master. Reviewer: inherited Codex/GPT-6; exact model variant and
+per-agent usage counters were unavailable.
 
 The review exposed missing contention coverage around hidden libc effects.
 The committed native regression now covers it without a production test seam.
