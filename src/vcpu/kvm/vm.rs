@@ -24,8 +24,8 @@ use crate::vcpu::VcpuError;
 use crate::vcpu::mem::GuestMemory;
 use crate::vcpu::phys::PhysMem;
 use std::ffi::c_int;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Re-export the control-block virtual addresses and selectors the vcpu wires into
 // its sregs/MSRs, so vcpu.rs keeps importing them from `super::vm`.
@@ -74,9 +74,8 @@ pub struct Vm {
     /// none). All address spaces share this pool, so it is registered exactly once.
     pool: Mutex<Option<std::sync::Arc<PhysMem>>>,
     next_vcpu_id: AtomicU32,
-    /// Logical time shared by every vcpu and address space in this VM. RDTSC,
-    /// RDTSCP and syscall entry each advance it by one tick.
-    tsc: AtomicU64,
+    /// Direct vCPU users share this clock. A kernel binds its own VM clock.
+    clock: Arc<crate::clock::VirtualClock>,
 }
 
 // SAFETY: `Vm` is shared (`Arc`) across the vcpus of one kernel. The pool handle
@@ -154,7 +153,7 @@ impl Vm {
             xsave_get,
             pool: Mutex::new(None),
             next_vcpu_id: AtomicU32::new(0),
-            tsc: AtomicU64::new(0),
+            clock: Arc::new(crate::clock::VirtualClock::default()),
         })
     }
 
@@ -232,8 +231,8 @@ impl Vm {
         &self.cpuid
     }
 
-    pub fn tick(&self) -> u64 {
-        self.tsc.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    pub fn clock(&self) -> Arc<crate::clock::VirtualClock> {
+        self.clock.clone()
     }
 
     pub fn xsave_size(&self) -> usize {

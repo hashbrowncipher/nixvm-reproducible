@@ -69,6 +69,7 @@ enum Node {
 
 #[derive(Debug)]
 pub struct TmpFs {
+    clock: std::sync::Arc<crate::clock::VirtualClock>,
     nodes: BTreeMap<String, Node>,
     /// Regular-file inodes by inode number.
     files: BTreeMap<u64, FileData>,
@@ -99,6 +100,7 @@ impl TmpFs {
             },
         );
         Self {
+            clock: std::sync::Arc::default(),
             nodes,
             files: BTreeMap::new(),
             next_inode: 2,
@@ -113,7 +115,7 @@ impl TmpFs {
 
     /// A fresh `Meta` for a newly created node: owned by root, timestamps now.
     fn new_meta(&mut self) -> Meta {
-        let now = now_ts();
+        let now = self.clock.now_unix().as_secs() as i64;
         Meta {
             inode: self.alloc_inode(),
             uid: 0,
@@ -251,13 +253,10 @@ fn enodata() -> io::Error {
     io::Error::from_raw_os_error(61)
 }
 
-/// Current wall-clock time as Unix seconds, for `mtime` on write
-/// (wasm32-safe — see [`crate::clock`]).
-fn now_ts() -> i64 {
-    crate::clock::now_unix().as_secs() as i64
-}
-
 impl MountFs for TmpFs {
+    fn set_clock(&mut self, clock: std::sync::Arc<crate::clock::VirtualClock>) {
+        self.clock = clock;
+    }
     fn read_only(&self) -> bool {
         false
     }
@@ -355,6 +354,7 @@ impl MountFs for TmpFs {
     }
 
     fn write_at(&mut self, rel: &str, off: u64, buf: &[u8]) -> io::Result<usize> {
+        let now = self.clock.now_unix().as_secs() as i64;
         match self.nodes.get(rel) {
             Some(Node::File { .. }) => {
                 let f = self.file_mut(rel).ok_or_else(enoent)?;
@@ -363,7 +363,7 @@ impl MountFs for TmpFs {
                     f.data.resize(end, 0);
                 }
                 f.data[off as usize..end].copy_from_slice(buf);
-                f.meta.mtime = now_ts();
+                f.meta.mtime = now;
                 Ok(buf.len())
             }
             Some(_) => Err(eisdir()),
@@ -451,11 +451,12 @@ impl MountFs for TmpFs {
     }
 
     fn truncate(&mut self, rel: &str, len: u64) -> io::Result<()> {
+        let now = self.clock.now_unix().as_secs() as i64;
         match self.nodes.get(rel) {
             Some(Node::File { .. }) => {
                 let f = self.file_mut(rel).ok_or_else(enoent)?;
                 f.data.resize(len as usize, 0);
-                f.meta.mtime = now_ts();
+                f.meta.mtime = now;
                 Ok(())
             }
             Some(Node::Dir { .. }) => Err(eisdir()),
@@ -484,7 +485,7 @@ impl MountFs for TmpFs {
     }
 
     fn set_times(&mut self, rel: &str, atime: SetTime, mtime: SetTime) -> io::Result<()> {
-        let now = now_ts();
+        let now = self.clock.now_unix().as_secs() as i64;
         let apply = |slot: &mut i64, t: SetTime| match t {
             SetTime::Omit => {}
             SetTime::Now => *slot = now,

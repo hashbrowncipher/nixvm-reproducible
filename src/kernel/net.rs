@@ -330,6 +330,30 @@ pub(super) struct Net {
     ping_ident: u16,
 }
 
+impl Net {
+    /// SCM_RIGHTS owns a backing descriptor while it waits in a byte stream.
+    pub(super) fn queued_timerfds(&self) -> impl Iterator<Item = usize> + '_ {
+        self.socks
+            .iter()
+            .filter_map(|socket| match &socket.kind {
+                Kind::Pair(pair) => Some(pair),
+                _ => None,
+            })
+            .flat_map(|pair| {
+                pair.scm
+                    .iter()
+                    .enumerate()
+                    .filter(|(end, _)| pair.refs[*end] > 0 && !pair.shut_rd[*end])
+                    .flat_map(|(_, queue)| queue.iter())
+            })
+            .flat_map(|(_, descriptors)| descriptors.iter())
+            .filter_map(|descriptor| match descriptor {
+                Fd::Timerfd(index) => Some(*index),
+                _ => None,
+            })
+    }
+}
+
 impl std::fmt::Debug for Net {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Net")

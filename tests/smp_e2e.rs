@@ -1,11 +1,8 @@
-//! End-to-end SMP determinism test: a small aarch64 program forks four
-//! children, each doing a bit of arithmetic and exiting with the result; the
-//! parent `wait4`s all four and exits with their sum. The test runs this
-//! program repeatedly under `Kernel::set_ncpus(1)` (the cooperative serial
-//! scheduler) and `Kernel::set_ncpus(4)` (the SMP scheduler, which runs guest
-//! compute on parallel host worker threads while servicing syscalls serially —
-//! see `src/kernel/mod.rs`'s `schedule_smp`) and asserts they agree, several
-//! times over, to catch any scheduler-dependent nondeterminism.
+//! End-to-end virtual scheduler coverage. An aarch64 program forks four
+//! children, each doing arithmetic and exiting with the result. The parent
+//! waits for all four and exits with their sum. Repeated single-CPU runs must
+//! produce that sum. A separate test checks that a larger scheduler worker
+//! count returns the virtual-execution configuration error.
 //!
 //! Self-contained: its own ELF builder + instruction encoders, duplicated from
 //! `tests/aarch64_smoke.rs` / `tests/proc_ipc.rs` rather than shared (see
@@ -20,9 +17,9 @@ use nixvm::fs::MountTable;
 use nixvm::kernel::Kernel;
 use nixvm::loader::{ProcessSpec, load_static};
 use nixvm::vcpu::Backend;
-use nixvm::vcpu::GuestMemory;
 use nixvm::vcpu::interp::InterpBackend;
 use nixvm::vcpu::mem::PAGE_SIZE;
+use nixvm::vcpu::{GuestMemory, VcpuError};
 
 const EHDR_LEN: usize = 64;
 const PHDR_LEN: usize = 56;
@@ -156,10 +153,9 @@ fn words_to_bytes(words: &[u32]) -> Vec<u8> {
     bytes
 }
 
-/// Load `body` at `vaddr` and run it to completion on the software
-/// interpreter with `ncpus` virtual CPUs, capturing stdout. Returns
-/// `(exit_code, stdout, kernel)`.
-fn run_program(vaddr: u64, body: &[u8], ncpus: usize) -> (i32, Vec<u8>, Kernel) {
+/// Load `body` at `vaddr` and run it on the software interpreter with the
+/// requested scheduler worker count. Returns `(run_result, stdout, kernel)`.
+fn run_program(vaddr: u64, body: &[u8], ncpus: usize) -> (Result<i32, VcpuError>, Vec<u8>, Kernel) {
     let elf = build_elf(vaddr, body);
 
     let mut mem = GuestMemory::new(vaddr, 256 * PAGE_SIZE);
@@ -177,7 +173,7 @@ fn run_program(vaddr: u64, body: &[u8], ncpus: usize) -> (i32, Vec<u8>, Kernel) 
     kernel.set_stdout(Box::new(SharedBuf(captured.clone())));
     kernel.set_ncpus(ncpus);
 
-    let exit_code = kernel.run(vcpu, mem).unwrap();
+    let exit_code = kernel.run(vcpu, mem);
     let out = captured.lock().unwrap().clone();
     (exit_code, out, kernel)
 }
@@ -246,7 +242,7 @@ fn build_code(wstatus_addr: u32) -> Vec<u32> {
 const EXPECTED_EXIT: i32 = 7 + 14 + 21 + 28;
 
 #[test]
-fn smp_scheduling_matches_serial_fork_sum() {
+fn serial_scheduling_reaps_four_children_and_sums_results() {
     let vaddr = 0x1_0000u64;
 
     let code_words = build_code(0).len() as u64;
@@ -261,11 +257,15 @@ fn smp_scheduling_matches_serial_fork_sum() {
     let mut body = words_to_bytes(&instrs);
     body.extend_from_slice(&[0u8; 4]); // wstatus scratch word, filled by wait4
 
-    // Run several times under each scheduler to catch scheduler-dependent
-    // nondeterminism, not just a single lucky interleaving.
+    // Exercise the full fork/wait lifecycle repeatedly on the supported
+    // virtual scheduler.
     for iter in 0..15 {
         let (serial_code, serial_out, serial_kernel) = run_program(vaddr, &body, 1);
-        assert_eq!(serial_code, EXPECTED_EXIT, "serial (ncpus=1) run {iter}");
+        assert_eq!(
+            serial_code.unwrap(),
+            EXPECTED_EXIT,
+            "serial (ncpus=1) run {iter}"
+        );
         assert_eq!(serial_out.len(), 0);
         assert_eq!(
             serial_kernel.unsupported().len(),
@@ -273,18 +273,21 @@ fn smp_scheduling_matches_serial_fork_sum() {
             "{:?}",
             serial_kernel.unsupported()
         );
+    }
+}
 
-        let (smp_code, smp_out, smp_kernel) = run_program(vaddr, &body, 4);
-        assert_eq!(
-            smp_code, EXPECTED_EXIT,
-            "SMP (ncpus=4) run {iter} must agree with the serial scheduler"
-        );
-        assert_eq!(smp_out.len(), 0);
-        assert_eq!(
-            smp_kernel.unsupported().len(),
-            0,
-            "{:?}",
-            smp_kernel.unsupported()
-        );
+#[test]
+fn virtual_execution_rejects_multiple_scheduler_cpus() {
+    let vaddr = 0x1_0000;
+    let body = words_to_bytes(&[movz(0, 19), movz(8, NR_EXIT), svc0()]);
+    for ncpus in [2, 4] {
+        let (result, stdout, kernel) = run_program(vaddr, &body, ncpus);
+        assert!(matches!(
+            result,
+            Err(VcpuError::Backend(message))
+                if message == "virtual execution requires one scheduler CPU"
+        ));
+        assert!(stdout.is_empty());
+        assert!(kernel.unsupported().is_empty());
     }
 }

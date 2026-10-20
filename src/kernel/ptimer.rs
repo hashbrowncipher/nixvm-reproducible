@@ -3,9 +3,9 @@
 //!
 //! Each timer lives on the task its expirations are delivered to (the creating
 //! task for `SIGEV_SIGNAL`, the named thread for `SIGEV_THREAD_ID`), next to the
-//! `ITIMER_REAL` state it generalizes: an absolute wall-clock deadline that the
+//! `ITIMER_REAL` state it generalizes: an absolute VM deadline that the
 //! schedulers already wake parked tasks for ([`super::ProcInfo::timer_deadline`]),
-//! fired from the same per-step hook as `alarm` ([`fire_timers_if_due`]). Any
+//! fired from the same per-step hook as `alarm` ([`super::expire_task_waits`]). Any
 //! thread of the group may operate on a timer by id (Linux timers are
 //! per-process), so lookups search the caller and then its thread-group
 //! siblings.
@@ -19,11 +19,11 @@
 //! (a helper thread `sigwaitinfo`-ing `SIGEV_THREAD_ID` deliveries) and glibc's
 //! work unchanged on top.
 //!
-//! The CPU-time clocks (`CLOCK_PROCESS_CPUTIME_ID`/`CLOCK_THREAD_CPUTIME_ID`)
-//! are approximated by wall time: a task that is mostly running consumes CPU at
-//! wall rate, which is what profilers arming these timers assume.
+//! CPU timers use per-task or thread-group execution totals. Only a runnable
+//! contributor projects their remaining duration onto a guest execution limit;
+//! idle jumps and accelerated clock observations cannot expire them.
 
-use super::{Kernel, ProcInfo, QueuedSig, RunState, ServiceCtx, Shared, err, poll};
+use super::{Kernel, ProcInfo, QueuedSig, RunState, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -43,16 +43,16 @@ pub(super) struct PosixTimer {
     pub(super) id: i32,
     /// The thread group that owns the timer (ids are per-process).
     pub(super) tgid: i32,
-    /// `CLOCK_REALTIME` timers re-anchor on a wall-clock jump on Linux; with no
-    /// settable clock here that never happens, but the clock still selects how
-    /// an absolute `it_value` converts to a wall deadline.
+    /// Clock domain used to interpret absolute it_value.
     clock: i64,
+    /// CPU clock measured by this timer, independent of its signal recipient.
+    cpu_clock: Option<(bool, i32)>,
     /// `SIGEV_SIGNAL`/`SIGEV_NONE`/`SIGEV_THREAD_ID`.
     notify: i32,
     signo: u32,
     /// `sigev_value`, echoed as `si_value`.
     value: u64,
-    /// Next expiration, as an absolute wall-clock time (ns since the epoch).
+    /// Next expiration: VM monotonic ns or the selected CPU clock total.
     pub(super) deadline: Option<u128>,
     interval_ns: u128,
     /// Overruns reported by `timer_getoverrun`: the expirations folded into
@@ -60,6 +60,33 @@ pub(super) struct PosixTimer {
     overrun_last: i32,
     /// Expirations that occurred while this timer's signal was still pending.
     overrun_pending: i32,
+}
+
+impl PosixTimer {
+    pub(super) fn wall_deadline(&self) -> Option<u128> {
+        self.cpu_clock.is_none().then_some(self.deadline).flatten()
+    }
+
+    fn clock_now(&self, wall: u128, cpu: &super::CpuTimes) -> u128 {
+        match self.cpu_clock {
+            Some((true, pid)) => cpu.tasks.get(&pid).copied().unwrap_or(0),
+            Some((false, tgid)) => cpu.groups.get(&tgid).copied().unwrap_or(0),
+            None => wall,
+        }
+    }
+
+    pub(super) fn execution_remaining(
+        &self,
+        running: &ProcInfo,
+        cpu: &super::CpuTimes,
+    ) -> Option<u128> {
+        let (thread, id) = self.cpu_clock?;
+        if (thread && id != running.pid) || (!thread && id != running.tgid) {
+            return None;
+        }
+        self.deadline
+            .map(|deadline| deadline.saturating_sub(self.clock_now(0, cpu)))
+    }
 }
 
 /// Whether `info` still has `t`'s expiration signal queued (undelivered).
@@ -78,12 +105,21 @@ fn signal_queued(info: &ProcInfo, t: &PosixTimer) -> bool {
     }
 }
 
-/// Fire every POSIX timer on `info` whose deadline has passed at `now` (wall
-/// ns): post its signal (or count an overrun if one is still pending), re-arm a
+/// Fire POSIX timers whose native clock-domain deadline has passed: post its signal (or count an overrun if one is still pending), re-arm a
 /// periodic timer past `now`, disarm a one-shot. Un-parks the task when a
 /// signal was posted so a blocking syscall wakes to take it.
+#[cfg(test)]
 pub(super) fn fire_ptimers(info: &mut ProcInfo, now: u128) {
+    let cpu = super::CpuTimes {
+        tasks: [(info.pid, info.cpu_ns)].into(),
+        groups: [(info.tgid, info.cpu_ns)].into(),
+    };
+    fire_ptimers_with_cpu(info, now, &cpu);
+}
+
+pub(super) fn fire_ptimers_with_cpu(info: &mut ProcInfo, wall_now: u128, cpu: &super::CpuTimes) {
     for i in 0..info.ptimers.len() {
+        let now = info.ptimers[i].clock_now(wall_now, cpu);
         let Some(dl) = info.ptimers[i].deadline else {
             continue;
         };
@@ -184,6 +220,30 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
         let tgid = cx.cur.tgid;
+        let cpu_clock = match clock {
+            2 => Some((false, tgid)),
+            3 => Some((true, cx.cur.pid)),
+            clock if clock < 0 => {
+                let target = (!(clock >> 3)) as i32;
+                let thread = clock & 4 != 0;
+                let found = if target == cx.cur.pid || (!thread && target == tgid) {
+                    true
+                } else {
+                    sh.procs.iter().flatten().any(|p| {
+                        if thread {
+                            p.info.pid == target
+                        } else {
+                            p.info.tgid == target
+                        }
+                    })
+                };
+                if !found {
+                    return err(Errno::EINVAL);
+                }
+                Some((thread, target))
+            }
+            _ => None,
+        };
         // Ids are per thread group: the lowest one not in use.
         let mut used: Vec<i32> = cx.cur.ptimers.iter().map(|t| t.id).collect();
         used.extend(
@@ -222,6 +282,7 @@ impl Kernel {
             id,
             tgid,
             clock,
+            cpu_clock,
             notify,
             signo,
             value,
@@ -275,10 +336,12 @@ impl Kernel {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let now = poll::now_ns();
+        let wall_now = self.clock.now_monotonic().as_nanos();
+        let cpu = super::CpuTimes::read(sh, Some(&cx.cur));
         let Some(t) = Self::ptimer_mut(sh, cx, id as i32) else {
             return err(Errno::EINVAL);
         };
+        let now = t.clock_now(wall_now, &cpu);
         if old != 0 {
             let mut b = [0u8; 32];
             put_ts(&mut b, 0, t.interval_ns);
@@ -291,12 +354,14 @@ impl Kernel {
         t.overrun_pending = 0;
         t.deadline = if value == 0 {
             None
+        } else if flags & TIMER_ABSTIME != 0 && t.cpu_clock.is_some() {
+            Some(value)
         } else if flags & TIMER_ABSTIME != 0 {
-            // An absolute expiry on the timer's clock, converted to the wall
+            // An absolute expiry on the timer's clock, converted to the monotonic
             // deadline the scheduler tracks. A past time fires at once.
             let clock_now = match t.clock {
-                0 | 8 | 11 => crate::clock::now_unix(),
-                _ => crate::clock::now_monotonic(),
+                0 | 8 | 11 => self.clock.now_unix(),
+                _ => self.clock.now_monotonic(),
             }
             .as_nanos();
             Some(now + value.saturating_sub(clock_now))
@@ -317,10 +382,12 @@ impl Kernel {
         curr: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let now = poll::now_ns();
+        let wall_now = self.clock.now_monotonic().as_nanos();
+        let cpu = super::CpuTimes::read(sh, Some(&cx.cur));
         let Some(t) = Self::ptimer_mut(sh, cx, id as i32) else {
             return err(Errno::EINVAL);
         };
+        let now = t.clock_now(wall_now, &cpu);
         let mut b = [0u8; 32];
         put_ts(&mut b, 0, t.interval_ns);
         // An armed timer whose deadline just passed reports the minimum

@@ -111,6 +111,8 @@ pub struct DirEntry {
 /// defaults to `EROFS`, so a read-only backend (like squashfs) implements the
 /// three required methods and nothing else.
 pub trait MountFs: std::fmt::Debug + Send {
+    /// Bind generated timestamps to the owning VM clock.
+    fn set_clock(&mut self, _clock: std::sync::Arc<crate::clock::VirtualClock>) {}
     // ---- required (read side) ----
     fn stat(&mut self, rel: &str) -> Option<Attrs>;
     /// Metadata with a lookup error. Layer merging must fall through only on
