@@ -231,6 +231,36 @@ fn install_handler() -> Result<(), VcpuError> {
         .map_err(error)
 }
 
+/// Consume queued overflow notifications while the host keeps SIGNAL blocked.
+/// A pending notification would otherwise interrupt every subsequent KVM_RUN.
+fn drain_overflow_signal() -> Result<(), VcpuError> {
+    // SAFETY: initialized libc signal set containing only our overflow signal.
+    let mut signals: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&raw mut signals);
+        libc::sigaddset(&raw mut signals, SIGNAL);
+    }
+    let timeout = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    loop {
+        // SAFETY: the overflow signal is blocked on this thread, both pointers
+        // remain valid, and a zero timeout makes the wait nonblocking.
+        let result = unsafe {
+            libc::sigtimedwait(&raw const signals, std::ptr::null_mut(), &raw const timeout)
+        };
+        if result == SIGNAL {
+            continue;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EAGAIN) => return Ok(()),
+            Some(libc::EINTR) => {}
+            _ => return Err(error("could not drain overflow signal")),
+        }
+    }
+}
+
 thread_local! {
     // One counter belongs to the host worker, while guest budgets belong to vCPUs.
     static WORKER: RefCell<Option<Counter>> = const { RefCell::new(None) };
@@ -449,6 +479,7 @@ impl Pmu {
             stepping,
             host,
             target,
+            overflow_drained: false,
         };
         // Overflow stays blocked on the host, and KVM unblocks it only in guest.
         let mask = sys::kvm_signal_mask {
@@ -492,6 +523,8 @@ impl Pmu {
             unsafe { sys::ioctl(guard.counter, DISABLE, 0) },
             "PMU disable",
         )?;
+        drain_overflow_signal()?;
+        guard.overflow_drained = true;
         let mut sample = [0u64; 3];
         // SAFETY: writable 24-byte buffer matching read_format.
         let size = unsafe { sys::read(guard.counter, sample.as_mut_ptr().cast(), 24) };
@@ -525,16 +558,20 @@ pub(super) struct RunGuard {
     pub stepping: bool,
     host: Option<HostScope>,
     target: Option<u64>,
+    overflow_drained: bool,
 }
 
 impl Drop for RunGuard {
     fn drop(&mut self) {
         let debug = sys::kvm_guest_debug::default();
-        // SAFETY: descriptors outlive the guard. Disable before restoring the
-        // host signal mask, so any pending signal is harmless outside KVM_RUN.
+        // SAFETY: descriptors outlive the guard. Stop overflow generation before
+        // draining notifications and restoring the caller's host signal mask.
         unsafe {
             sys::ioctl(self.counter, DISABLE, 0);
             sys::ioctl(self.vcpu, sys::KVM_SET_GUEST_DEBUG, &debug);
+        }
+        if !self.overflow_drained {
+            let _ = drain_overflow_signal();
         }
     }
 }
@@ -573,6 +610,7 @@ mod tests {
                     stepping: false,
                     host: None,
                     target: None,
+                    overflow_drained: false,
                 });
                 let mut pending: libc::sigset_t = std::mem::zeroed();
                 assert_eq!(libc::sigpending(&raw mut pending), 0);

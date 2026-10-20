@@ -197,6 +197,7 @@ impl Resources {
             libc::SYS_timer_settime,
             libc::SYS_sigaltstack,
             libc::SYS_rt_sigprocmask,
+            libc::SYS_rt_sigtimedwait,
         ] {
             calls.insert(syscall, Vec::new());
         }

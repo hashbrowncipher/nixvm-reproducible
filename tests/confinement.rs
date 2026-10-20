@@ -199,6 +199,80 @@ fn kvm_fork_exec_reuses_slots_and_measured_smp_is_rejected() {
     }
 }
 
+#[test]
+#[ignore = "requires real KVM and guest-only Intel perf counters"]
+fn kvm_confined_workers_resume_after_repeated_pmu_overflows() {
+    nixvm::vcpu::kvm::KvmBackend::new().expect("hardware test requires KVM");
+    let root = Root::new("overflow");
+    let mut code = Vec::new();
+    syscall(&mut code, 57); // fork; both tasks compute for several quanta
+    code.extend_from_slice(&[0x49, 0x89, 0xc4, 0x48, 0x85, 0xc0]); // r12 = pid
+    let failed = jump(&mut code, 0x88);
+    mov32(&mut code, 0xbb, 20_000);
+    let start = code.len();
+    code.extend_from_slice(&[0xff, 0xcb]); // dec ebx
+    let again = jump(&mut code, 0x85);
+    target(&mut code, again, start);
+    code.extend_from_slice(&[0x4d, 0x85, 0xe4]); // test r12,r12
+    let child = jump(&mut code, 0x84);
+    code.extend_from_slice(&[
+        0x4c, 0x89, 0xe7, 0x48, 0x83, 0xec, 8, 0x48, 0x89, 0xe6, 0x31, 0xd2, 0x45, 0x31, 0xd2,
+    ]);
+    syscall(&mut code, 61); // wait4(child, &status, 0, NULL)
+    code.extend_from_slice(&[0x4c, 0x39, 0xe0]); // cmp rax,r12
+    let bad_wait = jump(&mut code, 0x85);
+    code.extend_from_slice(&[0x83, 0x3c, 0x24, 0]); // cmp status,0
+    let bad_status = jump(&mut code, 0x85);
+    let done = code.len();
+    target(&mut code, child, done);
+    exit(&mut code, 0);
+    let failure = code.len();
+    for offset in [failed, bad_wait, bad_status] {
+        target(&mut code, offset, failure);
+    }
+    exit(&mut code, 99);
+    root.write("init", &code);
+    assert_code(&run(&root.0, &[], &[("NIXVM_BRANCH_QUANTUM", "4096")]), 0);
+}
+
+#[test]
+#[ignore = "requires real KVM and guest-only Intel perf counters"]
+fn kvm_confined_solo_compute_resumes_after_a_timer_overflow() {
+    nixvm::vcpu::kvm::KvmBackend::new().expect("hardware test requires KVM");
+    let root = Root::new("timer-overflow");
+    let mut code = Vec::new();
+    mov32(&mut code, 0xbf, 1); // CLOCK_MONOTONIC
+    code.extend_from_slice(&[0x31, 0xf6]);
+    syscall(&mut code, 283); // timerfd_create
+    code.extend_from_slice(&[0x49, 0x89, 0xc4, 0x48, 0x83, 0xec, 32, 0x31, 0xc0]);
+    // it_interval = {0, 0}; it_value = {0, 4096ns}.
+    code.extend_from_slice(&[
+        0x48, 0x89, 0x04, 0x24, 0x48, 0x89, 0x44, 0x24, 8, 0x48, 0x89, 0x44, 0x24, 16, 0x48, 0xc7,
+        0x44, 0x24, 24, 0, 0x10, 0, 0, 0x4c, 0x89, 0xe7, 0x31, 0xf6, 0x48, 0x89, 0xe2, 0x45, 0x31,
+        0xd2,
+    ]);
+    syscall(&mut code, 286); // timerfd_settime
+    mov32(&mut code, 0xbb, 20_000);
+    let start = code.len();
+    code.extend_from_slice(&[0xff, 0xcb]);
+    let again = jump(&mut code, 0x85);
+    target(&mut code, again, start);
+    code.extend_from_slice(&[0x4c, 0x89, 0xe7, 0x48, 0x89, 0xe6]);
+    mov32(&mut code, 0xba, 8);
+    syscall(&mut code, 0); // read the completed timer
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 8]);
+    let bad_read = jump(&mut code, 0x85);
+    code.extend_from_slice(&[0x48, 0x83, 0x3c, 0x24, 1]);
+    let bad_count = jump(&mut code, 0x85);
+    exit(&mut code, 0);
+    let failure = code.len();
+    target(&mut code, bad_read, failure);
+    target(&mut code, bad_count, failure);
+    exit(&mut code, 99);
+    root.write("init", &code);
+    assert_code(&run(&root.0, &[], &[]), 0);
+}
+
 #[cfg(feature = "erofs")]
 #[test]
 fn strict_erofs_cli_parses_and_decompresses_after_confinement() {
