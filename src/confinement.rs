@@ -30,6 +30,8 @@ pub struct Resources {
     pub(crate) vcpus: Vec<i32>,
     pub(crate) images: Vec<i32>,
     pub(crate) perf: Vec<i32>,
+    pub(crate) reports: Vec<i32>,
+    pub(crate) host_tty: bool,
 }
 
 fn error(value: impl std::fmt::Display) -> Error {
@@ -50,7 +52,7 @@ pub(crate) fn descriptors() -> Result<Vec<i32>, Error> {
 
 /// Close inherited capabilities before opening any runtime resources.
 /// Entry from a multi-threaded embedder is rejected before changing anything.
-pub(crate) fn begin() -> Result<(), Error> {
+pub(crate) fn begin(retain: &[i32]) -> Result<(), Error> {
     if std::fs::read_dir("/proc/self/task").map_err(error)?.count() != 1 {
         return Err(error("requires a dedicated single-threaded process"));
     }
@@ -77,11 +79,33 @@ pub(crate) fn begin() -> Result<(), Error> {
             return Err(error("stdio must be regular files, pipes or terminals"));
         }
     }
+    for signal in [libc::SIGPIPE, libc::SIGXFSZ] {
+        // SAFETY: dedicated single-threaded entry. Failed writes are reported by
+        // the run instead of terminating this process before errors are latched.
+        if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+            return Err(error(std::io::Error::last_os_error()));
+        }
+    }
     crate::vcpu::kvm::clear_inactive_thread_resources();
-    // Future CLI arguments that designate inherited resource FDs may need
-    // explicit exemptions from close_range. No such arguments exist today.
-    // SAFETY: single-threaded entry; only the explicitly retained stdio survives.
-    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) } != 0 {
+    let mut retained = retain.to_vec();
+    retained.sort_unstable();
+    retained.dedup();
+    let mut first = 3u32;
+    for last in retained {
+        if last < 3 {
+            return Err(error("report descriptors must be above stderr"));
+        }
+        let last = last as u32;
+        if first < last {
+            // SAFETY: dedicated process; preserve only the named report descriptors.
+            if unsafe { libc::syscall(libc::SYS_close_range, first, last - 1, 0u32) } != 0 {
+                return Err(error(std::io::Error::last_os_error()));
+            }
+        }
+        first = last + 1;
+    }
+    // SAFETY: close every remaining inherited descriptor above the retained set.
+    if unsafe { libc::syscall(libc::SYS_close_range, first, u32::MAX, 0u32) } != 0 {
         return Err(error(std::io::Error::last_os_error()));
     }
     std::env::set_current_dir("/").map_err(error)?;
@@ -239,6 +263,7 @@ impl Resources {
         let mut reads = fd_rules(&[0]);
         reads.extend(fd_rules(&self.perf));
         let mut writes = fd_rules(&[1, 2]);
+        writes.extend(fd_rules(&self.reports));
         let mut ordinary = Vec::new();
         let mut directory_fcntl = Vec::new();
         let mut start = 3;
@@ -313,6 +338,7 @@ impl Resources {
                 calls.insert(syscall, Vec::new());
             }
         }
+        calls.insert(libc::SYS_poll, Vec::new());
         calls.insert(libc::SYS_read, reads);
         calls.insert(libc::SYS_write, writes.clone());
         calls.insert(libc::SYS_writev, writes);
@@ -320,7 +346,7 @@ impl Resources {
             calls.insert(libc::SYS_pread64, fd_rules(&self.images));
         }
         let mut ioctls = Vec::new();
-        for fd in 0..=2 {
+        for fd in (0..=2).filter(|_| self.host_tty) {
             for request in [
                 libc::TCGETS,
                 libc::TCSETS,
@@ -358,7 +384,11 @@ impl Resources {
                 ioctls.push(rule(vec![eq(0, fd as u64), eq(1, request)]));
             }
         }
-        calls.insert(libc::SYS_ioctl, ioctls);
+        // An empty rule list permits every request. Omit ioctl entirely when
+        // no prepared resource authorizes a request.
+        if !ioctls.is_empty() {
+            calls.insert(libc::SYS_ioctl, ioctls);
+        }
         let program: BpfProgram = SeccompFilter::new(
             calls,
             SeccompAction::KillProcess,
@@ -399,7 +429,7 @@ mod tests {
     }
 
     fn strict() {
-        begin().unwrap();
+        begin(&[]).unwrap();
         restrict_filesystem(&[]).unwrap();
         drop_thread_privileges().unwrap();
         Resources::default().install(false).unwrap();
@@ -553,7 +583,7 @@ mod tests {
         child(
             || {
                 use std::os::fd::IntoRawFd;
-                begin().unwrap();
+                begin(&[]).unwrap();
                 let fd = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
                 restrict_filesystem(&[]).unwrap();
                 drop_thread_privileges().unwrap();
@@ -582,7 +612,7 @@ mod tests {
                         libc::personality((current | libc::READ_IMPLIES_EXEC) as libc::c_ulong)
                     } >= 0
                 );
-                let error = begin().unwrap_err();
+                let error = begin(&[]).unwrap_err();
                 assert!(error.to_string().contains("READ_IMPLIES_EXEC"));
             },
             None,
@@ -595,7 +625,7 @@ mod tests {
             || {
                 use std::os::fd::IntoRawFd;
                 let inherited = std::fs::File::open("/dev/null").unwrap().into_raw_fd();
-                begin().unwrap();
+                begin(&[]).unwrap();
                 assert_eq!(unsafe { libc::fcntl(inherited, libc::F_GETFD) }, -1);
                 assert_eq!(
                     std::io::Error::last_os_error().raw_os_error(),
@@ -620,7 +650,7 @@ mod tests {
     fn filter_covers_prepared_workers() {
         child(
             || {
-                begin().unwrap();
+                begin(&[]).unwrap();
                 restrict_filesystem(&[]).unwrap();
                 let (ready_tx, ready_rx) = std::sync::mpsc::channel();
                 let (run_tx, run_rx) = std::sync::mpsc::channel();
@@ -658,7 +688,7 @@ mod tests {
         std::os::unix::fs::symlink("file", root.join("link")).unwrap();
         child(
             || {
-                begin().unwrap();
+                begin(&[]).unwrap();
                 let mut mount = crate::fs::Passthrough::prepared(root.clone(), false).unwrap();
                 restrict_filesystem(&[(mount.pinned_root(), false)]).unwrap();
                 drop_thread_privileges().unwrap();
@@ -705,7 +735,7 @@ mod tests {
         for number in [libc::SYS_readlinkat, libc::SYS_statx] {
             child(
                 || {
-                    begin().unwrap();
+                    begin(&[]).unwrap();
                     restrict_filesystem(&[(
                         std::sync::Arc::new(std::fs::File::open(&root).unwrap()),
                         false,
@@ -729,7 +759,7 @@ mod tests {
         }
         child(
             || {
-                begin().unwrap();
+                begin(&[]).unwrap();
                 restrict_filesystem(&[(
                     std::sync::Arc::new(std::fs::File::open(&root).unwrap()),
                     false,
@@ -753,7 +783,7 @@ mod tests {
         child(
             || {
                 use crate::vcpu::{Backend, Exit, GuestMemory, Prot};
-                begin().unwrap();
+                begin(&[]).unwrap();
                 let backend = crate::vcpu::kvm::KvmBackend::new().expect("requires real KVM");
                 let base = 0x1_0000;
                 let mut memory = GuestMemory::new(base, 64 * 1024);
@@ -802,7 +832,7 @@ mod tests {
             child(
                 || {
                     use crate::vcpu::{Backend, GuestMemory};
-                    begin().unwrap();
+                    begin(&[]).unwrap();
                     let backend = crate::vcpu::kvm::KvmBackend::new().expect("requires real KVM");
                     let memory = GuestMemory::new(0x1_0000, 64 * 1024);
                     let resources = backend.prepare_confinement(2, &memory).unwrap();

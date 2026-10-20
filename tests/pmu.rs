@@ -23,7 +23,7 @@ fn invalid_quantum_is_rejected_before_opening_kvm() {
 #[ignore = "requires KVM and guest-only Intel perf counters"]
 fn stepping_flags_are_hidden_from_pushf_and_popf_roundtrips() {
     for code in [
-        vec![0x9c, 0x58, 0x0f, 0x05], // pushfq; pop rax; syscall
+        vec![0x9c, 0x58, 0x0f, 0x05],             // pushfq; pop rax; syscall
         vec![0x66, 0x9c, 0x66, 0x58, 0x0f, 0x05], // pushfw; pop ax; syscall
         vec![0x9c, 0x58, 0x50, 0x9d, 0x9c, 0x58, 0x0f, 0x05],
     ] {
@@ -31,13 +31,19 @@ fn stepping_flags_are_hidden_from_pushf_and_popf_roundtrips() {
         let mut memory = GuestMemory::new(BASE, 64 * 1024);
         memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
         memory.map(BASE + PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
-        memory.write_init(BASE + 2 * PAGE_SIZE - 8, &[0; 8]).unwrap();
+        memory
+            .write_init(BASE + 2 * PAGE_SIZE - 8, &[0; 8])
+            .unwrap();
         memory.write_init(BASE, &code).unwrap();
         let mut cpu = backend.new_vcpu(BASE, BASE + 2 * PAGE_SIZE).unwrap();
         cpu.set_preemption_required(true);
         cpu.begin_slice();
         assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Syscall);
-        assert_eq!(cpu.reg(0) & 0x100, 0, "pushed flags include host TF: {code:x?}");
+        assert_eq!(
+            cpu.reg(0) & 0x100,
+            0,
+            "pushed flags include host TF: {code:x?}"
+        );
         assert_eq!(cpu.rflags() & 0x100, 0);
     }
 }
@@ -53,8 +59,15 @@ fn stepping_flags_are_hidden_from_exception_frames() {
         let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
         cpu.set_preemption_required(true);
         cpu.begin_slice();
-        assert!(matches!(cpu.run(&mut memory).unwrap(), Exit::IllegalInstruction { .. } | Exit::MemFault { .. }));
-        assert_eq!(cpu.rflags() & 0x100, 0, "exception flags include host TF: {code:x?}");
+        assert!(matches!(
+            cpu.run(&mut memory).unwrap(),
+            Exit::IllegalInstruction { .. } | Exit::MemFault { .. }
+        ));
+        assert_eq!(
+            cpu.rflags() & 0x100,
+            0,
+            "exception flags include host TF: {code:x?}"
+        );
     }
 }
 
@@ -65,18 +78,30 @@ fn int1_and_guest_trap_flags_are_independent_of_host_stepping() {
         for (code, expected_pc, expected_code) in [
             (vec![0xf1, 0x0f, 0x05], BASE + 1, 1),
             // pushfq; or word [rsp],TF; popfq; nop; syscall.
-            (vec![0x9c, 0x66, 0x81, 0x0c, 0x24, 0, 1, 0x9d, 0x90, 0x0f, 0x05], BASE + 9, 2),
+            (
+                vec![0x9c, 0x66, 0x81, 0x0c, 0x24, 0, 1, 0x9d, 0x90, 0x0f, 0x05],
+                BASE + 9,
+                2,
+            ),
         ] {
             let backend = KvmBackend::with_branch_quantum(64).unwrap();
             let mut memory = GuestMemory::new(BASE, 64 * 1024);
             memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
             memory.map(BASE + PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
-            memory.write_init(BASE + 2 * PAGE_SIZE - 8, &[0; 8]).unwrap();
+            memory
+                .write_init(BASE + 2 * PAGE_SIZE - 8, &[0; 8])
+                .unwrap();
             memory.write_init(BASE, &code).unwrap();
             let mut cpu = backend.new_vcpu(BASE, BASE + 2 * PAGE_SIZE).unwrap();
             cpu.set_preemption_required(stepping);
             cpu.begin_slice();
-            assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Breakpoint { pc: expected_pc, code: expected_code });
+            assert_eq!(
+                cpu.run(&mut memory).unwrap(),
+                Exit::Breakpoint {
+                    pc: expected_pc,
+                    code: expected_code
+                }
+            );
             assert_eq!(cpu.rflags() & 0x100 != 0, expected_code == 2);
         }
     }
@@ -216,7 +241,9 @@ fn solo_compute_can_use_an_explicit_branch_limit() {
     let backend = KvmBackend::with_branch_quantum(16).unwrap();
     let mut memory = GuestMemory::new(BASE, 64 * 1024);
     memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
-    memory.write_init(BASE, &[0x48, 0xff, 0xc3, 0x48, 0x85, 0xdb, 0x75, 0xf8]).unwrap();
+    memory
+        .write_init(BASE, &[0x48, 0xff, 0xc3, 0x48, 0x85, 0xdb, 0x75, 0xf8])
+        .unwrap();
     let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
     cpu.set_execution_limit(Some(32));
     assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);

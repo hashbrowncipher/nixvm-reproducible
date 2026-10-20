@@ -170,6 +170,7 @@ pub const KVM_SET_MP_STATE: c_ulong = 0x4004_ae99;
 pub const KVM_SET_VCPU_EVENTS: c_ulong = 0x4040_aea0;
 pub const KVM_GET_VCPU_EVENTS: c_ulong = 0x8040_ae9f;
 pub const KVM_SET_DEBUGREGS: c_ulong = 0x4080_aea2;
+pub const KVM_GET_DEBUGREGS: c_ulong = 0x8080_aea1;
 
 /// linux/asm/kvm.h event state, including pending fault and interrupt state.
 #[repr(C)]

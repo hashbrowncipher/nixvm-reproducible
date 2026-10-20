@@ -28,152 +28,6 @@ use crate::vcpu::phys::PhysMem;
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 use iced_x86::Code;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-/// Per-thread wall-clock preemption for `KVM_RUN`.
-///
-/// `KVM_RUN` only returns on a vmexit or a delivered signal, so a compute-bound
-/// guest (a JIT hot loop, a GC sweep) that never faults or syscalls would run
-/// its whole time slice on hardware. To bound that, each host thread arms a
-/// POSIX timer just before entering the guest; when it fires it raises a
-/// dedicated signal *at that very thread* (`SIGEV_THREAD_ID`), whose no-op
-/// handler — installed without `SA_RESTART` — makes `KVM_RUN` return `-EINTR`,
-/// which [`KvmVcpu::run_once`] already turns into [`Exit::Interrupted`].
-///
-/// A `KvmVcpu` can migrate between the SMP worker threads, so the timer is a
-/// thread-local keyed to the thread that actually runs the guest, created lazily
-/// and re-armed around each `KVM_RUN`.
-pub(super) mod preempt {
-    use super::sys;
-    use std::cell::Cell;
-    use std::sync::Once;
-    use std::time::Duration;
-
-    /// The signal the preemption timer raises. A real-time signal above the two
-    /// (`SIGRTMIN`, `SIGRTMIN+1`) that glibc's NPTL reserves for thread
-    /// cancellation and `setxid`, so it collides with nothing the host runtime
-    /// or the guest-signal emulation (which is entirely in-VM and touches no
-    /// host signal) uses. The number is the kernel's raw signal, not glibc's
-    /// remapped `SIGRTMIN`.
-    const PREEMPT_SIG: i32 = 40;
-
-    /// The signal handler: it does nothing. Its entire purpose is to be a
-    /// non-`SA_RESTART` handler so that its delivery interrupts the `KVM_RUN`
-    /// ioctl (returning `-EINTR`) rather than being ignored or restarting it.
-    extern "C" fn on_preempt(_sig: i32) {}
-
-    fn install_handler() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            let act = sys::sigaction {
-                sa_handler: on_preempt as *const () as usize,
-                sa_mask: [0; 16],
-                // No SA_RESTART: the delivery must break KVM_RUN out with EINTR.
-                sa_flags: 0,
-                sa_restorer: 0,
-            };
-            // SAFETY: `act` is a valid, fully-initialized sigaction; we install
-            // our own no-op handler for a signal nothing else uses. glibc's
-            // wrapper supplies the SA_RESTORER trampoline.
-            unsafe {
-                sys::sigaction(PREEMPT_SIG, std::ptr::from_ref(&act), std::ptr::null_mut());
-            }
-        });
-    }
-
-    thread_local! {
-        /// This thread's one-shot preemption timer, created on first use and
-        /// targeting this thread's tid. `None` until created (or if creation
-        /// failed — then preemption silently degrades to the syscall-count cap).
-        static TIMER: Cell<Option<sys::timer_t>> = const { Cell::new(None) };
-    }
-
-    /// This thread's timer id, creating it (and installing the handler) on first
-    /// use. The timer notifies via `SIGEV_THREAD_ID` at *this* thread, so the
-    /// signal always lands on whoever is inside `KVM_RUN`.
-    fn thread_timer() -> Option<sys::timer_t> {
-        install_handler();
-        TIMER.with(|slot| {
-            if let Some(id) = slot.get() {
-                return Some(id);
-            }
-            // SAFETY: `gettid` takes no arguments and only reads the caller's tid.
-            let tid = unsafe { sys::gettid() };
-            let mut ev = sys::sigevent {
-                sigev_signo: PREEMPT_SIG,
-                sigev_notify: sys::SIGEV_THREAD_ID,
-                sigev_notify_thread_id: tid,
-                ..sys::sigevent::default()
-            };
-            let mut id: sys::timer_t = std::ptr::null_mut();
-            // SAFETY: valid out-pointers; creates a per-thread CLOCK_MONOTONIC
-            // timer bound to this thread via SIGEV_THREAD_ID.
-            let ret = unsafe {
-                sys::timer_create(
-                    sys::CLOCK_MONOTONIC,
-                    std::ptr::from_mut(&mut ev),
-                    std::ptr::from_mut(&mut id),
-                )
-            };
-            if ret != 0 {
-                return None;
-            }
-            slot.set(Some(id));
-            Some(id)
-        })
-    }
-
-    pub fn prepare() -> Result<(), crate::vcpu::VcpuError> {
-        thread_timer().map(|_| ()).ok_or_else(|| {
-            crate::vcpu::VcpuError::Backend(format!(
-                "prepare preemption timer: {}",
-                std::io::Error::last_os_error()
-            ))
-        })
-    }
-
-    /// Arm this thread's timer to fire once after `d` (a zero `it_interval`
-    /// makes it one-shot). Call immediately before `KVM_RUN`.
-    pub fn arm(d: Duration) {
-        let Some(id) = thread_timer() else {
-            return;
-        };
-        let spec = sys::itimerspec {
-            it_interval: sys::timespec::default(),
-            it_value: sys::timespec {
-                // A zero it_value would *disarm* the timer, so a sub-nanosecond
-                // quantum still asks for at least one nanosecond.
-                tv_sec: d.as_secs() as i64,
-                tv_nsec: i64::from(d.subsec_nanos().max(1)),
-            },
-        };
-        // SAFETY: valid timer id and itimerspec; one-shot relative arming.
-        unsafe {
-            sys::timer_settime(id, 0, std::ptr::from_ref(&spec), std::ptr::null_mut());
-        }
-    }
-
-    /// Disarm this thread's timer (zero `it_value`). Call immediately after
-    /// `KVM_RUN` so a late expiry doesn't fire into the next, unrelated slice.
-    ///
-    /// v1 accepts two benign races: the signal landing between `arm` and
-    /// `KVM_RUN` (the run returns EINTR at once — a harmlessly short slice), and
-    /// landing after `KVM_RUN` returns but before `disarm` (the no-op handler
-    /// runs, doing nothing). The fully race-free upgrade is
-    /// `KVM_SET_SIGNAL_MASK` — unblock the signal only for the duration of
-    /// `KVM_RUN` — which we deliberately skip for v1.
-    pub fn disarm() {
-        TIMER.with(|slot| {
-            if let Some(id) = slot.get() {
-                let spec = sys::itimerspec::default();
-                // SAFETY: valid timer id; a zero it_value disarms the timer.
-                unsafe {
-                    sys::timer_settime(id, 0, std::ptr::from_ref(&spec), std::ptr::null_mut());
-                }
-            }
-        });
-    }
-}
 
 /// `RFLAGS` for fresh user code: just the always-one bit and IF (interrupts
 /// are never injected, but a clear IF would make a guest `pushf` look odd).
@@ -217,14 +71,9 @@ pub struct KvmVcpu {
     /// registers without entering the guest; [`KvmVcpu::set_syscall_ret`]
     /// (and `reset`) clear it.
     in_syscall: bool,
-    /// Wall-clock preemption quantum: a per-thread timer armed around each
-    /// `KVM_RUN` breaks the guest out with `Exit::Interrupted` after this long,
-    /// so a compute-bound guest that never exits still yields the CPU. `None`
-    /// disables it. This host watchdog bounds embedder latency without charging
-    /// guest time. Conditional-branch targets enforce guest scheduling and timers.
-    /// Cached from `NIXVM_QUANTUM_MS` (see [`preempt`] and
-    /// [`crate::vcpu::preempt_quantum`]).
-    quantum: Option<Duration>,
+    /// Whether precision stepping injected TF into the current user frame.
+    injected_tf: bool,
+    guest_debug: Option<(u64, Option<u64>)>,
     pmu: pmu::Pmu,
     clock: Arc<crate::clock::VirtualClock>,
     observer: u64,
@@ -383,7 +232,8 @@ impl KvmVcpu {
             sregs,
             sregs_dirty: true,
             in_syscall: false,
-            quantum: crate::vcpu::preempt_quantum(),
+            injected_tf: false,
+            guest_debug: None,
             pmu: pmu::Pmu::new(branch_quantum),
             clock,
             observer,
@@ -423,11 +273,7 @@ impl KvmVcpu {
     }
 
     /// Flush dirty caches to the vcpu, run it once, and refresh the caches.
-    fn run_once(
-        &mut self,
-        quantum: Option<Duration>,
-        target: Option<u64>,
-    ) -> Result<(u32, bool), VcpuError> {
+    fn run_once(&mut self, target: Option<u64>) -> Result<(u32, bool), VcpuError> {
         if self.regs_dirty {
             // SAFETY: valid struct pointer; the fd is live.
             let ret =
@@ -470,22 +316,35 @@ impl KvmVcpu {
             self.sregs_dirty = false;
         }
 
-        // Arm this thread's preemption timer so a compute-bound guest that never
-        // exits is broken out after the quantum: the timer signal interrupts
-        // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
-        // after so a late expiry can't fire into an unrelated later slice.
         let counter = pmu::Pmu::start(self.fd.0, target)?;
         let stepping = counter.stepping;
-        if let Some(q) = quantum {
-            preempt::arm(q);
+        let user = self.sregs.cs.selector == SEL_UCODE;
+        let guest_tf = self.regs.rflags & 0x100;
+        if user {
+            self.injected_tf = stepping && self.regs.rflags & 0x100 == 0;
         }
+        let instruction = if stepping && user {
+            super::instruction::decode(self.sregs.cr3, self.phys.as_ref().unwrap(), self.regs.rip)
+                .ok()
+        } else {
+            None
+        };
+        self.guest_debug = if let Some(instruction) =
+            instruction.filter(|instruction| instruction.code() == Code::Int1)
+        {
+            Some((1, Some(instruction.next_ip())))
+        } else if stepping && user && self.regs.rflags & 0x100 != 0 {
+            Some((2, None))
+        } else {
+            None
+        };
+        let pushed_flags = instruction
+            .filter(|instruction| matches!(instruction.code(), Code::Pushfq | Code::Pushfw))
+            .map(|instruction| (instruction.next_ip(), self.regs.rflags & 0x100));
         // SAFETY: `KVM_RUN` takes no argument; the fd is live and not run
         // concurrently (see the `Send` note).
         let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_RUN, 0) };
         let run_error = (ret < 0).then(std::io::Error::last_os_error);
-        if quantum.is_some() {
-            preempt::disarm();
-        }
         let branches = self.pmu.finish(counter)?;
         self.clock.advance_execution(branches);
         if let Some(remaining) = &mut self.execution_limit {
@@ -520,6 +379,34 @@ impl KvmVcpu {
             )
         };
         check(ret, "KVM_GET_SREGS")?;
+        if stepping && user && self.sregs.cs.selector == SEL_UCODE {
+            // Clearing KVM's debugger also clears hardware TF. Guest-owned TF
+            // survives independently of that temporary debugger state.
+            self.regs.rflags = (self.regs.rflags & !0x100) | guest_tf;
+            self.regs_dirty = true;
+        }
+
+        if let Some((next, guest_tf)) = pushed_flags
+            && self.regs.rip == next
+            && self.sregs.cs.selector == SEL_UCODE
+        {
+            // PUSHF saves the injected hardware TF. Change only that bit
+            // after successful retirement, including across a page boundary.
+            let phys = self.phys.as_ref().unwrap();
+            let address = self.regs.rsp.wrapping_add(1);
+            let translation =
+                crate::vcpu::pagetable::AddrSpace::translate_cr3(self.sregs.cr3, address, phys)
+                    .filter(|entry| {
+                        !entry.supervisor && entry.prot.contains(crate::vcpu::Prot::WRITE)
+                    })
+                    .ok_or_else(|| {
+                        VcpuError::Backend("retired PUSHF has no writable stack".into())
+                    })?;
+            let mut byte = [0];
+            phys.read(translation.paddr, &mut byte);
+            byte[0] = (byte[0] & !1) | (guest_tf >> 8) as u8;
+            phys.write(translation.paddr, &byte);
+        }
 
         if interrupted {
             return Ok((sys::KVM_EXIT_INTR, stepping));
@@ -531,7 +418,6 @@ impl KvmVcpu {
 
     /// Drive KVM through incidental traps until a kernel event or exact limit.
     fn run_loop(&mut self) -> Result<Exit, VcpuError> {
-        let started = Instant::now();
         loop {
             if self.clock.deadline_due() || self.execution_limit == Some(0) || self.pmu.finished() {
                 return Ok(Exit::Interrupted);
@@ -545,24 +431,44 @@ impl KvmVcpu {
                 .into_iter()
                 .flatten()
                 .min();
-            // Host time bounds embedder latency only. It never contributes to
-            // guest time or completes a guest wait. Exact PMU runs use their
-            // branch boundary; count-only runs retain the host watchdog.
-            let watchdog = if target.is_some() {
-                None
-            } else {
-                self.quantum.map(|q| q.saturating_sub(started.elapsed()))
-            };
-            if watchdog.is_some_and(|q| q.is_zero()) {
-                return Ok(Exit::Interrupted);
+            if target.is_some_and(|target| target <= pmu::SKID)
+                && self.sregs.cs.selector == SEL_UCODE
+                && let Ok(instruction) = super::instruction::decode(
+                    self.sregs.cr3,
+                    self.phys.as_ref().unwrap(),
+                    self.regs.rip,
+                )
+                && matches!(instruction.code(), Code::Popfq | Code::Popfw)
+            {
+                let tracing = self.regs.rflags & 0x100 != 0;
+                if let Some(exit) = self.emulate_popf(instruction) {
+                    return Ok(exit);
+                }
+                if tracing {
+                    return Ok(Exit::Breakpoint {
+                        pc: self.regs.rip,
+                        code: 2,
+                    });
+                }
+                continue;
             }
-            let (reason, stepping) = self.run_once(watchdog, target)?;
+            let (reason, stepping) = self.run_once(target)?;
             if reason == sys::KVM_EXIT_DEBUG {
+                if let Some((code, next)) = self.guest_debug {
+                    if let Some(next) = next {
+                        self.regs.rip = next;
+                        self.regs_dirty = true;
+                    }
+                    return Ok(Exit::Breakpoint {
+                        pc: self.regs.rip,
+                        code,
+                    });
+                }
                 // The precision tail remains inside this slice. Recalculate
                 // its limit after charging actual retired branches.
                 continue;
             }
-            if reason == sys::KVM_EXIT_INTR && target.is_some() {
+            if reason == sys::KVM_EXIT_INTR {
                 // Overflow is an early warning; an unrelated host interrupt
                 // must not turn it into an inexact scheduling boundary.
                 continue;
@@ -571,7 +477,7 @@ impl KvmVcpu {
                 continue;
             };
             if exit == Exit::Syscall {
-                if stepping {
+                if stepping && self.injected_tf {
                     // SYSCALL copies KVM's host single-step TF into R11. It is
                     // not guest state and must not survive the return to CPL3.
                     self.regs.r11 &= !0x100;
@@ -584,6 +490,41 @@ impl KvmVcpu {
             }
             return Ok(exit);
         }
+    }
+
+    /// POPF must not clear the hardware flag enforcing the precision tail.
+    fn emulate_popf(&mut self, instruction: iced_x86::Instruction) -> Option<Exit> {
+        let width = if instruction.code() == Code::Popfw {
+            2
+        } else {
+            8
+        };
+        let phys = self.phys.as_ref().unwrap();
+        let mut bytes = [0u8; 8];
+        for (offset, byte) in bytes[..width].iter_mut().enumerate() {
+            let address = self.regs.rsp.wrapping_add(offset as u64);
+            if !crate::vcpu::pagetable::is_canonical(address) {
+                return Some(Exit::ProtectionFault { pc: self.regs.rip });
+            }
+            let Some(entry) =
+                crate::vcpu::pagetable::AddrSpace::translate_cr3(self.sregs.cr3, address, phys)
+                    .filter(|entry| !entry.supervisor)
+            else {
+                return Some(Exit::MemFault {
+                    addr: address,
+                    write: false,
+                });
+            };
+            phys.read(entry.paddr, std::slice::from_mut(byte));
+        }
+        // CPL3 may change status, TF, DF, NT, AC and ID; IF and IOPL stay fixed.
+        let mask = if width == 2 { 0x4dd5 } else { 0x24_4dd5 };
+        self.regs.rflags =
+            ((self.regs.rflags & !mask) | (u64::from_le_bytes(bytes) & mask)) & !(1 << 16);
+        self.regs.rsp = self.regs.rsp.wrapping_add(width as u64);
+        self.regs.rip = instruction.next_ip();
+        self.regs_dirty = true;
+        None
     }
 
     /// Recover a CPL3 exception frame and restore the state exposed to the kernel.
@@ -611,6 +552,9 @@ impl KvmVcpu {
         let err = if error_code { phys.read_u64(pa) } else { 0 };
         self.regs.rip = at(0);
         self.regs.rflags = at(2);
+        if self.injected_tf {
+            self.regs.rflags &= !0x100;
+        }
         self.regs.rsp = at(3);
         self.regs_dirty = true;
         self.sregs.cs = user_cs();
@@ -622,6 +566,26 @@ impl KvmVcpu {
     /// `None` means an intercepted instruction completed; resume internally.
     fn decode_exit(&mut self, reason: u32) -> Result<Option<Exit>, VcpuError> {
         let exit = match reason {
+            sys::KVM_EXIT_HLT if self.regs.rip == crate::vcpu::ctrl::DB_TRAMP_VA + 1 => {
+                self.restore_exception(false)?;
+                let mut debug = sys::kvm_debugregs::default();
+                // SAFETY: live vCPU and initialized debug-register buffer.
+                check(
+                    unsafe { sys::ioctl(self.fd.0, sys::KVM_GET_DEBUGREGS, &raw mut debug) },
+                    "KVM_GET_DEBUGREGS",
+                )?;
+                let code = if debug.dr6 & (1 << 14) == 0 { 1 } else { 2 };
+                debug.dr6 = 0xffff_0ff0;
+                // SAFETY: clear the consumed debug status on this same vCPU.
+                check(
+                    unsafe { sys::ioctl(self.fd.0, sys::KVM_SET_DEBUGREGS, &raw const debug) },
+                    "KVM_SET_DEBUGREGS",
+                )?;
+                Exit::Breakpoint {
+                    pc: self.regs.rip,
+                    code,
+                }
+            }
             sys::KVM_EXIT_HLT if self.regs.rip == FAULT_TRAMP_VA + 1 => {
                 let err = self.restore_exception(true)?;
                 Exit::MemFault {

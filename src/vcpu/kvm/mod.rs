@@ -61,6 +61,7 @@ impl KvmBackend {
     }
 
     fn configured(branch_quantum: u64) -> Result<Self, VcpuError> {
+        super::validate_branch_watchdog()?;
         probe_guest_counter()?;
         Ok(Self {
             vm: Arc::new(vm::Vm::new()?),
@@ -141,7 +142,6 @@ impl Backend for KvmBackend {
 }
 
 pub(crate) fn prepare_thread() -> Result<(), VcpuError> {
-    vcpu::preempt::prepare()?;
     pmu::prepare_thread()?;
     Ok(())
 }
@@ -161,6 +161,8 @@ pub(crate) fn runtime_requests() -> Vec<u64> {
         sys::KVM_SET_REGS,
         sys::KVM_GET_SREGS,
         sys::KVM_SET_SREGS,
+        sys::KVM_GET_DEBUGREGS,
+        sys::KVM_SET_DEBUGREGS,
         sys::KVM_SET_MSRS,
         sys::KVM_SET_CPUID2,
         sys::KVM_SET_XCRS,
@@ -420,17 +422,9 @@ mod tests {
         }
     }
 
-    /// Real intra-process parallelism: two KVM vcpus in the *same* address space
-    /// (one shared VM, one `GuestMemory`) must execute `KVM_RUN` on two host cores
-    /// at once — the whole point of the lockless SMP split. Each thread mirrors the
-    /// scheduler: reconcile under the memory lock, then run with it dropped. A
-    /// `jmp $` guest is compute-bound, so each `run_bare` spans a full preemption
-    /// quantum; an instrument around it records the peak number of vcpus inside
-    /// `KVM_RUN` simultaneously. If the run still held the memory lock (the bug
-    /// this milestone fixes), the two threads would serialize on that one Mutex and
-    /// the peak would never exceed 1. Also checks each vcpu's independent write
-    /// landed in its own slot — no corruption from the concurrent runs + the
-    /// concurrent shadow-page-table sync. Skips cleanly without `/dev/kvm`.
+    /// Run two vCPUs against one address space with separate result slots.
+    /// Each worker reconciles under the memory lock, then executes a bounded
+    /// branch allowance without that lock. Their active calls must overlap.
     #[test]
     fn two_vcpus_run_concurrently_in_one_address_space() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -445,8 +439,9 @@ mod tests {
         let mut mem = GuestMemory::new(base, 64 * 1024);
         mem.map(code, PAGE_SIZE, Prot::rwx()).unwrap();
         mem.map(data, PAGE_SIZE, Prot::rw()).unwrap();
-        // mov [rsi], eax ; jmp $  — store this vcpu's value to its slot, then spin.
-        mem.write_init(code, &[0x89, 0x06, 0xEB, 0xFE]).unwrap();
+        // Store this vCPU's value, then loop through counted conditional branches.
+        mem.write_init(code, &[0x89, 0x06, 0x85, 0xc0, 0x75, 0xfc])
+            .unwrap();
         // Demand paging: this test drives vcpus directly (no kernel to service a
         // fault), so pre-back the data page — write_init faults in its frame — or
         // the guest's first store would fault instead of spinning.
@@ -486,6 +481,7 @@ mod tests {
                         }
                         let n = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                         max_seen.fetch_max(n, Ordering::SeqCst);
+                        v.set_execution_limit(Some(64));
                         let exit = v.run_bare().expect("KVM run");
                         in_flight.fetch_sub(1, Ordering::SeqCst);
                         assert_eq!(exit, Exit::Interrupted, "compute-bound guest is preempted");
@@ -515,31 +511,26 @@ mod tests {
         );
     }
 
-    /// Time-based preemption on the hardware path: a guest spinning forever in a
-    /// `jmp $` self-loop makes no syscall and never faults, so without the
-    /// per-thread preemption timer `KVM_RUN` would never return and `run` would
-    /// hang. The armed timer's signal must break it out as `Exit::Interrupted`,
-    /// leaving the guest resumable (rip still on the loop). Uses the default
-    /// `NIXVM_QUANTUM_MS` quantum, so a broken timer hangs the test rather than
-    /// passing.
+    /// A direct vCPU driver can stop a compute loop at an explicit branch count.
     #[test]
-    fn time_quantum_preempts_a_compute_bound_guest() {
+    fn branch_allowance_preempts_a_compute_bound_guest() {
         let Some(backend) = backend_or_skip() else {
             return;
         };
         let base = 0x1_0000u64;
         let mut mem = GuestMemory::new(base, 64 * 1024);
         mem.map(base, PAGE_SIZE, Prot::rwx()).unwrap();
-        mem.write_init(base, &[0xEB, 0xFE]).unwrap(); // jmp $ (spin forever)
+        mem.write_init(base, &[0x85, 0xc0, 0x74, 0xfc]).unwrap(); // test eax,eax; jz start
 
         let mut v = backend
             .new_vcpu(base, base + 0x8000)
             .expect("create KVM vcpu");
+        v.set_execution_limit(Some(32));
         let exit = v.run(&mut mem).expect("KVM run");
         assert_eq!(
             exit,
             Exit::Interrupted,
-            "the quantum timer preempts the guest"
+            "the branch allowance preempts the guest"
         );
         assert_eq!(v.pc(), base, "still on the self-loop, resumable");
     }

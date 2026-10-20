@@ -227,7 +227,7 @@ fn timestamp_reads_preserve_flags() {
 }
 
 #[test]
-fn timestamp_trap_loop_still_yields() {
+fn timestamp_trap_loop_reaches_virtual_deadlines() {
     for code in [
         &[0x0f, 0x31, 0xeb, 0xfc][..],
         &[0x0f, 0x01, 0xf9, 0xeb, 0xfb][..],
@@ -238,10 +238,13 @@ fn timestamp_trap_loop_still_yields() {
         mem.write_init(BASE, code).unwrap(); // timestamp read; JMP back
         let mut v = backend.new_vcpu(BASE, STACK).unwrap();
         v.reconcile(&mut mem).unwrap();
-        let started = std::time::Instant::now();
+        let clock = std::sync::Arc::new(nixvm::clock::VirtualClock::new());
+        v.set_clock(std::sync::Arc::clone(&clock), 1);
         for _ in 0..3 {
+            let deadline = clock.now_monotonic().as_nanos() + 100;
+            clock.set_deadline(Some(deadline));
             assert_eq!(v.run_bare().unwrap(), Exit::Interrupted);
+            assert_eq!(clock.now_monotonic().as_nanos(), deadline);
         }
-        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 }

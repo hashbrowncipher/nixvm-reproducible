@@ -29,23 +29,15 @@ pub(crate) mod vdso;
 
 pub use mem::{GuestMemory, MemError, Prot};
 
-/// KVM's host watchdog while counting without an exact execution target.
-/// Its timer returns control to the embedder without advancing virtual time.
-/// Exact timer and fairness boundaries use the PMU instead of this watchdog.
-///
-/// Configured once by `NIXVM_QUANTUM_MS` (default 10 ms); `0` disables it.
+/// Measured KVM execution cannot use a host-time scheduling boundary.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[must_use]
-pub(crate) fn preempt_quantum() -> Option<std::time::Duration> {
-    use std::sync::OnceLock;
-    static Q: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-    *Q.get_or_init(|| {
-        let ms = std::env::var("NIXVM_QUANTUM_MS")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .unwrap_or(10);
-        (ms > 0).then(|| std::time::Duration::from_millis(ms))
-    })
+pub(crate) fn validate_branch_watchdog() -> Result<(), VcpuError> {
+    if std::env::var_os("NIXVM_QUANTUM_MS")
+        .is_some_and(|value| value.to_str().map(str::trim) != Some("0"))
+    {
+        return Err(VcpuError::Backend("host watchdog is incompatible with branch counting; unset NIXVM_QUANTUM_MS or set it to 0".into()));
+    }
+    Ok(())
 }
 
 thread_local! {

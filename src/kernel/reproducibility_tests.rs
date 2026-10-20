@@ -1,5 +1,5 @@
-use super::*;
 use super::testutil::{BASE, call, setup};
+use super::*;
 use crate::fs::{DirEntry, MountFs, TmpFs};
 
 #[derive(Debug)]
@@ -26,24 +26,73 @@ fn directory_order_ignores_backend_order_across_short_reads_and_rewinds() {
     for name in ["c", "a", "b"] {
         directory.create(name, 0o644).unwrap();
     }
-    kernel.vfs.get_mut().unwrap().mount("/", Box::new(ReverseDirectory(directory)));
+    kernel
+        .vfs
+        .get_mut()
+        .unwrap()
+        .mount("/", Box::new(ReverseDirectory(directory)));
     for syscall in [Sysno::Getdents64, Sysno::Getdents] {
-        context.cur.fds.insert(3, Fd::Dir { path: "/".into(), pos: 0 });
+        context.cur.fds.insert(
+            3,
+            Fd::Dir {
+                path: "/".into(),
+                pos: 0,
+            },
+        );
         let mut names = Vec::new();
         loop {
-            let size = call(&kernel, &mut context, &mut memory, &mut cpu, syscall,
-                [3, BASE, 24, 0, 0, 0]);
+            let size = call(
+                &kernel,
+                &mut context,
+                &mut memory,
+                &mut cpu,
+                syscall,
+                [3, BASE, 24, 0, 0, 0],
+            );
             assert!(size >= 0);
-            if size == 0 { break; }
+            if size == 0 {
+                break;
+            }
             let bytes = memory.read_vec(BASE, size as usize).unwrap();
-            let offset = if matches!(syscall, Sysno::Getdents64) { 19 } else { 18 };
-            names.push(String::from_utf8(bytes[offset..].iter().copied().take_while(|b| *b != 0).collect()).unwrap());
+            let offset = if matches!(syscall, Sysno::Getdents64) {
+                19
+            } else {
+                18
+            };
+            names.push(
+                String::from_utf8(
+                    bytes[offset..]
+                        .iter()
+                        .copied()
+                        .take_while(|b| *b != 0)
+                        .collect(),
+                )
+                .unwrap(),
+            );
         }
         assert_eq!(names, [".", "..", "a", "b", "c"]);
-        assert_eq!(call(&kernel, &mut context, &mut memory, &mut cpu, Sysno::Lseek,
-            [3, 0, 0, 0, 0, 0]), 0);
-        assert_eq!(call(&kernel, &mut context, &mut memory, &mut cpu, syscall,
-            [3, BASE, 24, 0, 0, 0]), 24);
+        assert_eq!(
+            call(
+                &kernel,
+                &mut context,
+                &mut memory,
+                &mut cpu,
+                Sysno::Lseek,
+                [3, 0, 0, 0, 0, 0]
+            ),
+            0
+        );
+        assert_eq!(
+            call(
+                &kernel,
+                &mut context,
+                &mut memory,
+                &mut cpu,
+                syscall,
+                [3, BASE, 24, 0, 0, 0]
+            ),
+            24
+        );
     }
 }
 
@@ -52,7 +101,9 @@ impl Write for FailedOutput {
     fn write(&mut self, _: &[u8]) -> io::Result<usize> {
         Err(io::Error::from_raw_os_error(28))
     }
-    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -69,27 +120,74 @@ fn host_output_failure_is_not_a_guest_syscall_result() {
                 Sysno::Write => [destination, BASE, 3, 0, 0, 0],
                 Sysno::Writev => [destination, BASE + 32, 1, 0, 0, 0],
                 Sysno::Sendfile => {
-                    kernel.vfs.get_mut().unwrap().create("/input", 0o644).unwrap();
-                    kernel.vfs.get_mut().unwrap().write_at("/input", 0, b"abc").unwrap();
-                    context.cur.fds.insert(3, Fd::File {
-                        path: "/input".into(), offset: FileOffset::new(0),
-                        readable: true, writable: false,
-                    });
+                    kernel
+                        .vfs
+                        .get_mut()
+                        .unwrap()
+                        .create("/input", 0o644)
+                        .unwrap();
+                    kernel
+                        .vfs
+                        .get_mut()
+                        .unwrap()
+                        .write_at("/input", 0, b"abc")
+                        .unwrap();
+                    context.cur.fds.insert(
+                        3,
+                        Fd::File {
+                            path: "/input".into(),
+                            offset: FileOffset::new(0),
+                            readable: true,
+                            writable: false,
+                        },
+                    );
                     [destination, 3, 0, 3, 0, 0]
                 }
                 Sysno::Splice => {
-                    assert_eq!(call(&kernel, &mut context, &mut memory, &mut cpu,
-                        Sysno::Pipe2, [BASE + 64, 0, 0, 0, 0, 0]), 0);
-                    let reader = memory.read_u32(BASE + 64).unwrap() as u64;
-                    let writer = memory.read_u32(BASE + 68).unwrap() as u64;
-                    assert_eq!(call(&kernel, &mut context, &mut memory, &mut cpu,
-                        Sysno::Write, [writer, BASE, 3, 0, 0, 0]), 3);
+                    assert_eq!(
+                        call(
+                            &kernel,
+                            &mut context,
+                            &mut memory,
+                            &mut cpu,
+                            Sysno::Pipe2,
+                            [BASE + 64, 0, 0, 0, 0, 0]
+                        ),
+                        0
+                    );
+                    let reader = u64::from(memory.read_u32(BASE + 64).unwrap());
+                    let writer = u64::from(memory.read_u32(BASE + 68).unwrap());
+                    assert_eq!(
+                        call(
+                            &kernel,
+                            &mut context,
+                            &mut memory,
+                            &mut cpu,
+                            Sysno::Write,
+                            [writer, BASE, 3, 0, 0, 0]
+                        ),
+                        3
+                    );
                     [reader, 0, destination, 0, 3, 0]
                 }
                 _ => unreachable!(),
             };
-            assert_eq!(call(&kernel, &mut context, &mut memory, &mut cpu, operation, args), 3,
-                "{operation:?} on guest fd {destination}");
+            assert_eq!(
+                call(
+                    &kernel,
+                    &mut context,
+                    &mut memory,
+                    &mut cpu,
+                    operation,
+                    args
+                ),
+                3,
+                "{operation:?} on guest fd {destination}"
+            );
+            assert!(
+                kernel.check_output().is_err(),
+                "host failure must fail the run"
+            );
         }
     }
 }
