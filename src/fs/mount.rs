@@ -2,6 +2,8 @@
 
 use std::io;
 
+use crate::random::RandomSource;
+
 use super::{Attrs, DirEntry, MountFs, NodeKind};
 
 /// Most symlinks followed while resolving one path's directories (Linux's
@@ -257,6 +259,14 @@ impl MountTable {
     /// procfs is mounted (e.g. minimal test harnesses).
     pub fn procfs_mut(&mut self) -> Option<&mut super::ProcFs> {
         self.mounts.iter_mut().find_map(|m| m.fs.as_procfs_mut())
+    }
+
+    pub(crate) fn set_random_source(&mut self, random: &RandomSource) {
+        for mount in &mut self.mounts {
+            if let Some(devfs) = mount.fs.as_devfs_mut() {
+                devfs.set_random_source(random.clone());
+            }
+        }
     }
 
     pub fn read_at(&mut self, abs_path: &str, off: u64, buf: &mut [u8]) -> io::Result<usize> {

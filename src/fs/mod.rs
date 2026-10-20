@@ -231,6 +231,11 @@ pub trait MountFs: std::fmt::Debug + Send {
     fn as_procfs_mut(&mut self) -> Option<&mut ProcFs> {
         None
     }
+
+    /// Device filesystem whose randomness the kernel wires to its shared stream.
+    fn as_devfs_mut(&mut self) -> Option<&mut DevFs> {
+        None
+    }
 }
 
 fn erofs() -> io::Error {

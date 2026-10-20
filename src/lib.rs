@@ -36,6 +36,7 @@ pub mod fs;
 pub mod image;
 pub mod kernel;
 pub mod loader;
+mod random;
 pub mod sandbox;
 #[cfg(feature = "tunnel")]
 pub mod tunnel;

@@ -95,6 +95,9 @@ pub struct Config {
     pub ncpus: usize,
     /// Guest memory ceiling in bytes.
     pub mem_bytes: u64,
+    /// Seed for getrandom and /dev/{u,}random. Defaults to 32 zero bytes.
+    /// A fixed seed makes guest randomness reproducible and predictable.
+    pub random_seed: [u8; 32],
     /// Guest architecture (defaults to the host's native arch). Unless set
     /// explicitly ([`Config::arch_explicit`]), the PID-1 binary's ELF header
     /// decides: an x86-64 root runs as x86-64 on any host.
@@ -153,6 +156,7 @@ impl Default for SandboxBuilder {
                     .and_then(|s| s.trim().parse::<usize>().ok())
                     .map_or(1, |n| n.max(1)),
                 mem_bytes: DEFAULT_MEM_BYTES,
+                random_seed: [0; 32],
                 arch,
                 arch_explicit: false,
                 prefer_interp: false,
@@ -186,6 +190,15 @@ impl SandboxBuilder {
     #[must_use]
     pub fn mem_bytes(mut self, bytes: u64) -> Self {
         self.config.mem_bytes = bytes;
+        self
+    }
+
+    /// Set the sandbox's initial 256-bit ChaCha20 seed. No host entropy is read.
+    /// Getrandom and random-device reads share this stream; successful clones
+    /// without CLONE_VM reseed it using stream bytes and the child's PID.
+    #[must_use]
+    pub fn random_seed(mut self, seed: [u8; 32]) -> Self {
+        self.config.random_seed = seed;
         self
     }
 
@@ -379,7 +392,7 @@ impl Sandbox {
         let backend = self.backend(arch)?;
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
-        let mut kernel = Kernel::new(arch, mounts);
+        let mut kernel = Kernel::with_random_seed(arch, mounts, self.config.random_seed);
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
         kernel.set_cwd(if self.config.mode == RunMode::Booted {
@@ -489,7 +502,8 @@ impl Sandbox {
         let backend = self.backend(arch)?;
         let vcpu = backend.new_vcpu(img.entry, img.stack_pointer)?;
 
-        let mut kernel = Kernel::new(arch, self.build_mounts()?);
+        let mut kernel =
+            Kernel::with_random_seed(arch, self.build_mounts()?, self.config.random_seed);
         kernel.set_ncpus(self.config.ncpus);
         kernel.set_host_tty(true);
         kernel.set_cwd("/work");
@@ -545,7 +559,10 @@ impl Sandbox {
             None => mounts.mount("/", Box::new(TmpFs::new())),
         }
         mounts.mount("/tmp", Box::new(TmpFs::new()));
-        mounts.mount("/dev", Box::new(DevFs::new()));
+        mounts.mount(
+            "/dev",
+            Box::new(DevFs::with_random_seed(self.config.random_seed)),
+        );
         mounts.mount("/proc", Box::new(ProcFs::new(self.config.ncpus)));
         mounts.mount("/sys", Box::new(SysFs::new(self.config.ncpus)));
 
