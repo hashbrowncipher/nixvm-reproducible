@@ -488,11 +488,10 @@ impl KvmVcpu {
         // exits is broken out after the quantum: the timer signal interrupts
         // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
         // after so a late expiry can't fire into an unrelated later slice.
-        let counter = self
-            .pmu
-            .as_mut()
-            .map(|pmu| pmu.start(self.fd.0))
-            .transpose()?;
+        let counter = match &mut self.pmu {
+            Some(pmu) => pmu.start(self.fd.0)?,
+            None => None,
+        };
         if let Some(q) = self.quantum {
             preempt::arm(q);
         }
@@ -873,6 +872,12 @@ impl Vcpu for KvmVcpu {
     fn begin_slice(&mut self) {
         if let Some(pmu) = &mut self.pmu {
             pmu.begin_slice();
+        }
+    }
+
+    fn set_preemption_required(&mut self, required: bool) {
+        if let Some(pmu) = &mut self.pmu {
+            pmu.set_enabled(required);
         }
     }
 

@@ -325,6 +325,7 @@ impl Counter {
 }
 
 pub(super) struct Pmu {
+    enabled: bool,
     budget: Budget,
     counter: Option<Counter>,
 }
@@ -332,6 +333,7 @@ pub(super) struct Pmu {
 impl Pmu {
     pub fn new(quantum: u64) -> Self {
         Self {
+            enabled: false,
             budget: Budget {
                 quantum,
                 used: 0,
@@ -349,11 +351,20 @@ impl Pmu {
     pub fn begin_slice(&mut self) {
         self.budget.used = 0;
     }
+    pub fn set_enabled(&mut self, enabled: bool) {
+        if enabled && !self.enabled {
+            self.begin_slice();
+        }
+        self.enabled = enabled;
+    }
     pub fn finished(&self) -> bool {
-        self.budget.remaining() == 0
+        self.enabled && self.budget.remaining() == 0
     }
 
-    pub fn start(&mut self, vcpu: i32) -> Result<RunGuard, VcpuError> {
+    pub fn start(&mut self, vcpu: i32) -> Result<Option<RunGuard>, VcpuError> {
+        if !self.enabled {
+            return Ok(None);
+        }
         let affinity = Affinity::pin()?;
         let profile = Profile::detect()?;
         // SAFETY: gettid has no arguments.
@@ -410,7 +421,7 @@ impl Pmu {
             check(sys::ioctl(counter, PERIOD, &period), "PMU period")?;
             check(sys::ioctl(counter, ENABLE, 0), "PMU enable")?;
         }
-        Ok(guard)
+        Ok(Some(guard))
     }
 
     pub fn finish(&mut self, guard: RunGuard) -> Result<(), VcpuError> {
@@ -479,6 +490,29 @@ impl Drop for RunGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncontended_runs_do_not_open_a_counter_or_consume_the_budget() {
+        let mut pmu = Pmu::new(8);
+        assert!(pmu.start(-1).unwrap().is_none());
+        assert_eq!(pmu.total(), 0);
+        pmu.set_enabled(true);
+        pmu.budget.account(7, false).unwrap();
+        pmu.budget.account(1, true).unwrap();
+        assert!(pmu.finished());
+        pmu.set_enabled(false);
+        assert!(!pmu.finished());
+        assert!(pmu.start(-1).unwrap().is_none());
+        assert_eq!(pmu.total(), 8);
+        pmu.set_enabled(true);
+        assert!(!pmu.finished(), "new contention starts a fresh quantum");
+        assert_eq!(pmu.budget.remaining(), 8);
+        assert_eq!(
+            pmu.total(),
+            8,
+            "inactive execution adds no counted branches"
+        );
+    }
 
     #[test]
     fn rejects_invalid_quantum() {

@@ -196,7 +196,13 @@ pub trait Vcpu: Send {
     /// and memory faults, resetting it only when the scheduler dispatches anew.
     fn begin_slice(&mut self) {}
 
-    /// Retired conditional branches, when precise PMU scheduling is active.
+    /// Whether another task needs a bounded share of execution. Precise PMU
+    /// backends enable their counter only while this is true. The scheduler
+    /// updates it before guest entry, including after syscalls and wakeups.
+    /// Direct vCPU drivers supply their own runnable-task policy.
+    fn set_preemption_required(&mut self, _required: bool) {}
+
+    /// Conditional branches counted while precise PMU preemption is required.
     /// The scheduler uses differences for ordering instead of host elapsed time.
     fn retired_branches(&self) -> Option<u64> {
         None

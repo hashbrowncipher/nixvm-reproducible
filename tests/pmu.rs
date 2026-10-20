@@ -27,6 +27,7 @@ fn branch_quantum_lands_at_the_same_instruction_on_repeated_runs() {
                 .unwrap();
             let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
             for slice in 1..=3 {
+                cpu.set_preemption_required(true);
                 cpu.begin_slice();
                 assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
                 assert_eq!(cpu.pc(), BASE);
@@ -52,6 +53,7 @@ fn syscalls_preserve_the_branch_budget_and_forks_inherit_the_mode() {
         )
         .unwrap();
     let mut parent = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+    parent.set_preemption_required(true);
     parent.begin_slice();
     let mut syscalls = 0;
     loop {
@@ -70,4 +72,50 @@ fn syscalls_preserve_the_branch_budget_and_forks_inherit_the_mode() {
     assert_eq!(parent.pc(), BASE);
     let child = parent.fork();
     assert_eq!(child.retired_branches(), Some(0));
+}
+
+#[test]
+#[ignore = "requires KVM and guest-only perf counters on a supported Intel CPU"]
+fn solo_execution_does_not_count_and_contention_can_be_enabled_and_disabled() {
+    let quantum = 16;
+    let backend = KvmBackend::with_branch_quantum(quantum).unwrap();
+    let mut memory = GuestMemory::new(BASE, 64 * 1024);
+    memory.map(BASE, PAGE_SIZE, Prot::rwx()).unwrap();
+    // MOV EBX,1000; DEC EBX; JNZ dec; SYSCALL. Solo execution exceeds a quantum.
+    memory
+        .write_init(
+            BASE,
+            &[0xbb, 0xe8, 0x03, 0, 0, 0xff, 0xcb, 0x75, 0xfc, 0x0f, 0x05],
+        )
+        .unwrap();
+    let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+    cpu.begin_slice();
+    assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Syscall);
+    assert_eq!(cpu.retired_branches(), Some(0));
+    assert_eq!(cpu.reg(3), 0);
+
+    cpu.reset(BASE, BASE + 0x8000);
+    cpu.set_preemption_required(true);
+    assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+    assert_eq!(cpu.retired_branches(), Some(quantum));
+    assert_eq!(cpu.reg(3), 1000 - quantum);
+
+    cpu.set_preemption_required(false);
+    assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Syscall);
+    assert_eq!(cpu.reg(3), 0);
+    assert_eq!(
+        cpu.retired_branches(),
+        Some(quantum),
+        "solo tail stays uncounted"
+    );
+
+    cpu.reset(BASE, BASE + 0x8000);
+    cpu.set_preemption_required(true);
+    assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+    assert_eq!(cpu.retired_branches(), Some(quantum * 2));
+    assert_eq!(
+        cpu.reg(3),
+        1000 - quantum,
+        "new contention gets a full quantum"
+    );
 }
