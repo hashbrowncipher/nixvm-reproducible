@@ -83,7 +83,7 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | **Processes & threads** | `clone`/`fork`/`execve`/`wait4`/`exit(_group)`; `CLONE_VM`+`CLONE_THREAD` shared-address-space threads; real `futex` WAIT/WAKE parking |
 | **SMP scheduler** | a pool of `ncpus` host worker threads run guest compute in parallel; syscalls are serviced serially on the main thread (a big-kernel-lock model, `Kernel::set_ncpus`/`NIXVM_CPUS`) |
 | **Signals** | `rt_sigaction`/`rt_sigprocmask`/`kill`/`tgkill` and default-disposition delivery (terminate/ignore) — **custom handler invocation (frame push + PC redirect) is not implemented** |
-| **Filesystem** | `tmpfs` (rw in-memory), `overlay` (COW upper/lower), `passthrough` (host dir, **symlink/TOCTOU-safe** — see below), `devfs`, `procfs`, `sysfs`; a real on-disk squashfs/ext reader (`fstoolfs`, via the optional `fstool` crate) exists but isn't wired into the default mount table yet |
+| **Filesystem** | `tmpfs` (rw in-memory), `overlay` (COW upper/lower), format-independent read-only layer stacks, `passthrough` (host dir, **symlink/TOCTOU-safe** — see below), `devfs`, `procfs`, `sysfs`; EROFS images (`erofs` feature) and squashfs/ext backends (`fstool` feature) |
 | **Networking** | in-VM AF_UNIX + AF_INET/AF_INET6 loopback (TCP stream + UDP datagram), plus **host-passthrough egress** (opt-in `NIXVM_NET=host`, native only): guest TCP/UDP to routable addresses is bridged to real host sockets, so **`apk update && apk add` work over the real internet on x86-64**. DNS via a host UDP socket + injected `/etc/resolv.conf`. A browser (WebSocket/pktkit) transport and a `smoltcp` NAT stack are the follow-ups. |
 | **I/O multiplexing** | `poll`/`ppoll`/`select`/`pselect6`, `epoll_create1`/`ctl`/`wait`/`pwait2`, `eventfd2`, `timerfd_*` |
 | **Browser demo (wasm)** | working — [**live demo**](https://karpeleslab.github.io/nixvm/): `wasm32-unknown-unknown` + interpreter, built and deployed to GitHub Pages by CI on every push to `main` ([details](#try-it-in-your-browser)) |
@@ -109,6 +109,45 @@ cargo build --release
 cargo test
 ```
 
+### EROFS root layers
+
+Build with `--features erofs` to read EROFS images through the locally vendored
+`rust-fs-erofs` crate. Pass images in base-to-top order; the last image has
+precedence:
+
+```sh
+cargo run --features erofs --bin nixvm -- run \
+  --erofs base.erofs --erofs packages.erofs --erofs application.erofs \
+  -- /bin/sh
+```
+
+The library API accepts the same order:
+
+```rust
+let code = nixvm::Sandbox::builder()
+    .root_erofs_layers(["base.erofs", "packages.erofs", "application.erofs"])
+    .command(["/bin/sh"])
+    .run()?;
+```
+
+Images are opened read-only on the host at startup and read on demand. They do
+not need extraction or a host filesystem mount. Directories merge; a higher
+file or symlink hides the lower subtree. The generic `fs::LayerStack` handles
+layer precedence, character-device `0:0` whiteouts, zero-length regular-file
+whiteouts marked with `trusted.overlay.whiteout` or `user.overlay.whiteout`,
+and opaque directories marked with `trusted.overlay.opaque=y` or
+`user.overlay.opaque=y`. It keeps inode identities distinct across images and
+preserves hard links within an image. `fs::ErofsMount` only reads the format;
+the layer merger works with any `MountFs` backend.
+
+Overlayfs directory redirects and metadata-only copies (`metacopy`) are
+unsupported and return `EOPNOTSUPP` when encountered.
+
+Guest writes go to the existing ephemeral tmpfs upper. Saving changes as a new
+EROFS layer is deferred; [the writing task](tasks/erofs-writing.md) records that
+work. The guest path interface uses UTF-8 strings, so names and symlink targets
+that are not UTF-8 return `EILSEQ`.
+
 On macOS/arm64 the HVF backend is exercised by a separate, `#[ignore]`d test
 suite (it needs a binary codesigned with the `com.apple.security.hypervisor`
 entitlement, which `cargo test` can't do for itself):
@@ -117,14 +156,9 @@ entitlement, which `cargo test` can't do for itself):
 scripts/hvf-test.sh          # builds, ad-hoc codesigns, runs the HVF tests
 ```
 
-The `nixvm` CLI and the public `Sandbox::run()` API drive the full
-image-based pipeline (resolve a cached Alpine squashfs → mount → load → run),
-but image fetch/caching is still a stub (ROADMAP Phase 11) and the default
-mount table doesn't yet wire in the squashfs reader — so that path isn't
-runnable end-to-end yet.
-
-What **does** work today is running a static ELF directly, via the dev
-harnesses or the embeddable `Sandbox::exec_elf()`:
+The `nixvm` CLI and `Sandbox::run()` load the command from the selected guest
+root. Use `--root <directory>` for an extracted rootfs or `--erofs` for images.
+To run a static ELF directly, use the dev harnesses or `Sandbox::exec_elf()`:
 
 ```sh
 # Run a statically-linked aarch64 ELF on the interpreter:
@@ -160,7 +194,7 @@ masking does not itself intercept instructions such as `RDRAND` or virtualize ti
 ## Default sandbox layout
 
 ```
-/           tmpfs by default; overlay(passthrough(NIXVM_ROOT), tmpfs) when set
+/           tmpfs by default; overlay(read-only root, tmpfs) when selected
 /work       the host's current working directory, passed through read-write
 /tmp,/dev,  synthesized in-sandbox (tmpfs / devfs / procfs / sysfs)
 /proc,/sys
