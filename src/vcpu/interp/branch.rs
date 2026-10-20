@@ -243,10 +243,8 @@ impl Aarch64Interp {
             DCZID_EL0 => DCZID_EL0_VAL,
             CNTFRQ_EL0 => CNTFRQ_EL0_VAL,
             CNTVCT_EL0 => {
-                // Advance on every read so `while (cntvct == cntvct) {}`-style
-                // spins (and real "did time pass" checks) always terminate.
-                self.cntvct = self.cntvct.wrapping_add(1);
-                self.cntvct
+                self.time.account();
+                self.time.observe()
             }
             // Linux emulates EL0 reads of the CPU identification space.
             MIDR_EL1 => MIDR_EL1_VAL,

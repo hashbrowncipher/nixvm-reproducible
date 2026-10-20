@@ -500,14 +500,14 @@ impl Kernel {
         if mem.write(buf, &tms).is_err() {
             return err(Errno::EFAULT);
         }
-        (crate::clock::now_monotonic().as_nanos() / TICK_NS) as i64 // real elapsed ticks
+        (self.clock.now_monotonic().as_nanos() / TICK_NS) as i64 // real elapsed ticks
     }
 }
 
 /// `sysinfo(buf)` — write a `struct sysinfo` with 2 GiB total RAM, one process,
 /// and `mem_unit = 1`.
-pub(super) fn sys_sysinfo(buf: u64, mem: &mut GuestMemory) -> i64 {
-    let data = encode_sysinfo();
+pub(super) fn sys_sysinfo(uptime: u64, buf: u64, mem: &mut GuestMemory) -> i64 {
+    let data = encode_sysinfo(uptime);
     if mem.write(buf, &data).is_err() {
         return err(Errno::EFAULT);
     }
@@ -564,11 +564,11 @@ pub(super) fn write_rlimit(mem: &mut GuestMemory, addr: u64, cur: u64, max: u64)
 
 /// Encode a 64-bit `struct sysinfo` (112 bytes): 2 GiB total RAM at offset 32,
 /// `procs = 1` at offset 80, `mem_unit = 1` at offset 104; everything else 0.
-fn encode_sysinfo() -> [u8; 112] {
+fn encode_sysinfo(uptime: u64) -> [u8; 112] {
     const TOTAL_RAM: u64 = 2 * 1024 * 1024 * 1024;
     let mut b = [0u8; 112];
     // uptime (offset 0): seconds the VM has been running.
-    b[0..8].copy_from_slice(&(crate::clock::now_monotonic().as_secs() as i64).to_le_bytes());
+    b[0..8].copy_from_slice(&(uptime as i64).to_le_bytes());
     b[32..40].copy_from_slice(&TOTAL_RAM.to_le_bytes()); // totalram
     // freeram (offset 40): report most of RAM free — 0 would make memory-sizing
     // programs (JVMs, databases) think the machine is out of memory.
@@ -599,7 +599,7 @@ mod tests {
     fn sysinfo_writes_totalram() {
         let (_k, mut mem) = setup();
         let buf = 0x1_0000;
-        assert_eq!(sys_sysinfo(buf, &mut mem), 0);
+        assert_eq!(sys_sysinfo(0, buf, &mut mem), 0);
         assert_eq!(mem.read_u64(buf + 32).unwrap(), 2 * 1024 * 1024 * 1024);
         assert_eq!(mem.read_u32(buf + 104).unwrap(), 1);
     }

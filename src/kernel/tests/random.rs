@@ -294,6 +294,7 @@ fn failed_clones_do_not_reseed_or_consume_bytes() {
 #[test]
 fn device_writes_and_new_mounts_do_not_restart_the_stream() {
     let (kernel, mut memory, mut vcpu, mut context) = seeded([7; 32]);
+    kernel.clock.advance_execution(4_000_000_123);
     getrandom(&kernel, &mut memory, &mut vcpu, &mut context, 3, 0);
     {
         let mut mounts = kernel.vfs.lock().unwrap();
@@ -316,6 +317,13 @@ fn device_writes_and_new_mounts_do_not_restart_the_stream() {
             ),
             0
         );
+        {
+            let mut mounts = kernel.vfs.lock().unwrap();
+            mounts.create("/extra/shm/clock-binding", 0o600).unwrap();
+            let attributes = mounts.stat("/extra/shm/clock-binding").unwrap();
+            let expected = crate::clock::DEFAULT_EPOCH_SECS as i64 + 4;
+            assert_eq!((attributes.atime, attributes.mtime), (expected, expected));
+        }
         assert_eq!(
             device(&kernel, "/extra/random", 65),
             reference([7; 32], consumed + 65)[consumed..]
@@ -384,6 +392,70 @@ fn composed_devfs_mounts_share_the_kernel_stream() {
         7,
         0,
     ));
+    assert_eq!(actual, reference([7; 32], actual.len()));
+}
+
+// Keep test access to a child backend even when guest writes are blocked by a layer stack.
+#[derive(Debug)]
+struct SharedDevFs(Arc<Mutex<DevFs>>);
+
+impl MountFs for SharedDevFs {
+    fn set_clock(&mut self, clock: Arc<crate::clock::VirtualClock>) {
+        self.0.lock().unwrap().set_clock(clock);
+    }
+
+    fn visit_devfs_mut(&mut self, visitor: &mut dyn FnMut(&mut DevFs)) {
+        visitor(&mut self.0.lock().unwrap());
+    }
+
+    fn stat(&mut self, rel: &str) -> Option<Attrs> {
+        self.0.lock().unwrap().stat(rel)
+    }
+
+    fn read_at(&mut self, rel: &str, off: u64, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().read_at(rel, off, bytes)
+    }
+
+    fn readdir(&mut self, rel: &str) -> std::io::Result<Vec<crate::fs::DirEntry>> {
+        self.0.lock().unwrap().readdir(rel)
+    }
+}
+
+#[test]
+fn composed_devfs_mounts_bind_clock_and_randomness_together() {
+    let devfs = Arc::new(Mutex::new(DevFs::with_random_seed([99; 32])));
+    let mut mounts = MountTable::new();
+    mounts.mount("/", Box::new(TmpFs::new()));
+    mounts.mount(
+        "/nested",
+        Box::new(Overlay::new(
+            Box::new(
+                LayerStack::new(vec![Box::new(Overlay::new(
+                    Box::new(TmpFs::new()),
+                    Box::new(SharedDevFs(Arc::clone(&devfs))),
+                ))])
+                .unwrap(),
+            ),
+            Box::new(TmpFs::new()),
+        )),
+    );
+    let (kernel, mut memory, mut vcpu, mut context) = seeded_mounts([7; 32], mounts);
+    kernel.clock.advance_execution(4_000_000_123);
+    devfs
+        .lock()
+        .unwrap()
+        .create("shm/clock-binding", 0o600)
+        .unwrap();
+    let attributes = kernel
+        .vfs
+        .lock()
+        .unwrap()
+        .stat("/nested/shm/clock-binding")
+        .unwrap();
+    let expected = crate::clock::DEFAULT_EPOCH_SECS as i64 + 4;
+    assert_eq!((attributes.atime, attributes.mtime), (expected, expected));
+    let mut actual = getrandom(&kernel, &mut memory, &mut vcpu, &mut context, 3, 0);
+    actual.extend(device(&kernel, "/nested/random", 17));
     assert_eq!(actual, reference([7; 32], actual.len()));
 }
 

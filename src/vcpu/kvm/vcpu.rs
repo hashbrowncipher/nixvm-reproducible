@@ -5,12 +5,12 @@
 //!   address space has its own page tables, selected by CR3.
 //! * A guest `syscall` vectors to the `hlt; sysretq` trampoline at CPL0; the
 //!   `hlt` exits to the host as `KVM_EXIT_HLT` → [`Exit::Syscall`]. The kernel
-//!   writes the return value into `rax` ([`KvmVcpu::set_syscall_ret`]) and the
-//!   resumed `sysretq` returns to CPL3 at the user `rip`/`rflags` that
-//!   `syscall` saved in `rcx`/`r11`.
+//!   completes the syscall through [`KvmVcpu::set_syscall_ret`], which restores
+//!   CPL3 at the user `rip`/`rflags` saved in `rcx`/`r11`, then writes `rax`.
+//!   Software return keeps SYSRETQ from clearing KVM's stepping flag.
 //! * #PF, #GP and #UD enter supervisor HLT trampolines through the IDT. The
 //!   host recovers the original user state from the exception frame. CR4.TSD
-//!   traps RDTSC/RDTSCP through #GP; we decode them and supply a logical counter.
+//!   traps RDTSC/RDTSCP through #GP; we decode them and observe the VM clock.
 //!
 //! Register state is cached host-side: refreshed from the vcpu after every
 //! `KVM_RUN`, flushed back (when dirty) before the next. That makes the
@@ -207,21 +207,19 @@ pub struct KvmVcpu {
     /// registers without entering the guest; [`KvmVcpu::set_syscall_ret`]
     /// (and `reset`) clear it.
     in_syscall: bool,
-    /// Debug: linear addresses of armed 4-byte write watchpoints
-    /// (`NIXVM_WATCHPOINT`), used to log every write to them. Empty when unarmed.
-    watchpoint: Vec<u64>,
-    /// Debug: an execute breakpoint (`NIXVM_EBP`); logs `r8`/`rdi` state each
-    /// time the address is reached. `None` when unarmed.
-    ebp: Option<u64>,
     /// Wall-clock preemption quantum: a per-thread timer armed around each
     /// `KVM_RUN` breaks the guest out with `Exit::Interrupted` after this long,
     /// so a compute-bound guest that never exits still yields the CPU. `None`
-    /// disables it. PMU counting suspends this timer while tasks compete to run;
-    /// solo execution still yields so the kernel can service timers and sleepers.
+    /// disables it. This host watchdog bounds embedder latency without charging
+    /// guest time. Conditional-branch targets enforce guest scheduling and timers.
     /// Cached from `NIXVM_QUANTUM_MS` (see [`preempt`] and
     /// [`crate::vcpu::preempt_quantum`]).
     quantum: Option<Duration>,
-    pmu: Option<pmu::Pmu>,
+    pmu: pmu::Pmu,
+    clock: Arc<crate::clock::VirtualClock>,
+    observer: u64,
+    /// Optional execution allowance supplied by a direct vCPU driver.
+    execution_limit: Option<u64>,
     /// The `CR3` this vcpu's `sregs` currently name, so a context switch (execve
     /// installs fresh page tables; a forked child runs a different address space)
     /// is picked up as a single `KVM_SET_SREGS` before the next run. `None` until
@@ -269,7 +267,7 @@ impl KvmVcpu {
         vm: Arc<Vm>,
         entry: u64,
         stack: u64,
-        branch_quantum: Option<u64>,
+        branch_quantum: u64,
     ) -> Result<Box<dyn Vcpu>, VcpuError> {
         let mut v = Self::create(vm, branch_quantum)?;
         v.regs = sys::kvm_regs {
@@ -284,7 +282,7 @@ impl KvmVcpu {
 
     /// Create and fully configure a vcpu (CPUID, MSRs, long-mode sregs) with
     /// zeroed general registers; the caller sets rip/rsp.
-    fn create(vm: Arc<Vm>, branch_quantum: Option<u64>) -> Result<Self, VcpuError> {
+    fn create(vm: Arc<Vm>, branch_quantum: u64) -> Result<Self, VcpuError> {
         let (fd, run) = vm.create_vcpu()?;
 
         // SAFETY: `fd` is a live vcpu fd; the cpuid2 struct is valid for the
@@ -343,9 +341,8 @@ impl KvmVcpu {
         let ret = unsafe { sys::ioctl(fd.0, sys::KVM_SET_XCRS, std::ptr::from_ref(&xcrs)) };
         check(ret, "KVM_SET_XCRS")?;
 
-        // Debug: NIXVM_EBP=0xADDR arms an execute breakpoint on DR0 (fires
-        // *before* the instruction); otherwise NIXVM_WATCHPOINT arms up to four
-        // 4-byte write watchpoints (DR0..3). Both exit with KVM_EXIT_DEBUG.
+        // Precision stepping owns KVM guest-debug state. Breakpoints need a
+        // separate debugger integration before they can coexist with it.
         let ebp = std::env::var("NIXVM_EBP")
             .ok()
             .and_then(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok());
@@ -358,45 +355,13 @@ impl KvmVcpu {
                     .collect()
             })
             .unwrap_or_default();
-        if branch_quantum.is_some() && (ebp.is_some() || !watchpoints.is_empty()) {
+        if ebp.is_some() || !watchpoints.is_empty() {
             return Err(VcpuError::Backend(
                 "PMU scheduling cannot share the guest debugger with breakpoints".into(),
             ));
         }
-        if let Some(addr) = ebp {
-            // DR0 execute breakpoint: L0, R/W0=00 (execute), LEN0=00 (1 byte).
-            let dbg = sys::kvm_guest_debug {
-                control: sys::KVM_GUESTDBG_ENABLE | sys::KVM_GUESTDBG_USE_HW_BP,
-                pad: 0,
-                debugreg: [addr, 0, 0, 0, 0, 0, 0, (1 << 10) | 1],
-            };
-            // SAFETY: valid struct pointer; the fd is live.
-            let ret =
-                unsafe { sys::ioctl(fd.0, sys::KVM_SET_GUEST_DEBUG, std::ptr::from_ref(&dbg)) };
-            check(ret, "KVM_SET_GUEST_DEBUG")?;
-        } else if !watchpoints.is_empty() {
-            let mut debugreg = [0u64; 8];
-            let mut dr7 = 1u64 << 10; // reserved bit 10
-            for (i, &addr) in watchpoints.iter().enumerate() {
-                debugreg[i] = addr;
-                // DRi: Li (bit 2i), R/Wi=01 write (bits 16+4i..), LENi=11 4-byte.
-                dr7 |= 1 << (2 * i); // local enable
-                dr7 |= 0b01 << (16 + 4 * i); // write
-                dr7 |= 0b11 << (18 + 4 * i); // 4-byte
-            }
-            debugreg[7] = dr7;
-            let dbg = sys::kvm_guest_debug {
-                control: sys::KVM_GUESTDBG_ENABLE | sys::KVM_GUESTDBG_USE_HW_BP,
-                pad: 0,
-                debugreg,
-            };
-            // SAFETY: valid struct pointer; the fd is live.
-            let ret =
-                unsafe { sys::ioctl(fd.0, sys::KVM_SET_GUEST_DEBUG, std::ptr::from_ref(&dbg)) };
-            check(ret, "KVM_SET_GUEST_DEBUG")?;
-        }
-        let watchpoint = watchpoints;
-
+        let clock = vm.clock();
+        let observer = clock.allocate_observer();
         Ok(Self {
             vm,
             fd,
@@ -406,10 +371,11 @@ impl KvmVcpu {
             sregs,
             sregs_dirty: true,
             in_syscall: false,
-            watchpoint,
-            ebp,
             quantum: crate::vcpu::preempt_quantum(),
-            pmu: branch_quantum.map(pmu::Pmu::new),
+            pmu: pmu::Pmu::new(branch_quantum),
+            clock,
+            observer,
+            execution_limit: None,
             cur_cr3: None,
             tlb_flush_pending: false,
             phys: None,
@@ -437,7 +403,11 @@ impl KvmVcpu {
     }
 
     /// Flush dirty caches to the vcpu, run it once, and refresh the caches.
-    fn run_once(&mut self, quantum: Option<Duration>) -> Result<u32, VcpuError> {
+    fn run_once(
+        &mut self,
+        quantum: Option<Duration>,
+        target: Option<u64>,
+    ) -> Result<u32, VcpuError> {
         if self.regs_dirty {
             // SAFETY: valid struct pointer; the fd is live.
             let ret =
@@ -484,10 +454,7 @@ impl KvmVcpu {
         // exits is broken out after the quantum: the timer signal interrupts
         // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
         // after so a late expiry can't fire into an unrelated later slice.
-        let counter = match &mut self.pmu {
-            Some(pmu) => pmu.start(self.fd.0)?,
-            None => None,
-        };
+        let counter = self.pmu.start(self.fd.0, target)?;
         if let Some(q) = quantum {
             preempt::arm(q);
         }
@@ -498,8 +465,10 @@ impl KvmVcpu {
         if quantum.is_some() {
             preempt::disarm();
         }
-        if let Some(counter) = counter {
-            self.pmu.as_mut().unwrap().finish(counter)?;
+        let branches = self.pmu.finish(counter)?;
+        self.clock.advance_execution(branches);
+        if let Some(remaining) = &mut self.execution_limit {
+            *remaining = remaining.saturating_sub(branches);
         }
         let interrupted = if let Some(err) = run_error {
             // EINTR/EAGAIN: a host signal broke us out of the guest.
@@ -539,66 +508,42 @@ impl KvmVcpu {
         Ok(unsafe { (*self.run).exit_reason })
     }
 
-    /// Drive `KVM_RUN` until a real [`Exit`], having already reconciled memory.
-    ///
-    /// `mem` is `Some` only on the serial path (a locked run), where it is used
-    /// solely to read the value written at a debug watchpoint; the lockless SMP
-    /// path passes `None` (no `GuestMemory` borrow is held) and logs the hit
-    /// without the value. Everything else — fault-frame recovery, exit decode —
-    /// reads the cached physical pool and CR3, so it works
-    /// identically with or without `mem`.
-    fn run_loop(&mut self, mem: Option<&GuestMemory>) -> Result<Exit, VcpuError> {
-        let pmu_enabled = self.pmu.as_ref().is_some_and(pmu::Pmu::enabled);
-        let quantum = if pmu_enabled { None } else { self.quantum };
+    /// Drive KVM through incidental traps until a kernel event or exact limit.
+    fn run_loop(&mut self) -> Result<Exit, VcpuError> {
         let started = Instant::now();
         loop {
-            // Count time across internal exits too: a loop containing only
-            // trapped RDTSC must yield even though each KVM_RUN is brief.
-            let remaining = quantum.map(|q| q.saturating_sub(started.elapsed()));
-            if remaining.is_some_and(|q| q.is_zero()) {
+            if self.clock.deadline_due() || self.execution_limit == Some(0) || self.pmu.finished() {
                 return Ok(Exit::Interrupted);
             }
-            if self.pmu.as_ref().is_some_and(pmu::Pmu::finished) {
+            let timer = self.clock.next_deadline().map(|deadline| {
+                u64::try_from(deadline.saturating_sub(self.clock.now_monotonic().as_nanos()))
+                    .unwrap_or(i64::MAX as u64)
+                    .min(i64::MAX as u64)
+            });
+            let target = [timer, self.execution_limit, self.pmu.remaining()]
+                .into_iter()
+                .flatten()
+                .min();
+            // Host time bounds embedder latency only. It never contributes to
+            // guest time or completes a guest wait. Exact PMU runs use their
+            // branch boundary; count-only runs retain the host watchdog.
+            let watchdog = if target.is_some() {
+                None
+            } else {
+                self.quantum.map(|q| q.saturating_sub(started.elapsed()))
+            };
+            if watchdog.is_some_and(|q| q.is_zero()) {
                 return Ok(Exit::Interrupted);
             }
-            let reason = self.run_once(remaining)?;
-            if pmu_enabled && matches!(reason, sys::KVM_EXIT_DEBUG | sys::KVM_EXIT_INTR) {
-                // Active PMU counting schedules only at the exact branch target.
-                // Host interrupts and the precision tail stay within that slice.
+            let reason = self.run_once(watchdog, target)?;
+            if reason == sys::KVM_EXIT_DEBUG {
+                // The precision tail remains inside this slice. Recalculate
+                // its limit after charging actual retired branches.
                 continue;
             }
-            // Debug watchpoint hit: log the write (value + faulting pc) and
-            // resume — the write already completed (a data #DB is a trap).
-            if reason == sys::KVM_EXIT_DEBUG {
-                // SAFETY: the run page is live; `debug` is the arm the kernel
-                // wrote for KVM_EXIT_DEBUG. dr6 bits 0..3 say which DRn matched.
-                let (pc, dr6) = unsafe {
-                    let d = (*self.run).exit.debug;
-                    (d.pc, d.dr6)
-                };
-                if self.ebp.is_some() {
-                    // Execute breakpoint: log the register state each time the
-                    // address is reached (for tracing a specific instruction).
-                    let r = &self.regs;
-                    eprintln!(
-                        "[ebp] pc={pc:#x} rax={:#x} rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} rsp={:#x}",
-                        r.rax, r.rdi, r.rsi, r.rdx, r.rcx, r.r8, r.rsp
-                    );
-                    // An execute #DB is a fault (rip unchanged); set RF so the
-                    // resumed instruction runs once without re-triggering.
-                    self.regs.rflags |= 0x1_0000;
-                    self.regs_dirty = true;
-                    continue;
-                }
-                for (i, &addr) in self.watchpoint.iter().enumerate() {
-                    if dr6 & (1 << i) != 0 {
-                        let val = mem.and_then(|m| m.read_u64(addr).ok()).unwrap_or(0);
-                        eprintln!(
-                            "[wp] {addr:#x} <- {val:#018x} (pc={pc:#x}) rsp={:#x}",
-                            self.regs.rsp
-                        );
-                    }
-                }
+            if reason == sys::KVM_EXIT_INTR && target.is_some() {
+                // Overflow is an early warning; an unrelated host interrupt
+                // must not turn it into an inexact scheduling boundary.
                 continue;
             }
             let Some(exit) = self.decode_exit(reason)? else {
@@ -607,7 +552,7 @@ impl KvmVcpu {
             if exit == Exit::Syscall {
                 // Count actual guest entry once. A blocked syscall is delivered
                 // again through in_syscall without running or ticking here.
-                self.vm.tick();
+                self.clock.advance_event();
                 self.in_syscall = true;
             }
             return Ok(exit);
@@ -671,7 +616,7 @@ impl KvmVcpu {
                         Ok(instruction)
                             if matches!(instruction.code(), Code::Rdtsc | Code::Rdtscp) =>
                         {
-                            let tsc = self.vm.tick();
+                            let tsc = self.clock.observe(self.observer).as_nanos() as u64;
                             self.regs.rax = u64::from(tsc as u32);
                             self.regs.rdx = tsc >> 32;
                             if instruction.code() == Code::Rdtscp {
@@ -923,23 +868,28 @@ impl Vcpu for KvmVcpu {
         // tables, then run under the caller's held memory lock.
         self.vm.ensure_memslot(mem)?;
         self.sync_cr3(mem);
-        self.run_loop(Some(mem))
+        self.run_loop()
     }
 
     fn begin_slice(&mut self) {
-        if let Some(pmu) = &mut self.pmu {
-            pmu.begin_slice();
-        }
+        self.pmu.begin_slice();
     }
 
     fn set_preemption_required(&mut self, required: bool) {
-        if let Some(pmu) = &mut self.pmu {
-            pmu.set_enabled(required);
-        }
+        self.pmu.set_fairness(required);
+    }
+
+    fn set_clock(&mut self, clock: Arc<crate::clock::VirtualClock>, task: u64) {
+        self.clock = clock;
+        self.observer = task;
+    }
+
+    fn set_execution_limit(&mut self, limit: Option<u64>) {
+        self.execution_limit = limit;
     }
 
     fn retired_branches(&self) -> Option<u64> {
-        self.pmu.as_ref().map(pmu::Pmu::total)
+        Some(self.pmu.total())
     }
 
     fn needs_locked_run(&self) -> bool {
@@ -967,7 +917,7 @@ impl Vcpu for KvmVcpu {
         if self.in_syscall {
             return Ok(Exit::Syscall);
         }
-        self.run_loop(None)
+        self.run_loop()
     }
 
     fn syscall_nr(&self) -> u64 {
@@ -986,8 +936,12 @@ impl Vcpu for KvmVcpu {
     }
 
     fn set_syscall_ret(&mut self, value: u64) {
-        // rip already points past the trampoline's `hlt`, at the `sysretq`
-        // that returns to user code — only the return register needs writing.
+        // Completion is explicit here. Normalize to CPL3 before precision
+        // stepping: hardware SYSRETQ could restore R11 without the stepping TF
+        // and let the next exact target run without any debug exit.
+        if self.in_syscall {
+            self.settle_syscall_return();
+        }
         self.regs.rax = value;
         self.regs_dirty = true;
         self.in_syscall = false;
@@ -1071,13 +1025,15 @@ impl Vcpu for KvmVcpu {
         // state, so the child's resume path is identical to the parent's. The
         // child re-issues the guest slot for its own (forked) memory on its
         // first `run` via the backing-generation seam.
-        let mut child = Self::create(self.vm.clone(), self.pmu.as_ref().map(pmu::Pmu::quantum))
-            .expect("create KVM vcpu (fork)");
+        let mut child =
+            Self::create(self.vm.clone(), self.pmu.quantum()).expect("create KVM vcpu (fork)");
         child.regs = self.regs;
         child.regs_dirty = true;
         child.sregs = self.sregs;
         child.sregs_dirty = true;
         child.in_syscall = self.in_syscall;
+        child.clock = self.clock.clone();
+        child.observer = self.clock.allocate_observer();
         // The child runs the *child's* address space (a different cr3); force a
         // re-sync on its first run rather than inheriting the parent's cached one.
         child.cur_cr3 = None;
@@ -1089,6 +1045,7 @@ impl Vcpu for KvmVcpu {
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {
+        self.clock.reset_observations(self.observer);
         self.regs = sys::kvm_regs {
             rip: entry,
             rsp: sp,
@@ -1114,12 +1071,17 @@ impl Vcpu for KvmVcpu {
     }
 
     fn vdso_calibration(&self) -> Option<crate::vcpu::VdsoCal> {
-        // RDTSC counts logical events rather than host time. Leave vvar uncalibrated so
-        // the vDSO uses clock syscalls, whose clock policy is owned by the kernel.
+        // vDSO arithmetic cannot perform accelerated observations or hand off
+        // at timers. Use syscalls to observe the shared clock through the kernel.
         None
     }
 
     fn settle_syscall_return(&mut self) {
+        // Async signals can arrive at an ordinary user instruction boundary.
+        // RCX/R11 then belong to the guest, not to a pending SYSRETQ.
+        if self.sregs.cs.selector == SEL_UCODE {
+            return;
+        }
         // Software `sysretq`: what the trampoline's `sysretq` would have done to
         // return the guest from CPL0 to CPL3 — rip←rcx, rflags←r11, and the flat
         // user segments. Called when the host is about to redirect the guest away
@@ -1137,10 +1099,12 @@ impl Vcpu for KvmVcpu {
         self.in_syscall = false;
     }
 
-    /// A KVM exit may land inside the syscall/exception trampolines (CPL0);
-    /// signals wait for the next syscall boundary.
+    /// Precision tails and completed timestamp traps expose cached CPL3 state.
+    /// Supervisor syscall scaffolding must finish before asynchronous delivery.
     fn async_signal_boundary(&self) -> bool {
-        false
+        self.sregs.cs.selector == SEL_UCODE
+            && self.sregs.ss.selector == SEL_UDATA
+            && !self.in_syscall
     }
 
     fn flush_tlb(&mut self) {
@@ -1174,7 +1138,7 @@ mod tests {
             }
         };
         let mem = GuestMemory::new(0x1_0000, 64 * 1024);
-        let mut v = KvmVcpu::create(vm, None).unwrap();
+        let mut v = KvmVcpu::create(vm, 100_000).unwrap();
         v.sync_cr3(&mem);
         let phys = mem.phys_arc();
         // Model the register snapshot returned by an interrupted KVM_RUN.
@@ -1226,7 +1190,7 @@ mod tests {
                 return;
             }
         };
-        let mut v = KvmVcpu::create(vm, None).unwrap();
+        let mut v = KvmVcpu::create(vm, 100_000).unwrap();
         for trampoline in [FAULT_TRAMP_VA, FAULT_TRAMP_VA + 0x10, FAULT_TRAMP_VA + 0x20] {
             for past_hlt in [0, 1] {
                 v.regs.rip = trampoline + past_hlt;

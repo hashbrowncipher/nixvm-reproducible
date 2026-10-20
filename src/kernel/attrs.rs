@@ -837,7 +837,7 @@ impl Kernel {
         if modes != 0 && modes != ADJ_OFFSET_SS_READ {
             return err(Errno::EPERM);
         }
-        let now = crate::clock::now_unix();
+        let now = self.clock.now_unix();
         let mut t = [0u8; 208];
         let mut put = |off: usize, v: i64| t[off..off + 8].copy_from_slice(&v.to_le_bytes());
         put(24, 500); // maxerror (µs)

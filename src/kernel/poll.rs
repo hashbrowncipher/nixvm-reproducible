@@ -2,21 +2,10 @@
 //! `pselect6`, `epoll_create1`/`epoll_ctl`/`epoll_wait`/`epoll_pwait`,
 //! `eventfd2`, and `timerfd_create`/`timerfd_settime`/`timerfd_gettime`.
 //!
-//! Readiness is computed synchronously against the existing pollable fd kinds
-//! (pipes, sockets, eventfds, timerfds) via [`Kernel::fd_ready`]. A caller with
-//! a zero timeout always gets an immediate answer; a caller willing to wait
-//! (nonzero or infinite timeout) that finds nothing ready sets `self.block`
-//! and re-traps, exactly like `read_pipe`/`accept4`/`wait4` — the scheduler
-//! retries the same syscall once another process makes progress. There is no
-//! wall-clock-driven wakeup (nixvm's cooperative scheduler has none), so a
-//! finite timeout behaves like an infinite one when nothing else in the VM
-//! ever changes the awaited state; this mirrors the rest of the kernel's
-//! blocking primitives.
-//!
-//! Socket readiness is necessarily best-effort: `net.rs` is a sibling module
-//! and its connection state is private to it, so a connected socket fd is
-//! reported as always read/write ready rather than risk incorrectly blocking
-//! forever on state this module cannot observe.
+//! Readiness scans park the task until an event or VM monotonic timeout.
+//! Relative durations are seeded once, with nanosecond precision for timespec
+//! interfaces. A registered timeout wins over readiness posted at or after its
+//! deadline; the ready event remains available to the next wait.
 
 use std::collections::BTreeMap;
 
@@ -86,12 +75,21 @@ pub(super) struct EventFdInst {
     nonblock: bool,
 }
 
-/// One `timerfd_create` timer. `expiry_ns` is the absolute host-clock deadline
-/// (nanoseconds since the UNIX epoch) of the next expiration, or `None` while
-/// disarmed; `expirations` accumulates until drained by `read`.
+/// Scheduler-visible timerfd deadlines.
+impl PollFds {
+    pub(super) fn next_deadline(&self) -> Option<u128> {
+        self.timerfds
+            .iter()
+            .filter_map(|timer| timer.expiry_ns)
+            .min()
+    }
+}
+
+/// One timerfd: monotonic expiry, clock domain for absolute inputs, and count.
 #[derive(Debug, Default)]
 pub(super) struct TimerFdInst {
-    expiry_ns: Option<u128>,
+    pub(super) expiry_ns: Option<u128>,
+    realtime: bool,
     interval_ns: u128,
     expirations: u64,
     nonblock: bool,
@@ -201,15 +199,6 @@ pub(super) fn install_poll_sigmask(cx: &mut ServiceCtx, mask_ptr: u64, mem: &Gue
     cx.cur.blocked = mask;
 }
 
-/// Nanoseconds since the UNIX epoch on the host wall clock. Routed through
-/// [`crate::clock`] — the platform-safe source that also works on
-/// wasm32-unknown-unknown (which has no `std::time` clock and would otherwise
-/// panic "time not implemented on this platform" the first time the demo's
-/// pump loop consulted a poll/timeout deadline).
-pub(super) fn now_ns() -> u128 {
-    crate::clock::now_unix().as_nanos()
-}
-
 fn read_u16(mem: &GuestMemory, addr: u64) -> Option<u16> {
     let b = mem.read_vec(addr, 2).ok()?;
     Some(u16::from_le_bytes([b[0], b[1]]))
@@ -226,19 +215,6 @@ fn read_timespec(mem: &GuestMemory, ptr: u64) -> Option<(u64, u64)> {
     Some((sec, nsec))
 }
 
-/// Convert a `timespec` duration to whole milliseconds, rounding a non-zero
-/// sub-millisecond remainder up to 1 (so a tiny timeout still parks briefly
-/// rather than collapsing to the zero-timeout "poll and return" case).
-fn timespec_to_ms(sec: u64, nsec: u64) -> i64 {
-    let ms = sec.saturating_mul(1000) + (nsec / 1_000_000);
-    if ms == 0 && nsec > 0 {
-        1
-    } else {
-        ms.min(i64::MAX as u64) as i64
-    }
-}
-
-/// Write a `struct timespec` (16 bytes).
 fn write_timespec(mem: &mut GuestMemory, ptr: u64, sec: u64, nsec: u64) -> bool {
     mem.write(ptr, &sec.to_le_bytes()).is_ok() && mem.write(ptr + 8, &nsec.to_le_bytes()).is_ok()
 }
@@ -383,45 +359,41 @@ impl Kernel {
         }
     }
 
-    /// Decide what a timed wait with no ready fd should do. Returns `true` if
-    /// the caller should return "timed out" (0 ready) — either because the
-    /// deadline has now passed, or (defensively) `timeout_ms == 0`. Returns
-    /// `false` after arranging to park (`self.block = true`); a negative
-    /// `timeout_ms` means "wait forever" and always parks.
-    ///
-    /// The absolute deadline lives on `cur.wake_deadline`, seeded on the first
-    /// call and re-checked on every re-trap of the same blocking syscall (the
-    /// guest PC never advanced past the `svc`). [`Kernel::service`] clears it
-    /// once the syscall finally completes.
-    #[allow(clippy::unused_self)]
+    /// Park against one monotonic deadline, retained across retries.
     fn block_or_timeout(&self, cx: &mut ServiceCtx, timeout_ms: i64) -> bool {
-        if timeout_ms == 0 {
+        self.block_or_timeout_ns(
+            cx,
+            (timeout_ms >= 0).then(|| timeout_ms as u128 * 1_000_000),
+        )
+    }
+
+    fn block_or_timeout_ns(&self, cx: &mut ServiceCtx, timeout: Option<u128>) -> bool {
+        if timeout == Some(0) {
             return true;
         }
-        // poll/ppoll/epoll_wait are never restarted after a signal (Linux returns
-        // EINTR regardless of SA_RESTART) — a restart would silently reset the
-        // remaining timeout.
         cx.restartable = false;
-        if timeout_ms < 0 {
+        let Some(duration) = timeout else {
             cx.block = true;
             return false;
+        };
+        let now = self.clock.now_monotonic().as_nanos();
+        let deadline = *cx
+            .cur
+            .wake_deadline
+            .get_or_insert(now.saturating_add(duration));
+        if now >= deadline {
+            cx.cur.wake_deadline = None;
+            true
+        } else {
+            cx.block = true;
+            false
         }
-        let now = now_ns();
-        match cx.cur.wake_deadline {
-            Some(dl) if now >= dl => {
-                cx.cur.wake_deadline = None;
-                true
-            }
-            Some(_) => {
-                cx.block = true;
-                false
-            }
-            None => {
-                cx.cur.wake_deadline = Some(now + (timeout_ms as u128) * 1_000_000);
-                cx.block = true;
-                false
-            }
-        }
+    }
+
+    fn wait_expired(&self, cx: &ServiceCtx) -> bool {
+        cx.cur
+            .wake_deadline
+            .is_some_and(|d| d <= self.clock.now_monotonic().as_nanos())
     }
 
     // ---- poll / ppoll -------------------------------------------------
@@ -455,9 +427,10 @@ impl Kernel {
         let mut net = self.net.lock().unwrap();
         let pipes = self.pipes.lock().unwrap();
         let mut pf = self.pollfds.lock().unwrap();
+        let expired = self.wait_expired(cx);
         let mut ready_count = 0i64;
         for (addr, fd, events) in entries {
-            let revents = if fd < 0 {
+            let revents = if expired || fd < 0 {
                 0
             } else {
                 self.fd_ready(&mut net, &pipes, &mut pf, cx, fd)
@@ -497,7 +470,19 @@ impl Kernel {
             let Some((sec, nsec)) = read_timespec(mem, timeout_ts) else {
                 return err(Errno::EFAULT);
             };
-            timespec_to_ms(sec, nsec)
+            if (sec as i64) < 0 || nsec >= 1_000_000_000 {
+                return err(Errno::EINVAL);
+            }
+            let duration = u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+            if duration != 0 && cx.cur.wake_deadline.is_none() {
+                cx.cur.wake_deadline = Some(
+                    self.clock
+                        .now_monotonic()
+                        .as_nanos()
+                        .saturating_add(duration),
+                );
+            }
+            i64::from(duration != 0)
         };
         install_poll_sigmask(cx, sigmask, mem);
         self.sys_poll(cx, fds_ptr, nfds, timeout_ms, mem)
@@ -516,7 +501,7 @@ impl Kernel {
         r: u64,
         w: u64,
         e: u64,
-        immediate: bool,
+        timeout: Option<u128>,
         mem: &mut GuestMemory,
     ) -> i64 {
         let Some(rbits) = read_fdset(mem, r, nfds) else {
@@ -540,11 +525,16 @@ impl Kernel {
         let mut net = self.net.lock().unwrap();
         let pipes = self.pipes.lock().unwrap();
         let mut pf = self.pollfds.lock().unwrap();
+        let expired = self.wait_expired(cx);
         for fd in 0..nfds as usize {
             if !rbits[fd] && !wbits[fd] && !ebits[fd] {
                 continue;
             }
-            let ready = self.fd_ready(&mut net, &pipes, &mut pf, cx, fd as i32);
+            let ready = if expired {
+                0
+            } else {
+                self.fd_ready(&mut net, &pipes, &mut pf, cx, fd as i32)
+            };
             if rbits[fd] && ready & (POLLIN | POLLHUP) != 0 {
                 rout[fd] = true;
                 total += 1;
@@ -559,7 +549,7 @@ impl Kernel {
             }
         }
 
-        if total > 0 || immediate {
+        if total > 0 || self.block_or_timeout_ns(cx, timeout) {
             if !write_fdset(mem, r, nfds, &rout)
                 || !write_fdset(mem, w, nfds, &wout)
                 || !write_fdset(mem, e, nfds, &eout)
@@ -589,13 +579,16 @@ impl Kernel {
         sigmask: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let immediate = if timeout_ts == 0 {
-            false
+        let timeout = if timeout_ts == 0 {
+            None
         } else {
             let Some((sec, nsec)) = read_timespec(mem, timeout_ts) else {
                 return err(Errno::EFAULT);
             };
-            sec == 0 && nsec == 0
+            if (sec as i64) < 0 || nsec >= 1_000_000_000 {
+                return err(Errno::EINVAL);
+            }
+            Some(u128::from(sec) * 1_000_000_000 + u128::from(nsec))
         };
         // Deref the argpack: `ss` is the sigset pointer at offset 0.
         if sigmask != 0
@@ -603,7 +596,7 @@ impl Kernel {
         {
             install_poll_sigmask(cx, ss, mem);
         }
-        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
+        self.sys_select_core(cx, nfds, r, w, e, timeout, mem)
     }
 
     /// The legacy `select(nfds, readfds, writefds, exceptfds, timeout)`
@@ -619,16 +612,19 @@ impl Kernel {
         timeout_tv: u64,
         mem: &mut GuestMemory,
     ) -> i64 {
-        let immediate = if timeout_tv == 0 {
-            false
+        let timeout = if timeout_tv == 0 {
+            None
         } else {
             let (Ok(sec), Ok(usec)) = (mem.read_u64(timeout_tv), mem.read_u64(timeout_tv + 8))
             else {
                 return err(Errno::EFAULT);
             };
-            sec == 0 && usec == 0
+            if (sec as i64) < 0 || usec >= 1_000_000 {
+                return err(Errno::EINVAL);
+            }
+            Some(u128::from(sec) * 1_000_000_000 + u128::from(usec) * 1_000)
         };
-        self.sys_select_core(cx, nfds, r, w, e, immediate, mem)
+        self.sys_select_core(cx, nfds, r, w, e, timeout, mem)
     }
 
     // ---- epoll ------------------------------------------------------------
@@ -782,6 +778,10 @@ impl Kernel {
             return err(Errno::EINVAL);
         }
 
+        if self.wait_expired(cx) {
+            cx.cur.wake_deadline = None;
+            return 0;
+        }
         let (_, stride) = self.epoll_event_layout();
         let mut n = 0u64;
         // Readiness lives in `net` (sockets), `pipes` (pipes), and `pollfds`
@@ -876,7 +876,19 @@ impl Kernel {
             let Some((sec, nsec)) = read_timespec(mem, timeout_ts) else {
                 return err(Errno::EFAULT);
             };
-            timespec_to_ms(sec, nsec)
+            if (sec as i64) < 0 || nsec >= 1_000_000_000 {
+                return err(Errno::EINVAL);
+            }
+            let duration = u128::from(sec) * 1_000_000_000 + u128::from(nsec);
+            if duration != 0 && cx.cur.wake_deadline.is_none() {
+                cx.cur.wake_deadline = Some(
+                    self.clock
+                        .now_monotonic()
+                        .as_nanos()
+                        .saturating_add(duration),
+                );
+            }
+            i64::from(duration != 0)
         };
         self.sys_epoll_wait(cx, epfd, events_ptr, maxevents, timeout_ms, mem)
     }
@@ -1055,20 +1067,23 @@ impl Kernel {
 
     // ---- timerfd ------------------------------------------------------------
 
-    /// `timerfd_create(clockid, flags)` — `clockid` is accepted but ignored
-    /// (there is only the one host wall clock).
+    /// Create a timerfd using the selected VM realtime or monotonic domain.
     #[allow(clippy::unused_self)]
     pub(super) fn sys_timerfd_create(
         &self,
         pf: &mut PollFds,
         cx: &mut ServiceCtx,
-        _clockid: u64,
+        clockid: u64,
         flags: u64,
     ) -> i64 {
+        if !matches!(clockid, 0 | 1 | 7 | 8 | 9) {
+            return err(Errno::EINVAL);
+        }
         const TFD_NONBLOCK: u64 = 0o4000;
         let idx = pf.timerfds.len();
         pf.timerfds.push(TimerFdInst {
             expiry_ns: None,
+            realtime: matches!(clockid, 0 | 8),
             interval_ns: 0,
             expirations: 0,
             nonblock: flags & TFD_NONBLOCK != 0,
@@ -1082,11 +1097,11 @@ impl Kernel {
     /// accumulate the elapsed expiration count and (for a periodic timer)
     /// rearm the deadline, or (for a one-shot) disarm it.
     #[allow(clippy::unused_self)]
-    fn update_timerfd(&self, pf: &mut PollFds, i: usize) {
+    pub(super) fn update_timerfd(&self, pf: &mut PollFds, i: usize) {
         let Some(expiry) = pf.timerfds[i].expiry_ns else {
             return;
         };
-        let now = now_ns();
+        let now = self.clock.now_monotonic().as_nanos();
         if now < expiry {
             return;
         }
@@ -1112,7 +1127,7 @@ impl Kernel {
         match pf.timerfds[i].expiry_ns {
             None => (0, 0),
             Some(exp) => {
-                let now = now_ns();
+                let now = self.clock.now_monotonic().as_nanos();
                 let rem = exp.saturating_sub(now);
                 (
                     u64::try_from(rem / 1_000_000_000).unwrap_or(u64::MAX),
@@ -1168,9 +1183,15 @@ impl Kernel {
         pf.timerfds[i].expiry_ns = if value_ns == 0 {
             None
         } else if flags & TFD_TIMER_ABSTIME != 0 {
-            Some(value_ns)
+            let now = self.clock.now_monotonic().as_nanos();
+            let domain_now = if pf.timerfds[i].realtime {
+                self.clock.now_unix().as_nanos()
+            } else {
+                now
+            };
+            Some(now + value_ns.saturating_sub(domain_now))
         } else {
-            Some(now_ns() + value_ns)
+            Some(self.clock.now_monotonic().as_nanos() + value_ns)
         };
         pf.timerfds[i].interval_ns = interval_ns;
         pf.timerfds[i].expirations = 0;

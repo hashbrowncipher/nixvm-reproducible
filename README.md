@@ -54,7 +54,7 @@ Functional on the software-interpreter path: a real Rust syscall kernel, two
 working CPU interpreters (aarch64 and a growing x86-64), static, static-PIE, and
 **dynamically-linked** ELF loading (real `ld-musl` boots stock Alpine and loads
 large C++ programs' full shared-library graphs, e.g. node's ~15 libs),
-multi-threaded/multi-process scheduling with an SMP worker-thread pool
+multi-threaded/multi-process scheduling on one scheduler CPU
 (POSIX threads share one fd table, so libuv's cross-thread wakeups work), an
 in-VM network stack, and several filesystem backends — all covered by 505 tests
 (`cargo test`). **Node.js runs** — on the software interpreter *and* the
@@ -81,7 +81,7 @@ See [ROADMAP.md](ROADMAP.md) for the phased plan and what's next.
 | **Execution backends** | software interpreter — **working** (portable, CI-tested). HVF (macOS/arm64) — **runs a static program end-to-end on hardware** (guest MMU-off at EL0, `svc` trapped via an EL1 stub); needs a codesigned binary (`scripts/hvf-test.sh`). KVM (Linux/x86-64) — **runs a real static glibc binary end-to-end on hardware** (guest at CPL3 in long mode over fixed identity page tables, `syscall` → `LSTAR` trampoline → `KVM_EXIT_HLT`); no entitlement needed, its tests run under plain `cargo test` wherever `/dev/kvm` is accessible and skip elsewhere. `vcpu::select` prefers hardware and falls back to the interpreter (`NIXVM_INTERP=1` forces it); dynamic linking + multi-process on the hardware backends are the follow-up. KVM/arm64 — not started. |
 | **ELF loading** | static (`ET_EXEC`), static-PIE (`ET_DYN` with `R_*_RELATIVE`/`R_*_IRELATIVE` fixups), and **dynamic linking** (`PT_INTERP` → `ld-musl`, file-backed `mmap` of `.so`s) — working; real Alpine boots on the interpreter. |
 | **Processes & threads** | `clone`/`fork`/`execve`/`wait4`/`exit(_group)`; `CLONE_VM`+`CLONE_THREAD` shared-address-space threads; real `futex` WAIT/WAKE parking |
-| **SMP scheduler** | a pool of `ncpus` host worker threads run guest compute in parallel; syscalls are serviced serially on the main thread (a big-kernel-lock model, `Kernel::set_ncpus`/`NIXVM_CPUS`) |
+| **Scheduler CPUs** | virtual-time execution supports one scheduler CPU; guest processes and threads share it. `Kernel::set_ncpus`/`NIXVM_CPUS` requests above `1` return an error for built-in measured backends. The SMP worker pool remains available for unmeasured custom backends. |
 | **Signals** | `rt_sigaction`/`rt_sigprocmask`/`kill`/`tgkill` and default-disposition delivery (terminate/ignore) — **custom handler invocation (frame push + PC redirect) is not implemented** |
 | **Filesystem** | `tmpfs` (rw in-memory), `overlay` (COW upper/lower), format-independent read-only layer stacks, `passthrough` (host dir, **symlink/TOCTOU-safe** — see below), `devfs`, `procfs`, `sysfs`; EROFS images (`erofs` feature) and squashfs/ext backends (`fstool` feature) |
 | **Networking** | in-VM AF_UNIX + AF_INET/AF_INET6 loopback (TCP stream + UDP datagram), plus **host-passthrough egress** (opt-in `NIXVM_NET=host`, native only): guest TCP/UDP to routable addresses is bridged to real host sockets, so **`apk update && apk add` work over the real internet on x86-64**. DNS via a host UDP socket + injected `/etc/resolv.conf`. A browser (WebSocket/pktkit) transport and a `smoltcp` NAT stack are the follow-ups. |
@@ -116,22 +116,36 @@ fail if the required hardware or permissions are absent:
 cargo test --offline --locked --test pmu -- --ignored --test-threads=1
 ```
 
-PMU scheduling replaces scheduler weighting and uses branch quanta while tasks
-compete to run. It does not make guest clocks, entropy, filesystem timestamps,
-or external I/O deterministic.
-The syscall-count limit still applies. A loop with no conditional branches and
-no syscalls cannot exhaust an active conditional-branch budget. Embedders can
-select this mode through `KvmBackend::with_branch_quantum`; direct vCPU users call
-`begin_slice()` before each dispatched slice and set
-`set_preemption_required(true)` while another task is runnable.
+KVM counts retired conditional branches continuously, including solo execution,
+and contributes one virtual nanosecond per branch. Guest clocks, timestamp
+instructions and timers share this internal VM clock. No host clock advances
+it. When every task blocks, the VM jumps to its next timed event. Repeated clock
+reads advance geometrically, capped at the next timer. Generated virtual
+filesystem timestamps also use the VM clock. Existing imported metadata remains
+input; passthrough filesystem metadata and time behavior remain host provided.
+See [CPU instruction policy](docs/cpu.md) for clock rules and backend execution
+metrics.
 
-The scheduler activates the counter only when more than one task is runnable.
-Solo execution leaves it disabled and adds no branch counts. The configured
-wall-clock quantum still yields to the kernel for timers and sleeping peers;
-`NIXVM_QUANTUM_MS=0` disables these timed yields. Runnable peers are checked
-before each guest entry from the kernel, including after clone, syscalls and
-wakeups. New contention starts a fresh branch quantum and suspends the wall-clock
-timer until execution is solo again.
+KVM requires a supported Intel PMU and usable guest-only perf counters. Automatic
+backend selection probes a guest loop and falls back to the interpreter if the
+counter is unavailable. An explicit `NIXVM_BRANCH_QUANTUM` request fails instead.
+The default fairness quantum is 100,000 branches. The scheduler interrupts at
+the earliest timer or fairness boundary. It stops early on PMU overflow and
+single-steps the remaining tail, rejecting late overflow rather than hiding
+skid. The syscall-count limit also applies.
+
+Direct vCPU users call `begin_slice()` before each dispatched slice and set
+`set_preemption_required(true)` while another task is runnable. This flag enables
+the fairness limit; solo execution still counts. Timer limits come from the
+shared clock. Incidental exits and clock reads retain the remaining quantum.
+The virtual-time scheduler requires one guest CPU.
+
+A loop with no conditional branches, clock reads or syscalls contributes no KVM
+time and cannot reach an exact PMU target. The host watchdog used while no exact
+target is armed returns control without advancing VM time. It cannot guarantee
+bounded responsiveness during an unconditional loop with an exact target.
+`NIXVM_QUANTUM_MS=0` disables that host watchdog. Entropy and external I/O have
+separate policies.
 
 ### EROFS root layers
 
@@ -197,16 +211,17 @@ Useful environment variables (both harnesses):
 - `NIXVM_ROOT=/path/to/alpine-rootfs` — mount `/` as
   `overlay(passthrough(NIXVM_ROOT) read-only, tmpfs)` instead of a bare tmpfs,
   so the guest sees a real Alpine tree with a copy-on-write upper.
-- `NIXVM_CPUS=N` — run guest compute on `N` host worker threads (the SMP
-  scheduler); default is `1` (single-threaded cooperative scheduling).
+- `NIXVM_CPUS=N` — request `N` scheduler workers; default is `1`. Current
+  virtual-time execution supports one worker and rejects larger requests. Guest
+  processes and threads share the scheduler CPU.
 - `NIXVM_TRACE=1` — log every dispatched syscall (`pid`, `pc`, name, raw
   number, args) to stderr.
-- `NIXVM_BRANCH_QUANTUM=N` — require KVM scheduling with an exact budget of
-  `N` retired conditional branches per slice. Requires Linux/x86-64, a supported
-  Intel CPU, access to guest-only perf counters, and `NIXVM_CPUS=1`. The backend
-  counts only while tasks compete to run, stops early on PMU overflow and
-  single-steps to the target. Unsupported
-  hardware, counter scheduling failures, and late overflows fail the run.
+- `NIXVM_BRANCH_QUANTUM=N` — require KVM and set its fairness quantum to
+  `N` retired conditional branches (default 100,000). Requires Linux/x86-64,
+  a supported Intel CPU, guest-only perf access, and `NIXVM_CPUS=1`. Counting
+  remains active during solo execution; timers can interrupt before the fairness
+  boundary. Unsupported hardware, counter scheduling failures and late
+  overflows fail an explicit request.
 - `NIXVM_INTERP=1` — skip the hardware-backend probe in `vcpu::select` and run
   on the software interpreter (a debugging/parity escape hatch).
 - `NIXVM_NET=host` — enable host-passthrough network egress: guest sockets to
