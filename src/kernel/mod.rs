@@ -993,6 +993,7 @@ fn run_slice_smp(
     mut vcpu: Box<dyn Vcpu>,
     space: &Arc<Mutex<GuestMemory>>,
 ) -> (usize, Box<dyn Vcpu>, SliceOutcome) {
+    vcpu.begin_slice();
     let mut count: u32 = 0;
     let mut progressed = false;
     loop {
@@ -1699,6 +1700,11 @@ impl Kernel {
     /// exit code.
     pub fn run(&mut self, vcpu: Box<dyn Vcpu>, mem: GuestMemory) -> Result<i32, VcpuError> {
         let ncpus = self.ncpus;
+        if ncpus > 1 && vcpu.retired_branches().is_some() {
+            return Err(VcpuError::Backend(
+                "PMU scheduling requires one scheduler CPU".into(),
+            ));
+        }
         let mut info = std::mem::take(&mut self.seed);
         {
             let sh = self.shared.get_mut().unwrap();
@@ -2021,8 +2027,10 @@ impl Kernel {
         vcpu: &mut Box<dyn Vcpu>,
         mem: &mut GuestMemory,
     ) -> Result<bool, VcpuError> {
+        vcpu.begin_slice();
         let mut progressed = false;
         loop {
+            let branches_before = vcpu.retired_branches();
             // Charge this step's wall time (guest execution + syscall servicing)
             // to the task's CPU total — a blocked task ends its slice here and
             // stops accruing, so this tracks CPU rather than wall time.
@@ -2044,7 +2052,7 @@ impl Kernel {
                 .as_nanos()
                 .saturating_sub(step_start);
             cx.cur.cpu_ns = cx.cur.cpu_ns.saturating_add(delta);
-            charge_vruntime(&mut cx.cur, delta);
+            charge_execution(&mut cx.cur, delta, branches_before, vcpu.retired_branches());
             match flow {
                 Serviced::SetRet => {
                     // The result was already written to the vcpu inside `service`
@@ -8711,13 +8719,24 @@ fn nice_weight(nice: i32) -> u128 {
     table[(nice.clamp(-20, 19) + 20) as usize]
 }
 
-/// Add one executed step's weighted virtual runtime to a task, given the raw CPU
-/// nanoseconds it consumed. Shared by the serial and SMP accounting sites so the
-/// two paths order their run queues identically.
-fn charge_vruntime(p: &mut ProcInfo, cpu_delta_ns: u128) {
-    p.vruntime = p
-        .vruntime
-        .saturating_add(cpu_delta_ns.saturating_mul(NICE0_WEIGHT) / nice_weight(p.nice));
+/// PMU mode orders tasks by execution counts. One tick per service step keeps
+/// a zero-branch syscall loop from staying at the front forever.
+fn charge_execution(p: &mut ProcInfo, elapsed: u128, before: Option<u64>, after: Option<u64>) {
+    let ticks = match (before, after) {
+        (Some(before), Some(after)) => u128::from(after.saturating_sub(before).max(1)),
+        _ => elapsed,
+    };
+    charge_vruntime(p, ticks);
+}
+
+/// Add nice-weighted execution units: elapsed nanoseconds or PMU branch ticks.
+/// Round up so a short step advances even a high-priority task's virtual runtime.
+fn charge_vruntime(p: &mut ProcInfo, execution: u128) {
+    p.vruntime = p.vruntime.saturating_add(
+        execution
+            .saturating_mul(NICE0_WEIGHT)
+            .div_ceil(nice_weight(p.nice)),
+    );
 }
 
 /// Join `argv` into the NUL-separated, NUL-terminated blob the kernel exposes
@@ -11452,6 +11471,35 @@ mod tests {
         // Out-of-range nice clamps to the table ends rather than panicking.
         assert_eq!(nice_weight(-100), nice_weight(-20));
         assert_eq!(nice_weight(100), nice_weight(19));
+    }
+
+    #[test]
+    fn pmu_scheduling_charge_ignores_host_elapsed_time() {
+        let mut first = ProcInfo::default();
+        let mut second = ProcInfo::default();
+        charge_execution(&mut first, 1, Some(100), Some(150));
+        charge_execution(&mut second, 1_000_000, Some(100), Some(150));
+        assert_eq!(first.vruntime, 50);
+        assert_eq!(first.vruntime, second.vruntime);
+        charge_execution(&mut first, 100_000, Some(150), Some(150));
+        assert_eq!(
+            first.vruntime, 51,
+            "zero-branch service steps still receive a charge"
+        );
+    }
+
+    #[test]
+    fn pmu_short_steps_advance_vruntime_at_every_nice_level() {
+        for nice in -20..=19 {
+            for branches in [0, 1] {
+                let mut task = ProcInfo {
+                    nice,
+                    ..ProcInfo::default()
+                };
+                charge_execution(&mut task, 0, Some(100), Some(100 + branches));
+                assert!(task.vruntime > 0, "nice {nice}, branches {branches}");
+            }
+        }
     }
 
     #[test]

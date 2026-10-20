@@ -18,11 +18,11 @@
 //! `fork` clones the *true* mid-trap state (CPL0, in the trampoline), so the
 //! child's first `sysretq` returns to user mode exactly like the parent's.
 
-use super::sys;
 use super::vm::{
     FAULT_TRAMP_VA, GDT_BASE, GDT_LIMIT, GP_TRAMP_VA, LSTAR_VA, SEL_UCODE, SEL_UDATA, STAR_VALUE,
     UD_TRAMP_VA, Vm, check,
 };
+use super::{pmu, sys};
 use crate::vcpu::ctrl::KSTACK_TOP;
 use crate::vcpu::phys::PhysMem;
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
@@ -219,6 +219,7 @@ pub struct KvmVcpu {
     /// disables it. Cached from `NIXVM_QUANTUM_MS` (see [`preempt`] and
     /// [`crate::vcpu::preempt_quantum`]).
     quantum: Option<Duration>,
+    pmu: Option<pmu::Pmu>,
     /// The `CR3` this vcpu's `sregs` currently name, so a context switch (execve
     /// installs fresh page tables; a forked child runs a different address space)
     /// is picked up as a single `KVM_SET_SREGS` before the next run. `None` until
@@ -262,8 +263,13 @@ impl KvmVcpu {
     /// Create a vcpu for a fresh thread, entering user code at `entry` with
     /// stack `stack`. Returns a boxed trait object (a factory, not `Self`).
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(vm: Arc<Vm>, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
-        let mut v = Self::create(vm)?;
+    pub fn new(
+        vm: Arc<Vm>,
+        entry: u64,
+        stack: u64,
+        branch_quantum: Option<u64>,
+    ) -> Result<Box<dyn Vcpu>, VcpuError> {
+        let mut v = Self::create(vm, branch_quantum)?;
         v.regs = sys::kvm_regs {
             rip: entry,
             rsp: stack,
@@ -276,7 +282,7 @@ impl KvmVcpu {
 
     /// Create and fully configure a vcpu (CPUID, MSRs, long-mode sregs) with
     /// zeroed general registers; the caller sets rip/rsp.
-    fn create(vm: Arc<Vm>) -> Result<Self, VcpuError> {
+    fn create(vm: Arc<Vm>, branch_quantum: Option<u64>) -> Result<Self, VcpuError> {
         let (fd, run) = vm.create_vcpu()?;
 
         // SAFETY: `fd` is a live vcpu fd; the cpuid2 struct is valid for the
@@ -350,6 +356,11 @@ impl KvmVcpu {
                     .collect()
             })
             .unwrap_or_default();
+        if branch_quantum.is_some() && (ebp.is_some() || !watchpoints.is_empty()) {
+            return Err(VcpuError::Backend(
+                "PMU scheduling cannot share the guest debugger with breakpoints".into(),
+            ));
+        }
         if let Some(addr) = ebp {
             // DR0 execute breakpoint: L0, R/W0=00 (execute), LEN0=00 (1 byte).
             let dbg = sys::kvm_guest_debug {
@@ -395,7 +406,12 @@ impl KvmVcpu {
             in_syscall: false,
             watchpoint,
             ebp,
-            quantum: crate::vcpu::preempt_quantum(),
+            quantum: if branch_quantum.is_some() {
+                None
+            } else {
+                crate::vcpu::preempt_quantum()
+            },
+            pmu: branch_quantum.map(pmu::Pmu::new),
             cur_cr3: None,
             tlb_flush_pending: false,
             phys: None,
@@ -470,17 +486,25 @@ impl KvmVcpu {
         // exits is broken out after the quantum: the timer signal interrupts
         // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
         // after so a late expiry can't fire into an unrelated later slice.
+        let counter = self
+            .pmu
+            .as_mut()
+            .map(|pmu| pmu.start(self.fd.0))
+            .transpose()?;
         if let Some(q) = quantum {
             preempt::arm(q);
         }
         // SAFETY: `KVM_RUN` takes no argument; the fd is live and not run
         // concurrently (see the `Send` note).
         let ret = unsafe { sys::ioctl(self.fd.0, sys::KVM_RUN, 0) };
+        let run_error = (ret < 0).then(std::io::Error::last_os_error);
         if quantum.is_some() {
             preempt::disarm();
         }
-        let interrupted = if ret < 0 {
-            let err = std::io::Error::last_os_error();
+        if let Some(counter) = counter {
+            self.pmu.as_mut().unwrap().finish(counter)?;
+        }
+        let interrupted = if let Some(err) = run_error {
             // EINTR/EAGAIN: a host signal broke us out of the guest.
             if !matches!(err.raw_os_error(), Some(4 | 11)) {
                 return Err(VcpuError::Backend(format!("KVM_RUN failed: {err}")));
@@ -535,7 +559,15 @@ impl KvmVcpu {
             if remaining.is_some_and(|q| q.is_zero()) {
                 return Ok(Exit::Interrupted);
             }
+            if self.pmu.as_ref().is_some_and(pmu::Pmu::finished) {
+                return Ok(Exit::Interrupted);
+            }
             let reason = self.run_once(remaining)?;
+            if self.pmu.is_some() && matches!(reason, sys::KVM_EXIT_DEBUG | sys::KVM_EXIT_INTR) {
+                // Host interrupts and the variable-length precision tail do not
+                // schedule guest tasks. Only the exact branch target does.
+                continue;
+            }
             // Debug watchpoint hit: log the write (value + faulting pc) and
             // resume — the write already completed (a data #DB is a trap).
             if reason == sys::KVM_EXIT_DEBUG {
@@ -895,6 +927,16 @@ impl Vcpu for KvmVcpu {
         self.run_loop(Some(mem))
     }
 
+    fn begin_slice(&mut self) {
+        if let Some(pmu) = &mut self.pmu {
+            pmu.begin_slice();
+        }
+    }
+
+    fn retired_branches(&self) -> Option<u64> {
+        self.pmu.as_ref().map(pmu::Pmu::total)
+    }
+
     fn needs_locked_run(&self) -> bool {
         // KVM executes against the mapped memslot: `KVM_RUN` needs no Rust borrow
         // of GuestMemory, so the SMP scheduler runs it with the lock dropped.
@@ -1024,7 +1066,8 @@ impl Vcpu for KvmVcpu {
         // state, so the child's resume path is identical to the parent's. The
         // child re-issues the guest slot for its own (forked) memory on its
         // first `run` via the backing-generation seam.
-        let mut child = Self::create(self.vm.clone()).expect("create KVM vcpu (fork)");
+        let mut child = Self::create(self.vm.clone(), self.pmu.as_ref().map(pmu::Pmu::quantum))
+            .expect("create KVM vcpu (fork)");
         child.regs = self.regs;
         child.regs_dirty = true;
         child.sregs = self.sregs;
@@ -1126,7 +1169,7 @@ mod tests {
             }
         };
         let mem = GuestMemory::new(0x1_0000, 64 * 1024);
-        let mut v = KvmVcpu::create(vm).unwrap();
+        let mut v = KvmVcpu::create(vm, None).unwrap();
         v.sync_cr3(&mem);
         let phys = mem.phys_arc();
         // Model the register snapshot returned by an interrupted KVM_RUN.
@@ -1178,7 +1221,7 @@ mod tests {
                 return;
             }
         };
-        let mut v = KvmVcpu::create(vm).unwrap();
+        let mut v = KvmVcpu::create(vm, None).unwrap();
         for trampoline in [FAULT_TRAMP_VA, FAULT_TRAMP_VA + 0x10, FAULT_TRAMP_VA + 0x20] {
             for past_hlt in [0, 1] {
                 v.regs.rip = trampoline + past_hlt;

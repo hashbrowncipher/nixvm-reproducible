@@ -192,6 +192,16 @@ pub trait Vcpu: Send {
     /// hypervisor (once) and the guest writes through to the same buffer.
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError>;
 
+    /// Start a scheduler slice. Precise backends keep its budget across syscalls
+    /// and memory faults, resetting it only when the scheduler dispatches anew.
+    fn begin_slice(&mut self) {}
+
+    /// Retired conditional branches, when precise PMU scheduling is active.
+    /// The scheduler uses differences for ordering instead of host elapsed time.
+    fn retired_branches(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether [`Vcpu::run`] must hold the `GuestMemory` lock for its whole
     /// duration. The software interpreter reads and writes guest memory *through*
     /// the `GuestMemory` struct as it executes, so it genuinely needs the lock the
@@ -370,6 +380,20 @@ pub(crate) mod softfloat;
 /// `SandboxBuilder::prefer_interp`).
 pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
     let force_interp = std::env::var_os("NIXVM_INTERP").is_some_and(|v| v == "1");
+    if std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
+        if force_interp || guest != Arch::X86_64 {
+            return Err(VcpuError::Backend(
+                "PMU scheduling requires the x86-64 KVM backend".into(),
+            ));
+        }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        return kvm::KvmBackend::new().map(|backend| Box::new(backend) as Box<dyn Backend>);
+        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+        return Err(VcpuError::Backend(
+            "PMU scheduling requires Linux/x86-64 KVM".into(),
+        ));
+    }
+
     #[cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
     {
         // When the hypervisor is unavailable/unentitled, `new` fails and we fall
@@ -400,4 +424,33 @@ pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
         return interp_x86::X86Backend::new(guest).map(|b| Box::new(b) as Box<dyn Backend>);
     }
     interp::InterpBackend::new(guest).map(|b| Box::new(b) as Box<dyn Backend>)
+}
+
+#[cfg(test)]
+mod selection_tests {
+    #[test]
+    fn requested_pmu_never_falls_back_to_an_interpreter() {
+        const CHILD: &str = "NIXVM_PMU_SELECTION_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            assert!(super::select(crate::abi::Arch::X86_64).is_err());
+            return;
+        }
+        for (quantum, interpreter) in [("64", "1"), ("invalid", "0")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "vcpu::selection_tests::requested_pmu_never_falls_back_to_an_interpreter",
+                ])
+                .env(CHILD, "1")
+                .env("NIXVM_BRANCH_QUANTUM", quantum)
+                .env("NIXVM_INTERP", interpreter)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+    }
 }
