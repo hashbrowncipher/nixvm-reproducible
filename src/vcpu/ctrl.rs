@@ -63,6 +63,8 @@ pub const FAULT_TRAMP_VA: u64 = CTRL_GPA + FAULT_TRAMP_OFF;
 /// General-protection and invalid-opcode exception trampolines.
 pub const GP_TRAMP_VA: u64 = FAULT_TRAMP_VA + 0x10;
 pub const UD_TRAMP_VA: u64 = FAULT_TRAMP_VA + 0x20;
+/// Debug exceptions retain guest-owned TF while host stepping stays private.
+pub const DB_TRAMP_VA: u64 = FAULT_TRAMP_VA + 0x30;
 /// Linear address of the IDT and of the TSS.
 #[cfg_attr(
     not(all(target_os = "linux", target_arch = "x86_64")),
@@ -217,7 +219,12 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     phys.write(tss_pa + 102, &0x68u16.to_le_bytes()); // iomap base past the TSS
 
     // 64-bit interrupt gates, CPL0. Exceptions preserve the user state on RSP0.
-    for (vector, off) in [(6, UD_TRAMP_VA), (13, GP_TRAMP_VA), (14, FAULT_TRAMP_VA)] {
+    for (vector, off) in [
+        (1, DB_TRAMP_VA),
+        (6, UD_TRAMP_VA),
+        (13, GP_TRAMP_VA),
+        (14, FAULT_TRAMP_VA),
+    ] {
         let gate_lo = (off & 0xFFFF)
             | (u64::from(SEL_KCODE) << 16)
             | (0x8Eu64 << 40)
@@ -232,6 +239,7 @@ pub fn reserve_and_build(fa: &mut FrameAllocator, phys: &PhysMem) {
     phys.write(fault_pa, &[0xF4]); // hlt
     phys.write(fault_pa + 0x10, &[0xF4]); // #GP: hlt
     phys.write(fault_pa + 0x20, &[0xF4]); // #UD: hlt (no CPU error code)
+    phys.write(fault_pa + 0x30, &[0xF4]); // #DB: hlt (no CPU error code)
 
     // vDSO ELF image (its clock code reads the vvar page at VVAR_VA). The vvar
     // frame is left zeroed — `mult == 0` makes the vDSO fall back to the syscall

@@ -41,8 +41,12 @@ fn main() -> ExitCode {
 }
 
 fn cmd_run(args: &[String]) -> ExitCode {
+    use std::io::Write;
     let mut builder =
         Sandbox::builder().confine_host(cfg!(all(target_os = "linux", target_arch = "x86_64")));
+    let mut reproducible = false;
+    let mut status_path = None;
+    let mut explicit_quanta = false;
     let mut erofs_layers = Vec::new();
     let mut directory_root = false;
     let mut i = 0;
@@ -50,6 +54,37 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let command: Vec<String> = loop {
         match args.get(i).map(String::as_str) {
             Some("--") => break args[i + 1..].to_vec(),
+            Some("--reproducible") => {
+                reproducible = true;
+                builder = builder.reproducible(true);
+                i += 1;
+            }
+            Some("--status-file") => {
+                let Some(path) = args.get(i + 1).filter(|path| !path.starts_with("--")) else {
+                    eprintln!("nixvm: --status-file needs a path");
+                    return ExitCode::FAILURE;
+                };
+                status_path = Some(path);
+                i += 2;
+            }
+            Some(option @ ("--branch-quantum" | "--syscall-quantum")) => {
+                let Some(value) = args.get(i + 1).and_then(|value| value.parse::<u64>().ok())
+                else {
+                    eprintln!("nixvm: {option} needs an unsigned integer");
+                    return ExitCode::FAILURE;
+                };
+                builder = if option == "--branch-quantum" {
+                    builder.branch_quantum(value)
+                } else {
+                    let Ok(value) = u32::try_from(value) else {
+                        eprintln!("nixvm: --syscall-quantum must fit in u32");
+                        return ExitCode::FAILURE;
+                    };
+                    builder.syscall_quantum(value)
+                };
+                explicit_quanta = true;
+                i += 2;
+            }
             Some("--mem") => {
                 let Some(v) = args.get(i + 1).and_then(|s| parse_size(s)) else {
                     eprintln!("nixvm: --mem needs a size (e.g. 512M, 2G)");
@@ -140,11 +175,55 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if !erofs_layers.is_empty() {
         builder = builder.root_erofs_layers(erofs_layers);
     }
-    match builder.command(command).run() {
+    if explicit_quanta && !reproducible {
+        eprintln!("nixvm: explicit quanta require --reproducible");
+        return ExitCode::FAILURE;
+    }
+    if reproducible && status_path.is_none() {
+        eprintln!(
+            "nixvm: --reproducible requires --status-file to separate sandbox failures from guest output"
+        );
+        return ExitCode::from(125);
+    }
+    let report = match status_path {
+        Some(path) => {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(path) {
+                Ok(file) => Some(std::sync::Arc::new(file)),
+                Err(error) => {
+                    eprintln!("nixvm: cannot open status file: {error}");
+                    return ExitCode::from(125);
+                }
+            }
+        }
+        None => None,
+    };
+    if let Some(file) = &report {
+        builder = builder.report_file(std::sync::Arc::clone(file));
+    }
+    let result = builder.command(command).run();
+    if let Some(file) = &report {
+        let written = match &result {
+            Ok(code) => writeln!(file.as_ref(), "guest-exit {}", code & 0xff),
+            Err(error) => writeln!(file.as_ref(), "sandbox-error\n{error}"),
+        };
+        if written.is_err() {
+            return ExitCode::from(125);
+        }
+    }
+    match result {
         Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1)),
         Err(e) => {
-            eprintln!("nixvm: {e}");
-            ExitCode::FAILURE
+            if !reproducible {
+                eprintln!("nixvm: {e}");
+            }
+            ExitCode::from(if reproducible { 125 } else { 1 })
         }
     }
 }
@@ -183,6 +262,9 @@ fn print_usage() {
          nixvm version\n\n\
          --workdir explicitly exposes a host directory at /work.\n\
          --vcpu-capacity bounds simultaneous guest CPUs (default 128).\n\
+         --reproducible requires EROFS, KVM/perf and --status-file; host NIXVM_* settings are refused.\n\
+         --branch-quantum and --syscall-quantum set its fairness budgets (defaults 100000 and 1024).\n\
+         Guest stdin reads return zero; stdout/stderr contain guest output only.\n\
          Linux x86-64 runs irreversibly confine the host process before parsing guest files.\n\
          Host-directory symlinks and metadata changes are unavailable when confined;\n\
          EROFS guest symlinks remain supported. Host networking is unavailable.\n\

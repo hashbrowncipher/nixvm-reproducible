@@ -1,0 +1,22 @@
+name: Reproducibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hardware:
+    runs-on: [self-hosted, linux, x64, nixvm-pmu]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build from cached dependencies
+        run: timeout 250s cargo build --offline --locked --features erofs --bin nixvm
+      - name: PMU regression tests
+        run: timeout 250s cargo test --offline --locked --features erofs --test pmu -- --ignored --test-threads=1
+      - name: Confined reproducible mode
+        run: timeout 250s cargo test --offline --locked --features erofs --test reproducible_cli -- --include-ignored --test-threads=1
+      - name: Perturb host conditions
+        run: timeout 250s python3 tools/check_reproducibility.py --nixvm target/debug/nixvm --self-test --repeats 3

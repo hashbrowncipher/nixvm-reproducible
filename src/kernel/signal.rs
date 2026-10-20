@@ -148,9 +148,9 @@ impl Fault {
                 addr: pc,
                 ..Self::default()
             },
-            Arch::X86_64 if code == 1 => Self {
+            Arch::X86_64 if code == 1 || code == 2 => Self {
                 sig: SIGTRAP,
-                code: TRAP_BRKPT,
+                code,
                 addr: pc,
                 trapno: 1,
                 ..Self::default()

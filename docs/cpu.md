@@ -41,9 +41,15 @@ to user mode before precise execution resumes.
 An unconditional loop such as `jmp .` retires no conditional branches and
 advances no x86 execution time. While an exact target is armed, it cannot reach
 that target. A different execution metric is required to guarantee timer
-progress for every possible instruction stream. The host watchdog used during
-count-only KVM execution returns control to the host; it does not advance time
-or complete guest waits. Embedder wall-clock budgets also remain host-only.
+progress for every possible instruction stream. Branch counting refuses a host
+watchdog: host time cannot choose a guest slice boundary. A nonzero or invalid
+`NIXVM_QUANTUM_MS` fails KVM setup. Foreign interrupts resume the same slice.
+Embedder wall-clock budgets cannot interrupt a syscall-free KVM run without a
+virtual deadline or branch allowance. An external process timeout can stop it.
+
+Precision stepping hides its injected TF from PUSHF, syscall return registers
+and saved exception frames. POPF is emulated during the precision tail so it
+cannot disable host stepping. Guest-owned TF and INT1 retain their debug traps.
 
 KVM leaves the vDSO uncalibrated so clock functions use their syscall fallback.
 

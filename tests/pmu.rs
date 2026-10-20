@@ -20,6 +20,94 @@ fn invalid_quantum_is_rejected_before_opening_kvm() {
 }
 
 #[test]
+#[ignore = "requires KVM and guest-only Intel perf counters"]
+fn stepping_flags_are_hidden_from_pushf_and_popf_roundtrips() {
+    for code in [
+        vec![0x9c, 0x58, 0x0f, 0x05],             // pushfq; pop rax; syscall
+        vec![0x66, 0x9c, 0x66, 0x58, 0x0f, 0x05], // pushfw; pop ax; syscall
+        vec![0x9c, 0x58, 0x50, 0x9d, 0x9c, 0x58, 0x0f, 0x05],
+    ] {
+        let backend = KvmBackend::with_branch_quantum(64).unwrap();
+        let mut memory = GuestMemory::new(BASE, 64 * 1024);
+        memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+        memory.map(BASE + PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
+        memory
+            .write_init(BASE + 2 * PAGE_SIZE - 8, &[0; 8])
+            .unwrap();
+        memory.write_init(BASE, &code).unwrap();
+        let mut cpu = backend.new_vcpu(BASE, BASE + 2 * PAGE_SIZE).unwrap();
+        cpu.set_preemption_required(true);
+        cpu.begin_slice();
+        assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Syscall);
+        assert_eq!(
+            cpu.reg(0) & 0x100,
+            0,
+            "pushed flags include host TF: {code:x?}"
+        );
+        assert_eq!(cpu.rflags() & 0x100, 0);
+    }
+}
+
+#[test]
+#[ignore = "requires KVM and guest-only Intel perf counters"]
+fn stepping_flags_are_hidden_from_exception_frames() {
+    for code in [vec![0x0f, 0x0b], vec![0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]] {
+        let backend = KvmBackend::with_branch_quantum(64).unwrap();
+        let mut memory = GuestMemory::new(BASE, 64 * 1024);
+        memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+        memory.write_init(BASE, &code).unwrap();
+        let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+        cpu.set_preemption_required(true);
+        cpu.begin_slice();
+        assert!(matches!(
+            cpu.run(&mut memory).unwrap(),
+            Exit::IllegalInstruction { .. } | Exit::MemFault { .. }
+        ));
+        assert_eq!(
+            cpu.rflags() & 0x100,
+            0,
+            "exception flags include host TF: {code:x?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires KVM and guest-only Intel perf counters"]
+fn int1_and_guest_trap_flags_are_independent_of_host_stepping() {
+    for stepping in [false, true] {
+        for (code, expected_pc, expected_code) in [
+            (vec![0xf1, 0x0f, 0x05], BASE + 1, 1),
+            // pushfq; or word [rsp],TF; popfq; nop; syscall.
+            (
+                vec![0x9c, 0x66, 0x81, 0x0c, 0x24, 0, 1, 0x9d, 0x90, 0x0f, 0x05],
+                BASE + 9,
+                2,
+            ),
+        ] {
+            let backend = KvmBackend::with_branch_quantum(64).unwrap();
+            let mut memory = GuestMemory::new(BASE, 64 * 1024);
+            memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+            memory.map(BASE + PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
+            memory
+                .write_init(BASE + 2 * PAGE_SIZE - 8, &[0; 8])
+                .unwrap();
+            memory.write_init(BASE, &code).unwrap();
+            let mut cpu = backend.new_vcpu(BASE, BASE + 2 * PAGE_SIZE).unwrap();
+            cpu.set_preemption_required(stepping);
+            cpu.begin_slice();
+            assert_eq!(
+                cpu.run(&mut memory).unwrap(),
+                Exit::Breakpoint {
+                    pc: expected_pc,
+                    code: expected_code
+                }
+            );
+            assert_eq!(cpu.rflags() & 0x100 != 0, expected_code == 2);
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires KVM and guest-only perf counters on a supported Intel CPU"]
 fn branch_quantum_lands_at_the_same_instruction_on_repeated_runs() {
     for quantum in [64, 20_000] {
@@ -128,10 +216,12 @@ fn solo_compute_loops_count_before_contention() {
         memory.write_init(BASE, code).unwrap();
         let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
         cpu.begin_slice();
+        cpu.set_execution_limit(Some(64));
         assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
         assert!(cpu.reg(3) > 0, "solo guest loop must make progress");
         assert!(cpu.retired_branches().unwrap() > 0);
         let solo = cpu.retired_branches().unwrap();
+        cpu.set_execution_limit(None);
 
         // Start contention at a known instruction boundary to check its budget.
         cpu.reset(BASE, BASE + 0x8000);
@@ -147,28 +237,17 @@ fn solo_compute_loops_count_before_contention() {
 
 #[test]
 #[ignore = "requires KVM"]
-fn solo_compute_loop_returns_to_the_kernel_pump() {
+fn solo_compute_can_use_an_explicit_branch_limit() {
     let backend = KvmBackend::with_branch_quantum(16).unwrap();
     let mut memory = GuestMemory::new(BASE, 64 * 1024);
     memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
-    // INC RBX; TEST RBX,RBX; JNZ start. The guest never returns through a syscall.
     memory
         .write_init(BASE, &[0x48, 0xff, 0xc3, 0x48, 0x85, 0xdb, 0x75, 0xf8])
         .unwrap();
-    let cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
-    let mut kernel = Kernel::new(Arch::X86_64, MountTable::new());
-    kernel.boot(cpu, memory);
-    for _ in 0..2 {
-        assert_eq!(
-            kernel.pump_for(Duration::from_millis(20)).unwrap(),
-            Pumped::Busy
-        );
-    }
-    assert!(
-        kernel.unsupported().is_empty(),
-        "{:?}",
-        kernel.unsupported()
-    );
+    let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+    cpu.set_execution_limit(Some(32));
+    assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+    assert_eq!(cpu.reg(3), 32);
 }
 
 #[test]

@@ -15,6 +15,12 @@
 //! later (we simply don't advance the guest PC), which the interpreter turns
 //! back into the same syscall on the next slice.
 
+macro_rules! kernel_diagnostic {
+    ($kernel:expr, $($arguments:tt)*) => {
+        if $kernel.diagnostics { eprintln!($($arguments)*); }
+    };
+}
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::atomic::AtomicU64;
@@ -42,6 +48,7 @@ mod mem_syscalls;
 mod mqueue;
 mod net;
 mod orphan;
+mod output;
 mod pagecache;
 mod path;
 mod poll;
@@ -49,6 +56,8 @@ mod prctl;
 mod procx;
 mod ptimer;
 mod pty;
+#[cfg(test)]
+mod reproducibility_tests;
 mod seccomp;
 mod signal;
 mod sockopt;
@@ -1217,6 +1226,7 @@ pub struct Kernel {
     /// echo). Cleared for paths that redirect stdio into a capture sink, where
     /// the host tty is unrelated to where the guest's output actually goes.
     host_tty: bool,
+    diagnostics: bool,
     trace: bool,
     /// Debug (`NIXVM_SCHEDTRACE`): log every scheduler slice (pid, syscalls run,
     /// how it ended) to see how threads interleave.
@@ -1308,8 +1318,8 @@ pub struct Kernel {
 pub(super) struct Shared {
     clock: Arc<crate::clock::VirtualClock>,
     stdin: Box<dyn Read + Send>,
-    stdout: Box<dyn Write + Send>,
-    stderr: Box<dyn Write + Send>,
+    stdout: output::Output,
+    stderr: output::Output,
     /// Buffered terminal input for interactive mode (see [`Kernel::feed_stdin`]).
     stdin_buf: VecDeque<u8>,
     /// Whether interactive stdin has been closed (EOF / Ctrl-D).
@@ -1643,6 +1653,7 @@ impl Kernel {
             ncpus: 1,
             interactive: false,
             host_tty: false,
+            diagnostics: true,
             vfs: Mutex::new(mounts),
             net: Mutex::new(Net::default()),
             pipes: Mutex::new(Vec::new()),
@@ -1656,8 +1667,8 @@ impl Kernel {
             shared: Mutex::new(Shared {
                 clock: Arc::clone(&clock),
                 stdin: Box::new(std::io::stdin()),
-                stdout: Box::new(std::io::stdout()),
-                stderr: Box::new(std::io::stderr()),
+                stdout: output::Output::host(1),
+                stderr: output::Output::host(2),
                 rlimit_nofile: (1024, 4096),
                 memfd_seq: 0,
                 umask: 0o022,
@@ -1685,13 +1696,31 @@ impl Kernel {
         }
     }
 
+    /// Set the syscall fairness budget explicitly; zero disables the cap.
+    pub fn set_syscall_quantum(&mut self, calls: u32) {
+        self.slice_cap = calls;
+    }
+
+    /// Keep host diagnostics separate from guest stderr in reproducible runs.
+    pub fn set_diagnostics(&mut self, enabled: bool) {
+        self.diagnostics = enabled;
+    }
+
+    /// Report and flush host output errors after guest execution finishes.
+    pub fn check_output(&self) -> Result<(), VcpuError> {
+        let mut shared = self.shared.lock().unwrap();
+        let stdout = shared.stdout.result();
+        let stderr = shared.stderr.result();
+        stdout.and(stderr)
+    }
+
     /// Redirect the sink backing guest fd 1 (`stdout`).
     pub fn set_stdout(&mut self, w: Box<dyn Write + Send>) {
-        self.shared.get_mut().unwrap().stdout = w;
+        self.shared.get_mut().unwrap().stdout = output::Output::new(w);
     }
     /// Redirect the sink backing guest fd 2 (`stderr`).
     pub fn set_stderr(&mut self, w: Box<dyn Write + Send>) {
-        self.shared.get_mut().unwrap().stderr = w;
+        self.shared.get_mut().unwrap().stderr = output::Output::new(w);
     }
     /// Redirect the source backing guest fd 0 (`stdin`).
     pub fn set_stdin(&mut self, r: Box<dyn Read + Send>) {
@@ -1787,17 +1816,22 @@ impl Kernel {
                 info,
             }));
         }
-        if ncpus > 1 {
-            self.schedule_smp()
+        let code = if ncpus > 1 {
+            self.schedule_smp()?
         } else {
-            self.schedule_serial()
-        }
+            self.schedule_serial()?
+        };
+        self.check_output()?;
+        Ok(code)
     }
 
     /// Cooperative single-CPU round-robin scheduler.
     fn schedule_serial(&self) -> Result<i32, VcpuError> {
         loop {
-            if let Some(code) = self.shared.lock().unwrap().pid1_code() {
+            if let Some(code) = {
+                let shared = self.shared.lock().unwrap();
+                shared.pid1_code()
+            } {
                 return Ok(code);
             }
             if self.serial_sweep()? {
@@ -1895,9 +1929,13 @@ impl Kernel {
                 } else {
                     "yield"
                 };
-                eprintln!(
+                kernel_diagnostic!(
+                    self,
                     "[sched] pid={} slot={} vr={} syscalls={} end={end}",
-                    cx.cur.pid, i, cx.cur.vruntime, cx.slice_syscalls
+                    cx.cur.pid,
+                    i,
+                    cx.cur.vruntime,
+                    cx.slice_syscalls
                 );
             }
             // The slice ended by exiting, yielding, preemption, or blocking;
@@ -2027,7 +2065,11 @@ impl Kernel {
     /// with no progress is reported as [`Pumped::Blocked`] (needs input), not a
     /// deadlock error.
     pub fn pump(&self) -> Result<Pumped, VcpuError> {
-        self.pump_inner()
+        let result = self.pump_inner()?;
+        if matches!(result, Pumped::Exited(_)) {
+            self.check_output()?;
+        }
+        Ok(result)
     }
 
     /// [`Kernel::pump`] with a time budget: return [`Pumped::Busy`] once
@@ -2038,14 +2080,17 @@ impl Kernel {
     /// instructions; its task stays runnable and resumes on the next call.
     pub fn pump_for(&self, budget: std::time::Duration) -> Result<Pumped, VcpuError> {
         crate::vcpu::set_yield_deadline(Some(crate::clock::host_monotonic() + budget));
-        let r = self.pump_inner();
+        let r = self.pump();
         crate::vcpu::set_yield_deadline(None);
         r
     }
 
     fn pump_inner(&self) -> Result<Pumped, VcpuError> {
         loop {
-            if let Some(code) = self.shared.lock().unwrap().pid1_code() {
+            if let Some(code) = {
+                let shared = self.shared.lock().unwrap();
+                shared.pid1_code()
+            } {
                 return Ok(Pumped::Exited(code));
             }
             if crate::vcpu::yield_due() {
@@ -2445,7 +2490,8 @@ impl Kernel {
                     // The guest caught it (JIT trap handler): run the handler.
                     Serviced::Resume
                 } else {
-                    eprintln!(
+                    kernel_diagnostic!(
+                        self,
                         "[fault] pid {} memory fault at {addr:#x} (write={write}, pc={:#x})",
                         cx.cur.pid,
                         vcpu.pc()
@@ -2466,7 +2512,8 @@ impl Kernel {
                 let bytes = mem.read_vec(pc, 16).unwrap_or_default();
                 let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
                 self.dump_fault_context(vcpu, mem);
-                eprintln!(
+                kernel_diagnostic!(
+                    self,
                     "[fault] pid {} illegal instruction at {pc:#x} [{}]",
                     cx.cur.pid,
                     hex.join(" ")
@@ -2478,7 +2525,8 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, signal::Fault::fpe(pc, code, vector), vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!(
+                kernel_diagnostic!(
+                    self,
                     "[fault] pid {} arithmetic exception (vector {vector}, si_code {code}) at {pc:#x}",
                     cx.cur.pid
                 );
@@ -2490,7 +2538,8 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, signal::Fault::gp(), vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!(
+                kernel_diagnostic!(
+                    self,
                     "[fault] pid {} general protection fault at {pc:#x}",
                     cx.cur.pid
                 );
@@ -2505,7 +2554,11 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!("[fault] pid {} breakpoint trap at {pc:#x}", cx.cur.pid);
+                kernel_diagnostic!(
+                    self,
+                    "[fault] pid {} breakpoint trap at {pc:#x}",
+                    cx.cur.pid
+                );
                 self.dump_fault_context(vcpu, mem);
                 self.die_of_signal(cx, SIGTRAP as u32, mem);
                 Serviced::Ended
@@ -2515,7 +2568,8 @@ impl Kernel {
                 if self.deliver_fault_signal(cx, fault, vcpu, mem) {
                     return Serviced::Resume;
                 }
-                eprintln!(
+                kernel_diagnostic!(
+                    self,
                     "[fault] pid {} alignment fault at {addr:#x} (write={write}, pc={:#x})",
                     cx.cur.pid,
                     vcpu.pc()
@@ -2912,7 +2966,8 @@ impl Kernel {
         };
         let now = mem.read_u64(addr).unwrap_or(0);
         if now != sh.watch_last {
-            eprintln!(
+            kernel_diagnostic!(
+                self,
                 "[watch] {addr:#x}: {:#018x} -> {now:#018x} in the window before {after:?} (pc={:#x})",
                 sh.watch_last,
                 vcpu.pc()
@@ -2963,11 +3018,11 @@ impl Kernel {
             .enumerate()
             .map(|(i, n)| format!("{n}={:#x}", vcpu.reg(i)))
             .collect();
-        eprintln!("[fault]   regs: {}", line.join(" "));
+        kernel_diagnostic!(self, "[fault]   regs: {}", line.join(" "));
         let pc = vcpu.pc();
         if let Ok(b) = mem.read_vec(pc, 16) {
             let hex: Vec<String> = b.iter().map(|x| format!("{x:02x}")).collect();
-            eprintln!("[fault]   code@pc: {}", hex.join(" "));
+            kernel_diagnostic!(self, "[fault]   code@pc: {}", hex.join(" "));
         }
         let sp = vcpu.sp();
         let stack: Vec<String> = (0..8u64)
@@ -2976,7 +3031,7 @@ impl Kernel {
                 Err(_) => "<unmapped>".to_string(),
             })
             .collect();
-        eprintln!("[fault]   [rsp+0..64]: {}", stack.join(" "));
+        kernel_diagnostic!(self, "[fault]   [rsp+0..64]: {}", stack.join(" "));
     }
 
     /// `NIXVM_TRACE` wrapper around [`Kernel::dispatch_inner`]: logs each call
@@ -2997,12 +3052,15 @@ impl Kernel {
             return self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
         }
         let (pid, pc) = (cx.cur.pid, vcpu.pc());
-        eprintln!("[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}");
+        kernel_diagnostic!(
+            self,
+            "[trace] pid={pid} pc={pc:#x} {sys:?} raw={raw} args={args:x?}"
+        );
         let ret = self.dispatch_impl(cx, sys, raw, args, vcpu, mem);
         if (-4095..0).contains(&ret) {
-            eprintln!("[trace]   = {ret} (errno {})", -ret);
+            kernel_diagnostic!(self, "[trace]   = {ret} (errno {})", -ret);
         } else {
-            eprintln!("[trace]   = {ret:#x}");
+            kernel_diagnostic!(self, "[trace]   = {ret:#x}");
         }
         ret
     }
@@ -4526,7 +4584,7 @@ impl Kernel {
             Ok(image) => image,
             Err(error) => {
                 if self.trace {
-                    eprintln!("[exec] {abs}: {error}");
+                    kernel_diagnostic!(self, "[exec] {abs}: {error}");
                 }
                 replacement.discard();
                 return err(
@@ -7351,7 +7409,7 @@ impl Kernel {
             Err(e) => return e,
         };
         if self.trace {
-            eprintln!("[open] pid={} {abs:?}", cx.cur.pid);
+            kernel_diagnostic!(self, "[open] pid={} {abs:?}", cx.cur.pid);
         }
         // A `/proc` open (of a file to read or a directory to list) must see this
         // task's live identity — its program name, cmdline, and open fds — not the
@@ -7809,10 +7867,11 @@ impl Kernel {
             Some(Fd::Dir { path, pos }) => (path.clone(), *pos),
             _ => return err(Errno::ENOTDIR),
         };
-        let entries = match vfs.readdir(&path) {
+        let mut entries = match vfs.readdir(&path) {
             Ok(e) => e,
             Err(e) => return io_errno(&e),
         };
+        entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         let mut all: Vec<(String, NodeKind, u64)> = vec![
             (".".into(), NodeKind::Dir, 1),
             ("..".into(), NodeKind::Dir, 1),

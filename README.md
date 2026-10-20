@@ -141,11 +141,64 @@ shared clock. Incidental exits and clock reads retain the remaining quantum.
 The virtual-time scheduler requires one guest CPU.
 
 A loop with no conditional branches, clock reads or syscalls contributes no KVM
-time and cannot reach an exact PMU target. The host watchdog used while no exact
-target is armed returns control without advancing VM time. It cannot guarantee
-bounded responsiveness during an unconditional loop with an exact target.
-`NIXVM_QUANTUM_MS=0` disables that host watchdog. Entropy and external I/O have
-separate policies.
+time and cannot reach an exact PMU target. Measured KVM never enables a host
+watchdog. An explicit nonzero or invalid `NIXVM_QUANTUM_MS` is refused; unset and
+`0` are accepted outside reproducible mode. Foreign host interrupts resume the
+same slice. `pump_for` cannot bound a syscall-free KVM run without a virtual
+deadline or execution allowance. Use an external process timeout to stop a stuck run.
+
+### Reproducible runs
+
+Build with `--features erofs`, then run with explicit immutable input layers:
+
+```sh
+nixvm run --reproducible --status-file result.status \
+  --branch-quantum 65536 --syscall-quantum 1024 --mem 128M \
+  --erofs root.erofs --erofs source.erofs -- /bin/sh /build.sh \
+  > output.tar 2> build.stderr
+```
+
+This mode requires Linux x86-64, confinement, usable Intel KVM/perf, and one
+scheduler CPU. It refuses host directories, bind mounts, interpreter fallback,
+and every ambient `NIXVM_*` variable. Branch and syscall quanta default to
+100,000 and 1,024; their CLI flags set declared run inputs. A zero syscall
+quantum disables that cap. Guest reads from stdin always return zero without
+reading or closing host fd 0. Guest terminal ioctls never reach the host.
+Directory entries use bytewise name order.
+
+Host stdout/stderr writes complete partial writes and retry nonblocking pipes
+without changing their shared flags. Permanent errors are latched: guest writes
+still report full counts, and the completed run fails. Confined runs ignore
+SIGPIPE and SIGXFSZ so broken pipes and file-size limits become reported errors.
+Output from a failed run is incomplete and must be discarded.
+
+The required status file receives `guest-exit N` for a completed guest, or
+`sandbox-error` followed by the host diagnostic. Sandbox failures exit 125;
+the status file distinguishes them from a guest that itself exits 125. nixvm's
+fault diagnostics are suppressed in this mode, keeping stdout/stderr for guest
+output. The library exposes the policy as `Sandbox::builder().reproducible(true)`
+and reports failures through `Result`; a report file is optional for library users.
+
+The declared environment still includes the CPU model/core type, PMU behavior
+of an outer hypervisor, kernel, executable, image contents, command, guest
+environment, RAM size, quanta and random seed. This mode does not establish
+equivalence across CPU generations or interpreter backends.
+
+Run the synthetic confined contention probe and host perturbations locally:
+
+```sh
+cargo build --offline --locked --features erofs --bin nixvm
+python3 tools/check_reproducibility.py --nixvm target/debug/nixvm --self-test
+cargo test --offline --locked --features erofs --test pmu -- --ignored --test-threads=1
+cargo test --offline --locked --features erofs --test reproducible_cli -- --ignored --test-threads=1
+```
+
+The harness varies cwd, environment, CPU affinity, image timestamps, terminal
+settings, host load and nonblocking stdout. Its self-test also checks full and
+broken sinks and host file-size limits. `--manifest FILE` records input and
+output hashes. Pass `--erofs` layers followed by `-- COMMAND...` to check a real
+build. The manually dispatched Reproducibility workflow runs these checks on a
+self-hosted runner labeled `nixvm-pmu`; hardware absence fails explicitly.
 
 ### EROFS root layers
 
@@ -267,7 +320,7 @@ policies.
 
 The Linux x86-64 CLI confines its host process before parsing guest files or
 decompressing images. It closes inherited descriptors above stderr, opens images
-and KVM resources, and prepares timers, affinity, signal masks and perf counters.
+and KVM resources, and prepares affinity, signal masks and perf counters.
 It then drops capabilities, dumpability and new privileges. Landlock restricts
 file contents and seccomp applies to every thread. Landlock ABI 5 (Linux 6.10+),
 close_range and seccomp thread synchronization are required. Confinement setup

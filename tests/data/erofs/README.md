@@ -25,3 +25,10 @@ whiteouts, opaque directories and file/directory replacement across layers.
 | zstd | 5ffd2a088efa1294464f127ac9e4a7ebce10acc0132da0a438c7c1acd5ab7038 |
 | middle | bfc3dad86fd3effdf3b0faf142f3b233dca25736f7f87426af0ca1938b795c9d |
 | top | 3af7e2dda9001f68ec149db8e7d5b55404642764e552801935221c71330301af |
+| reproducible | 8f4e210473ef180759aca47befc225453a3b3c7d12af4d4ea221b5931277e534 |
+
+`reproducible.erofs` contains synthetic x86-64 programs for empty stdin,
+terminal isolation, fork contention, flags, virtual time and output failures.
+Regenerate it separately with `python3 scripts/make-reproducibility-fixture.py`.
+The generator declares every byte and fixes image metadata. The `/fault` and
+`/exit125` programs check the separation of guest outcomes from host failures.

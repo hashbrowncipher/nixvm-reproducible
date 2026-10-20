@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 const SIGNAL: i32 = 41;
 // Headroom, not a guarantee: overruns are detected and fail the run.
-const SKID: u64 = 1024;
+pub(super) const SKID: u64 = 1024;
 const DISABLE: u64 = 0x2401;
 const RESET: u64 = 0x2403;
 const PERIOD: u64 = 0x4008_2404;

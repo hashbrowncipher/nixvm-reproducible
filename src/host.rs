@@ -18,6 +18,9 @@
 //! initialization. Calls serialize on a leaf mutex and are not signal-safe.
 //! Replay also requires the same toolchain and host random-call/thread order.
 
+#[cfg(target_os = "linux")]
+pub(crate) mod output;
+
 use std::io;
 
 /// Validate the host seed and disable Linux ASLR, re-executing once if needed.

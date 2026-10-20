@@ -78,6 +78,7 @@ const GUEST_VSIZE: u64 = 32 * 1024 * 1024 * 1024;
 
 /// A fully-specified sandbox run.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent builder policies
 pub struct Config {
     /// argv of the command to run inside the sandbox.
     pub command: Vec<String>,
@@ -120,6 +121,14 @@ pub struct Config {
     pub confine_host: bool,
     /// Maximum simultaneous guest vCPUs in a confined KVM run.
     pub vcpu_capacity: usize,
+    /// Enforce immutable inputs and deterministic host-boundary policies.
+    pub reproducible: bool,
+    /// Explicit fairness quantum for reproducible KVM execution.
+    pub branch_quantum: u64,
+    /// Explicit syscall quantum for reproducible execution.
+    pub syscall_quantum: u32,
+    /// A host-only report file retained across confinement; never mounted in the guest.
+    pub report_file: Option<std::sync::Arc<std::fs::File>>,
 }
 
 /// A host directory shared into the sandbox at a guest mount point.
@@ -169,12 +178,47 @@ impl Default for SandboxBuilder {
                 env: Vec::new(),
                 confine_host: false,
                 vcpu_capacity: 128,
+                reproducible: false,
+                branch_quantum: 100_000,
+                syscall_quantum: 1024,
+                report_file: None,
             },
         }
     }
 }
 
 impl SandboxBuilder {
+    /// Require EROFS layers, Linux confinement, measured KVM and no ambient NIXVM settings.
+    #[must_use]
+    pub fn reproducible(mut self, yes: bool) -> Self {
+        self.config.reproducible = yes;
+        if yes {
+            self.config.confine_host = true;
+        }
+        self
+    }
+
+    /// Set the retired-branch fairness quantum used in reproducible mode.
+    #[must_use]
+    pub fn branch_quantum(mut self, branches: u64) -> Self {
+        self.config.branch_quantum = branches;
+        self
+    }
+
+    /// Set the syscall fairness quantum used in reproducible mode; zero disables it.
+    #[must_use]
+    pub fn syscall_quantum(mut self, calls: u32) -> Self {
+        self.config.syscall_quantum = calls;
+        self
+    }
+
+    /// Preserve a regular host report file across confinement.
+    #[must_use]
+    pub fn report_file(mut self, file: std::sync::Arc<std::fs::File>) -> Self {
+        self.config.report_file = Some(file);
+        self
+    }
+
     /// Set the command (argv) to run in the sandbox.
     #[must_use]
     pub fn command<I, S>(mut self, argv: I) -> Self
@@ -387,10 +431,71 @@ impl Sandbox {
     /// `root_squashfs`). The binary must be a static ELF today — dynamic linking
     /// is not yet wired.
     pub fn run(&self) -> Result<i32, Error> {
+        self.validate_reproducible()?;
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
+            crate::vcpu::validate_branch_watchdog()?;
+        }
         if self.config.confine_host {
             return self.run_confined();
         }
         self.run_mounts(self.build_mounts()?, None)
+    }
+
+    fn validate_reproducible(&self) -> Result<(), Error> {
+        if !self.config.reproducible {
+            return Ok(());
+        }
+        if !cfg!(all(
+            feature = "erofs",
+            target_os = "linux",
+            target_arch = "x86_64"
+        )) {
+            return Err(Error::Config(
+                "reproducible mode requires Linux x86-64 and the erofs feature".into(),
+            ));
+        }
+        if !matches!(&self.config.root, RootSource::Erofs(images) if !images.is_empty())
+            || self.config.work_dir.is_some()
+            || !self.config.binds.is_empty()
+        {
+            return Err(Error::Config(
+                "reproducible mode requires EROFS layers only; host directories are unavailable"
+                    .into(),
+            ));
+        }
+        if !self.config.confine_host
+            || self.config.ncpus != 1
+            || self.config.prefer_interp
+            || self.config.arch != Arch::X86_64
+        {
+            return Err(Error::Config(
+                "reproducible mode requires confinement and one measured KVM CPU".into(),
+            ));
+        }
+        if self.config.branch_quantum == 0 || self.config.branch_quantum > i64::MAX as u64 {
+            return Err(Error::Config(
+                "branch quantum must be in 1..=i64::MAX".into(),
+            ));
+        }
+        for (name, _) in std::env::vars_os() {
+            if name.as_encoded_bytes().starts_with(b"NIXVM_") {
+                return Err(Error::Config(format!(
+                    "reproducible mode rejects ambient setting {}",
+                    name.to_string_lossy()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn configure_kernel(&self, kernel: &mut Kernel) {
+        kernel.set_host_tty(!self.config.reproducible);
+        if self.config.reproducible {
+            kernel.set_stdin(Box::new(std::io::empty()));
+            kernel.set_syscall_quantum(self.config.syscall_quantum);
+            kernel.set_diagnostics(false);
+        }
     }
 
     fn run_mounts(
@@ -412,7 +517,7 @@ impl Sandbox {
             let backend = if prepared.backend.guest_arch() == arch {
                 prepared.backend
             } else {
-                if std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
+                if self.config.reproducible || std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
                     return Err(Error::Config("PMU requires an x86-64 guest".into()));
                 }
                 Box::new(InterpBackend::new(arch)?) as Box<dyn Backend>
@@ -451,7 +556,7 @@ impl Sandbox {
 
         let mut kernel = Kernel::with_random_seed(arch, mounts, self.config.random_seed);
         kernel.set_ncpus(self.config.ncpus);
-        kernel.set_host_tty(true);
+        self.configure_kernel(&mut kernel);
         kernel.set_cwd(if self.config.mode == RunMode::Booted {
             "/"
         } else {
@@ -514,7 +619,23 @@ impl Sandbox {
                 "virtual execution requires one scheduler CPU".into(),
             ));
         }
-        confinement::begin()?;
+
+        let reports = sandbox
+            .config
+            .report_file
+            .as_ref()
+            .map(std::os::fd::AsRawFd::as_raw_fd)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(file) = &sandbox.config.report_file
+            && !file
+                .metadata()
+                .map_err(|error| Error::Config(error.to_string()))?
+                .is_file()
+        {
+            return Err(Error::Config("host report must be a regular file".into()));
+        }
+        confinement::begin(&reports)?;
         let backend = sandbox.backend(sandbox.config.arch)?;
         let mem = GuestMemory::new_split(
             GUEST_BASE,
@@ -586,6 +707,8 @@ impl Sandbox {
         }
         confinement::restrict_filesystem(&directories)?;
         confinement::drop_thread_privileges()?;
+        resources.reports = reports;
+        resources.host_tty = !sandbox.config.reproducible;
         resources.install(!directories.is_empty())?;
         // No guest parsing or decompression occurs above this boundary.
         let lower = if let Some(directory) = directory_lower {
@@ -707,6 +830,7 @@ impl Sandbox {
     /// the target binary out of the guest root. Exposed now so it's testable
     /// and embeddable ahead of that.
     pub fn exec_elf(&self, elf: &[u8]) -> Result<i32, Error> {
+        self.validate_reproducible()?;
         if self.config.confine_host {
             return Err(Error::Config("host confinement is supported through Sandbox::run; exec_elf cannot bypass preparation".into()));
         }
@@ -739,7 +863,7 @@ impl Sandbox {
         let mut kernel =
             Kernel::with_random_seed(arch, self.build_mounts()?, self.config.random_seed);
         kernel.set_ncpus(self.config.ncpus);
-        kernel.set_host_tty(true);
+        self.configure_kernel(&mut kernel);
         kernel.set_cwd(if self.config.work_dir.is_some() {
             "/work"
         } else {
@@ -756,6 +880,17 @@ impl Sandbox {
     /// Select the execution backend per config: the interpreter when forced,
     /// otherwise the best hardware backend for the host.
     fn backend(&self, arch: Arch) -> Result<Box<dyn Backend>, Error> {
+        if self.config.reproducible {
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if arch == Arch::X86_64 {
+                return Ok(Box::new(vcpu::kvm::KvmBackend::with_branch_quantum(
+                    self.config.branch_quantum,
+                )?));
+            }
+            return Err(Error::Config(
+                "reproducible mode requires an x86-64 KVM guest".into(),
+            ));
+        }
         if self.config.prefer_interp {
             if std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
                 return Err(vcpu::VcpuError::Backend(
