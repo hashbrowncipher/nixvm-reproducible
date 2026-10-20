@@ -109,6 +109,20 @@ cargo build --release
 cargo test
 ```
 
+The PMU hardware checks require KVM and perf access. Run them explicitly; they
+fail if the required hardware or permissions are absent:
+
+```sh
+cargo test --offline --locked --test pmu -- --ignored --test-threads=1
+```
+
+PMU scheduling replaces wall-clock preemption and scheduler weighting. It does
+not make guest clocks, entropy, filesystem timestamps, or external I/O deterministic.
+The syscall-count limit still applies. A loop with no conditional branches and
+no syscalls cannot exhaust a conditional-branch budget. Embedders can select this
+mode through `KvmBackend::with_branch_quantum`; direct vCPU users call
+`begin_slice()` before each dispatched slice.
+
 On macOS/arm64 the HVF backend is exercised by a separate, `#[ignore]`d test
 suite (it needs a binary codesigned with the `com.apple.security.hypervisor`
 entitlement, which `cargo test` can't do for itself):
@@ -143,6 +157,11 @@ Useful environment variables (both harnesses):
   scheduler); default is `1` (single-threaded cooperative scheduling).
 - `NIXVM_TRACE=1` — log every dispatched syscall (`pid`, `pc`, name, raw
   number, args) to stderr.
+- `NIXVM_BRANCH_QUANTUM=N` — require KVM scheduling with an exact budget of
+  `N` retired conditional branches per slice. Requires Linux/x86-64, a supported
+  Intel CPU, access to guest-only perf counters, and `NIXVM_CPUS=1`. The backend
+  stops early on PMU overflow and single-steps to the target. Unsupported
+  hardware, counter scheduling failures, and late overflows fail the run.
 - `NIXVM_INTERP=1` — skip the hardware-backend probe in `vcpu::select` and run
   on the software interpreter (a debugging/parity escape hatch).
 - `NIXVM_NET=host` — enable host-passthrough network egress: guest sockets to

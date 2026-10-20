@@ -480,6 +480,12 @@ impl Sandbox {
     /// otherwise the best hardware backend for the host.
     fn backend(&self, arch: Arch) -> Result<Box<dyn Backend>, Error> {
         if self.config.prefer_interp {
+            if std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
+                return Err(vcpu::VcpuError::Backend(
+                    "PMU scheduling requires KVM; interpreter requested".into(),
+                )
+                .into());
+            }
             Ok(Box::new(InterpBackend::new(arch)?))
         } else {
             Ok(vcpu::select(arch)?)

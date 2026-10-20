@@ -18,6 +18,13 @@ use std::ffi::{c_char, c_int, c_ulong, c_void};
 unsafe extern "C" {
     pub fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     pub fn close(fd: c_int) -> c_int;
+    pub fn syscall(number: i64, ...) -> i64;
+    pub fn read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
+    pub fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+    pub fn pthread_sigmask(how: c_int, set: *const [u64; 16], old: *mut [u64; 16]) -> c_int;
+    pub fn sched_getcpu() -> c_int;
+    pub fn sched_getaffinity(pid: c_int, size: usize, mask: *mut [u64; 16]) -> c_int;
+    pub fn sched_setaffinity(pid: c_int, size: usize, mask: *const [u64; 16]) -> c_int;
     pub fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     pub fn mmap(
         addr: *mut c_void,
@@ -156,6 +163,16 @@ pub const KVM_SET_GUEST_DEBUG: c_ulong = 0x4048_AE9B;
 
 // `kvm_guest_debug.control` flags.
 pub const KVM_GUESTDBG_ENABLE: u32 = 0x0000_0001;
+pub const KVM_GUESTDBG_SINGLESTEP: u32 = 0x0000_0002;
+pub const KVM_GUESTDBG_BLOCKIRQ: u32 = 0x0010_0000;
+pub const KVM_SET_SIGNAL_MASK: c_ulong = 0x4004_ae8b;
+
+/// KVM uses an eight-byte kernel signal set, preceded by its length.
+#[repr(C)]
+pub struct kvm_signal_mask {
+    pub len: u32,
+    pub mask: [u8; 8],
+}
 pub const KVM_GUESTDBG_USE_HW_BP: u32 = 0x0002_0000;
 
 // `kvm_run.exit_reason` values this backend decodes.

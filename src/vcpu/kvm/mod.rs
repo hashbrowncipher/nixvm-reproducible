@@ -18,6 +18,7 @@
 //! under plain `cargo test` wherever `/dev/kvm` exists, and skip themselves
 //! where it doesn't.
 
+mod pmu;
 mod sys;
 mod vcpu;
 mod vm;
@@ -31,6 +32,7 @@ use super::{Backend, Vcpu, VcpuError};
 #[derive(Debug)]
 pub struct KvmBackend {
     vm: Arc<vm::Vm>,
+    branch_quantum: Option<u64>,
 }
 
 impl KvmBackend {
@@ -39,8 +41,27 @@ impl KvmBackend {
     /// [`crate::vcpu::select`] turns into an interpreter fallback — when KVM
     /// is unavailable or inaccessible.
     pub fn new() -> Result<Self, VcpuError> {
+        let branch_quantum = std::env::var_os("NIXVM_BRANCH_QUANTUM")
+            .map(|value| pmu::parse_quantum(&value.to_string_lossy()))
+            .transpose()?;
+        Self::configured(branch_quantum)
+    }
+
+    /// Require precise preemption after this many retired conditional branches.
+    /// This controls scheduling only; guest time, entropy and I/O remain separate.
+    pub fn with_branch_quantum(branches: u64) -> Result<Self, VcpuError> {
+        if branches == 0 || branches > i64::MAX as u64 {
+            return Err(VcpuError::Backend(
+                "branch quantum must be in 1..=i64::MAX".into(),
+            ));
+        }
+        Self::configured(Some(branches))
+    }
+
+    fn configured(branch_quantum: Option<u64>) -> Result<Self, VcpuError> {
         Ok(Self {
             vm: Arc::new(vm::Vm::new()?),
+            branch_quantum,
         })
     }
 }
@@ -55,7 +76,7 @@ impl Backend for KvmBackend {
     }
 
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
-        vcpu::KvmVcpu::new(self.vm.clone(), entry, stack)
+        vcpu::KvmVcpu::new(self.vm.clone(), entry, stack, self.branch_quantum)
     }
 }
 
