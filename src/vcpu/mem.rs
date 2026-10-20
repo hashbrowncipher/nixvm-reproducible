@@ -187,7 +187,7 @@ impl GuestMemory {
     ///
     /// This is the *only* constructor that mints a pool; every other address
     /// space in a run comes from [`GuestMemory::fork`] (which shares this pool) or
-    /// `GuestMemory::exec_reset` (which rebuilds within it).
+    /// `GuestMemory::new_exec` (which creates an empty space within it).
     #[must_use]
     pub fn new(base: u64, size: u64) -> Self {
         // The tied form (virtual bound == physical pool), used by tests.
@@ -1077,10 +1077,67 @@ impl GuestMemory {
         }
     }
 
+    /// An empty exec image in the same physical pool. The caller must either
+    /// install it or call `discard` to return its frames, including on load errors.
+    pub(crate) fn new_exec(&self) -> Result<Self, MemError> {
+        let mut fa = self.fa.lock().unwrap();
+        let exhausted = || MemError::Host("exec: frame pool exhausted".into());
+        let mut space = AddrSpace::new(&mut fa, &self.phys).ok_or_else(exhausted)?;
+        let scaffold = (|| {
+            ctrl::try_map_into(&mut space, &mut fa, &self.phys).map_err(|_| exhausted())?;
+            let frame = fa.alloc(&self.phys).ok_or_else(exhausted)?;
+            if space
+                .map(
+                    ctrl::KSTACK_PAGE_VA,
+                    frame,
+                    Prot::rw(),
+                    true,
+                    &mut fa,
+                    &self.phys,
+                )
+                .is_err()
+            {
+                fa.free(frame);
+                return Err(exhausted());
+            }
+            Ok(frame)
+        })();
+        let kstack_pa = match scaffold {
+            Ok(frame) => frame,
+            Err(error) => {
+                space.destroy(&mut fa, &self.phys);
+                return Err(error);
+            }
+        };
+        let npages = self.prot.len();
+        Ok(Self {
+            base: self.base,
+            size: self.size,
+            phys: Arc::clone(&self.phys),
+            fa: Arc::clone(&self.fa),
+            space,
+            prot: vec![Prot::NONE; npages],
+            mapped: vec![false; npages],
+            file_backed: vec![false; npages],
+            shared_anon: vec![false; npages],
+            fork_policy: std::collections::BTreeMap::new(),
+            tlb_dirty: false,
+            kstack_pa,
+            shared: self.shared,
+        })
+    }
+
+    /// Destroy an address space that will never run again, returning all of its
+    /// frames to the shared pool without allocating a replacement page table.
+    pub(crate) fn discard(self) {
+        self.space.destroy(&mut self.fa.lock().unwrap(), &self.phys);
+    }
+
     /// Tear down the current page tables (returning their frames to the pool) and
     /// install a fresh empty address space in the *same* pool — the `execve` seam.
     /// The `CR3` changes; a KVM vcpu picks the new value up on its next run. The
     /// loader then maps the new image into this same `GuestMemory`.
+    #[cfg(test)]
     pub(crate) fn exec_reset(&mut self) {
         self.reset_space();
     }
@@ -1380,6 +1437,51 @@ mod tests {
             baseline,
             "exec_reset returned all frames"
         );
+    }
+
+    #[test]
+    fn staged_exec_uses_the_same_pool_and_discard_returns_every_frame() {
+        let mut original = mem();
+        original.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        original.write_u64(0x1_0000, 42).unwrap();
+        let baseline = original.frames_in_use();
+        let original_cr3 = original.cr3();
+        for _ in 0..32 {
+            let mut replacement = original.new_exec().unwrap();
+            assert_eq!(replacement.phys_ptr(), original.phys_ptr());
+            assert_ne!(replacement.cr3(), original_cr3);
+            replacement.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+            replacement.write_u64(0x1_0000, 99).unwrap();
+            assert_eq!(original.read_u64(0x1_0000).unwrap(), 42);
+            replacement.discard();
+            assert_eq!(original.frames_in_use(), baseline);
+        }
+    }
+
+    #[test]
+    fn staged_exec_allocation_failure_preserves_the_original_and_returns_frames() {
+        let mut original = mem();
+        original.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
+        original.write_u64(0x1_0000, 42).unwrap();
+        let mut held = Vec::new();
+        {
+            let mut allocator = original.fa.lock().unwrap();
+            while let Some(frame) = allocator.alloc(&original.phys) {
+                held.push(frame);
+            }
+        }
+        // Fail at the root table, interior tables, and private kernel stack.
+        for _ in 0..5 {
+            let baseline = original.frames_in_use();
+            assert!(original.new_exec().is_err());
+            assert_eq!(original.frames_in_use(), baseline);
+            assert_eq!(original.read_u64(0x1_0000).unwrap(), 42);
+            original.fa.lock().unwrap().free(held.pop().unwrap());
+        }
+        let mut allocator = original.fa.lock().unwrap();
+        for frame in held {
+            allocator.free(frame);
+        }
     }
 
     #[test]

@@ -30,9 +30,9 @@ use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod attrs;
+pub mod egress;
 #[cfg(test)]
 mod exec_tests;
-pub mod egress;
 mod fcntl;
 mod fd;
 mod fs_ext;
@@ -4503,13 +4503,49 @@ impl Kernel {
         if elf.len() < 64 || elf[0..4] != [0x7f, b'E', b'L', b'F'] || elf[4] != 2 {
             return err(Errno::ENOEXEC);
         }
-        // Capture the launch identity for /proc/self/{cmdline,comm} before argv
-        // is moved into the spec: cmdline is argv NUL-joined; comm is the new
-        // program's basename (truncated to 15), which execve resets (a prior
-        // PR_SET_NAME does not survive exec).
-        cx.cur.cmdline = cmdline_bytes(&argv);
-        cx.cur.comm = comm_from_path(&script_name);
+        let interpreter = if let Some(path) = interp_path(&elf) {
+            let Some(bytes) = vfs.read_file(&path) else {
+                return err(Errno::ENOENT);
+            };
+            Some(bytes)
+        } else {
+            None
+        };
         let spec = ProcessSpec { argv, envp };
+        // Build the replacement before changing memory or process state. Both
+        // address spaces use the same pool, keeping the KVM memslot valid.
+        let mut replacement = match mem.new_exec() {
+            Ok(memory) => memory,
+            Err(_) => return err(Errno::ENOMEM),
+        };
+        let loaded = if let Some(bytes) = interpreter {
+            load_dynamic(&mut replacement, &elf, &bytes, &spec)
+        } else {
+            load_static(&mut replacement, &elf, &spec)
+        };
+        let img = match loaded {
+            Ok(image) => image,
+            Err(error) => {
+                if self.trace {
+                    eprintln!("[exec] {abs}: {error}");
+                }
+                replacement.discard();
+                return err(
+                    if matches!(
+                        error,
+                        crate::loader::LoadError::Mem(crate::vcpu::mem::MemError::Host(_))
+                    ) {
+                        Errno::ENOMEM
+                    } else {
+                        Errno::ENOEXEC
+                    },
+                );
+            }
+        };
+        // /proc/self/cmdline is argv NUL-joined. Exec resets comm to the
+        // program's basename, truncated to 15 bytes.
+        cx.cur.cmdline = cmdline_bytes(&spec.argv);
+        cx.cur.comm = comm_from_path(&script_name);
         // Point of no return. Record the new program image for `/proc/self/exe`.
         cx.cur.exe = abs.to_string();
         // execve resets every *caught* signal handler to SIG_DFL — the handler
@@ -4551,22 +4587,9 @@ impl Kernel {
             self.flush_shared_maps(vfs, cx, 0, 0, mem);
             cx.cur.shared_maps.clear();
         }
-        // Replace the image *in place*: tear down the old page tables (returning
-        // their frames to the shared pool) and rebuild within the SAME pool, so
-        // the one KVM memslot stays valid and the process just gets a new cr3.
-        mem.exec_reset();
+        // Install the loaded image and return the old image's frames to the pool.
+        std::mem::replace(mem, replacement).discard();
         self.pc_gc(mem);
-        let loaded = if let Some(interp) = interp_path(&elf) {
-            let Some(interp_elf) = self.read_file(vfs, &interp) else {
-                return err(Errno::ENOENT); // interpreter missing
-            };
-            load_dynamic(mem, &elf, &interp_elf, &spec)
-        } else {
-            load_static(mem, &elf, &spec)
-        };
-        let Ok(img) = loaded else {
-            return err(Errno::ENOEXEC);
-        };
         vcpu.reset(img.entry, img.stack_pointer);
         cx.cur.auxv = crate::loader::read_auxv(mem, img.stack_pointer);
         cx.cur.sigtramp = 0;

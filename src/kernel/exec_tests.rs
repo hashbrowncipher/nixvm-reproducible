@@ -53,7 +53,11 @@ fn file(mounts: &mut MountTable, path: &str, bytes: &[u8]) {
 fn dynamic_exec_follows_linker_symlinks() {
     for syscall in [Sysno::Execve, Sysno::Execveat] {
         for target in ["/linker", "linker"] {
-            let (kernel, mut memory, mut vcpu, mut context) = setup();
+            let (kernel, _, mut vcpu, mut context) = setup();
+            let mut memory = crate::vcpu::GuestMemory::new(BASE, 512 * PAGE_SIZE);
+            memory
+                .map(BASE, PAGE_SIZE, crate::vcpu::mem::Prot::rw())
+                .unwrap();
             {
                 let mut mounts = kernel.vfs.lock().unwrap();
                 file(&mut mounts, "/program", &elf(Some("/ld.so")));

@@ -22,7 +22,7 @@
 //! the CPU pushes onto the kernel stack.
 
 use super::mem::{PAGE_SIZE, Prot};
-use super::pagetable::AddrSpace;
+use super::pagetable::{AddrSpace, MapErr};
 use super::phys::{FrameAllocator, PhysMem};
 
 /// Top of the (old) identity window; the control block sits just below it, so
@@ -267,14 +267,24 @@ pub fn write_vvar(
 /// stack — that is per address space (see [`map_kstack`]). Call after creating or
 /// forking an address space.
 pub fn map_into(space: &mut AddrSpace, fa: &mut FrameAllocator, phys: &PhysMem) {
+    let _ = try_map_into(space, fa, phys);
+}
+
+/// Map the shared scaffold, reporting allocation failure to an exec transaction.
+pub(crate) fn try_map_into(
+    space: &mut AddrSpace,
+    fa: &mut FrameAllocator,
+    phys: &PhysMem,
+) -> Result<(), MapErr> {
     for (i, p) in PAGES.iter().enumerate() {
-        let _ = space.map(CTRL_GPA + p.voff, frame_pa(i), p.prot, true, fa, phys);
+        space.map(CTRL_GPA + p.voff, frame_pa(i), p.prot, true, fa, phys)?;
     }
     // The vDSO code (user read/execute) and its vvar data (user read-only) —
     // mapped `supervisor = false` so the guest can call the clock code at CPL3.
     // These are the only user-accessible control-block pages.
-    let _ = space.map(VDSO_VA, frame_pa(VDSO_FIDX), Prot::rx(), false, fa, phys);
-    let _ = space.map(VVAR_VA, frame_pa(VVAR_FIDX), Prot::READ, false, fa, phys);
+    space.map(VDSO_VA, frame_pa(VDSO_FIDX), Prot::rx(), false, fa, phys)?;
+    space.map(VVAR_VA, frame_pa(VVAR_FIDX), Prot::READ, false, fa, phys)?;
+    Ok(())
 }
 
 /// Map a private kernel-stack `frame` at [`KSTACK_PAGE_VA`] into `space`,
