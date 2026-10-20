@@ -215,3 +215,45 @@ fn solo_execution_does_not_count_and_contention_can_be_enabled_and_disabled() {
         "new contention gets a full quantum"
     );
 }
+
+#[test]
+#[ignore = "requires KVM and guest-only perf counters on a supported Intel CPU"]
+fn precision_tail_steps_multiple_branches_after_a_syscall_return() {
+    let backend = KvmBackend::with_branch_quantum(16).unwrap();
+    let mut memory = GuestMemory::new(BASE, 64 * 1024);
+    memory.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+    // SYSCALL; TEST RBX,RBX; JZ next; TEST RBX,RBX; JZ next; JMP start.
+    // SYSRET must not clear the host's precision stepping and execute both
+    // conditional branches in one KVM_RUN.
+    memory
+        .write_init(
+            BASE,
+            &[
+                0x0f, 0x05, 0x48, 0x85, 0xdb, 0x74, 1, 0x90, 0x48, 0x85, 0xdb, 0x74, 1, 0x90, 0xeb,
+                0xf0,
+            ],
+        )
+        .unwrap();
+    let mut cpu = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+    loop {
+        if cpu.run(&mut memory).unwrap() == Exit::Syscall {
+            break;
+        }
+    }
+    cpu.set_syscall_ret(0);
+    cpu.set_preemption_required(true);
+    cpu.begin_slice();
+    loop {
+        match cpu.run(&mut memory).unwrap() {
+            Exit::Syscall => cpu.set_syscall_ret(0),
+            Exit::Interrupted => break,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    assert_eq!(cpu.retired_branches(), Some(16));
+    assert_eq!(
+        cpu.rflags() & 0x100,
+        0,
+        "host TF must not leak to the guest"
+    );
+}
