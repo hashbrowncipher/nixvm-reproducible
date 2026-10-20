@@ -104,8 +104,16 @@ pub(crate) fn flag_string() -> String {
                 (8, "bmi2"),
                 (9, "erms"),
                 (18, "rdseed"),
+                (19, "adx"),
                 (20, "smap"),
+                (23, "clflushopt"),
+                (24, "clwb"),
+                (29, "sha_ni"),
             ],
+        ),
+        (
+            structured.ecx,
+            &[(8, "gfni"), (9, "vaes"), (10, "vpclmulqdq"), (22, "rdpid")],
         ),
         (structured.edx, &[(29, "arch_capabilities")]),
         (
@@ -118,7 +126,10 @@ pub(crate) fn flag_string() -> String {
                 (29, "lm"),
             ],
         ),
-        (extended.ecx, &[(0, "lahf_lm"), (5, "abm")]),
+        (
+            extended.ecx,
+            &[(0, "lahf_lm"), (5, "abm"), (8, "3dnowprefetch")],
+        ),
     ];
     words
         .iter()
@@ -197,6 +208,45 @@ mod tests {
         assert_eq!((ymm.eax, ymm.ebx, ymm.ecx, ymm.edx), (256, 576, 0, 0));
     }
 
+    /// The Ice Lake-SP floor's extensions, as (leaf, register index EAX..EDX, bit).
+    const ICE_LAKE_FEATURES: [(&str, u32, usize, u32); 14] = [
+        ("pclmulqdq", 1, 2, 1),
+        ("fma", 1, 2, 12),
+        ("aes", 1, 2, 25),
+        ("f16c", 1, 2, 29),
+        ("adx", 7, 1, 19),
+        ("clflushopt", 7, 1, 23),
+        ("clwb", 7, 1, 24),
+        ("sha_ni", 7, 1, 29),
+        ("gfni", 7, 2, 8),
+        ("vaes", 7, 2, 9),
+        ("vpclmulqdq", 7, 2, 10),
+        ("rdpid", 7, 2, 22),
+        ("abm", 0x8000_0001, 2, 5),
+        ("3dnowprefetch", 0x8000_0001, 2, 8),
+    ];
+
+    #[test]
+    fn profile_advertises_the_ice_lake_floor_and_keeps_excluded_features_off() {
+        for (name, leaf, register, bit) in ICE_LAKE_FEATURES {
+            let entry = query(leaf, 0);
+            let word = [entry.eax, entry.ebx, entry.ecx, entry.edx][register];
+            assert_ne!(word & (1 << bit), 0, "{name}");
+        }
+        // RDRAND, x2APIC and TSC-Deadline.
+        assert_eq!(query(1, 0).ecx & ((1 << 30) | (1 << 21) | (1 << 24)), 0);
+        let structured = query(7, 0);
+        // FSGSBASE, HLE, RTM, RDSEED and every AVX-512 bit.
+        let excluded = (1 << 0) | (1 << 4) | (1 << 11) | (1 << 18);
+        let avx512 = (1 << 16) | (1 << 17) | (1 << 21) | (7 << 26) | (3 << 30);
+        assert_eq!(structured.ebx & (excluded | avx512), 0);
+        // PKU, OSPKE and the AVX-512 VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ extensions.
+        let excluded = (1 << 1) | (1 << 3) | (1 << 4) | (1 << 6) | (3 << 11) | (1 << 14);
+        assert_eq!(structured.ecx & excluded, 0);
+        let xsave = query(0xd, 1); // XSAVEOPT, XSAVEC, XGETBV1, XSAVES.
+        assert_eq!((xsave.eax, xsave.ebx, xsave.ecx, xsave.edx), (0, 0, 0, 0));
+    }
+
     #[test]
     fn cpuinfo_flags_include_vectors_and_exclude_hidden_host_features() {
         let flags = super::flag_string();
@@ -204,7 +254,10 @@ mod tests {
         for name in ["xsave", "osxsave", "avx", "avx2", "bmi1", "bmi2", "rdtscp"] {
             assert!(flags.contains(&name), "missing {name}");
         }
-        for name in ["rdrand", "rdseed", "aes", "pclmulqdq", "x2apic"] {
+        for (name, ..) in ICE_LAKE_FEATURES {
+            assert!(flags.contains(&name), "missing {name}");
+        }
+        for name in ["rdrand", "rdseed", "x2apic"] {
             assert!(!flags.contains(&name), "unexpected {name}");
         }
     }

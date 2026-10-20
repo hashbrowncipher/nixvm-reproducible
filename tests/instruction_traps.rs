@@ -81,6 +81,43 @@ fn rdtsc_rdtscp_and_syscall_entry_advance_one_vm_counter() {
 }
 
 #[test]
+fn rdpid_reads_a_fixed_zero_tsc_aux_on_every_vcpu() {
+    let Some(backend) = backend() else { return };
+    let mut mem = GuestMemory::new(BASE, 64 * 1024);
+    mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+    // MOV RAX, -1; RDPID RAX; SYSCALL. RDPID runs natively and reads IA32_TSC_AUX.
+    mem.write_init(
+        BASE,
+        &[
+            0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xf3, 0x0f, 0xc7, 0xf8, 0x0f, 0x05,
+        ],
+    )
+    .unwrap();
+    let mut v = backend.new_vcpu(BASE, STACK).unwrap();
+    assert_eq!(run(v.as_mut(), &mut mem, false), Exit::Syscall);
+    assert_eq!(v.reg(0), 0, "new vCPU");
+    // Fork creates a vCPU; exec resets the caller's vCPU in place.
+    let mut child = v.fork();
+    for (name, cpu) in [("exec", &mut v), ("fork", &mut child)] {
+        cpu.reset(BASE, STACK);
+        assert_eq!(run(cpu.as_mut(), &mut mem, true), Exit::Syscall);
+        assert_eq!(cpu.reg(0), 0, "{name}");
+    }
+    let mut sibling = backend.new_vcpu(BASE, STACK).unwrap();
+    assert_eq!(run(sibling.as_mut(), &mut mem, false), Exit::Syscall);
+    assert_eq!(sibling.reg(0), 0, "sibling vCPU");
+
+    // Confined sandboxes hand a dropped vCPU's slot to the next one.
+    let pooled = KvmBackend::new().unwrap();
+    pooled.prepare_confinement(1, &mem).unwrap();
+    for owner in 0..3 {
+        let mut cpu = pooled.new_vcpu(BASE, STACK).unwrap();
+        assert_eq!(run(cpu.as_mut(), &mut mem, false), Exit::Syscall);
+        assert_eq!(cpu.reg(0), 0, "pooled slot owner {owner}");
+    }
+}
+
+#[test]
 fn prefixed_timestamps_can_end_at_a_page_boundary() {
     for opcode in [&[0x0f, 0x31][..], &[0x0f, 0x01, 0xf9][..]] {
         for prefixes in [

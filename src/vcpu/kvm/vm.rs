@@ -485,4 +485,44 @@ mod tests {
         let error = guest_cpuid(&supported).unwrap_err().to_string();
         assert!(error.contains("leaf 0x7/0x0 missing bits 0x20"), "{error}");
     }
+
+    #[test]
+    fn missing_any_ice_lake_feature_rejects_hardware() {
+        // (name, leaf, register index EAX..EDX, bit) for the Ice Lake-SP floor.
+        let features = [
+            ("PCLMULQDQ", 1, 2, 1),
+            ("FMA", 1, 2, 12),
+            ("AES", 1, 2, 25),
+            ("F16C", 1, 2, 29),
+            ("ADX", 7, 1, 19),
+            ("CLFLUSHOPT", 7, 1, 23),
+            ("CLWB", 7, 1, 24),
+            ("SHA", 7, 1, 29),
+            ("GFNI", 7, 2, 8),
+            ("VAES", 7, 2, 9),
+            ("VPCLMULQDQ", 7, 2, 10),
+            ("RDPID", 7, 2, 22),
+            ("LZCNT", 0x8000_0001, 2, 5),
+            ("PREFETCHW", 0x8000_0001, 2, 8),
+        ];
+        assert!(guest_cpuid(&supported_profile()).is_ok());
+        for (name, leaf, register, bit) in features {
+            let mut supported = supported_profile();
+            let entry = supported
+                .entries
+                .iter_mut()
+                .find(|entry| entry.function == leaf && entry.index == 0)
+                .unwrap();
+            let word = match register {
+                1 => &mut entry.ebx,
+                2 => &mut entry.ecx,
+                _ => unreachable!("feature words are in EBX or ECX"),
+            };
+            assert_ne!(*word & (1 << bit), 0, "{name} is in the profile");
+            *word &= !(1 << bit);
+            let error = guest_cpuid(&supported).unwrap_err().to_string();
+            let expected = format!("leaf {leaf:#x}/0x0 missing bits {:#x}", 1u32 << bit);
+            assert!(error.contains(&expected), "{name}: {error}");
+        }
+    }
 }
