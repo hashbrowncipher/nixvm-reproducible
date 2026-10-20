@@ -1144,4 +1144,31 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn interrupted_user_pc_is_not_a_supervisor_exception_frame() {
+        let vm = match Vm::new() {
+            Ok(vm) => Arc::new(vm),
+            Err(error) => {
+                eprintln!("skipping KVM user interruption test: {error}");
+                return;
+            }
+        };
+        let mut v = KvmVcpu::create(vm).unwrap();
+        for trampoline in [FAULT_TRAMP_VA, FAULT_TRAMP_VA + 0x10, FAULT_TRAMP_VA + 0x20] {
+            for past_hlt in [0, 1] {
+                v.regs.rip = trampoline + past_hlt;
+                v.regs.rsp = 0x18000;
+                v.regs.rflags = 0x246;
+                v.regs_dirty = false;
+                v.sregs_dirty = false;
+                v.decode_exit(sys::KVM_EXIT_INTR).unwrap();
+                assert_eq!(v.regs.rip, trampoline + past_hlt);
+                assert_eq!(v.regs.rsp, 0x18000);
+                assert_eq!(v.regs.rflags, 0x246);
+                assert_eq!(v.sregs.cs.selector, SEL_UCODE);
+                assert!(!v.regs_dirty && !v.sregs_dirty);
+            }
+        }
+    }
 }
