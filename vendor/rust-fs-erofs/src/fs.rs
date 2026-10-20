@@ -1,0 +1,2512 @@
+//! Top-level read-only EROFS filesystem handle.
+//!
+//! Dispatches every data layout the crate supports: FLAT_PLAIN,
+//! FLAT_INLINE, chunk-based, and compressed clusters via
+//! [`crate::zmap`] and [`crate::decompress`].
+
+use crate::chunked::{self, EROFS_NULL_ADDR};
+use crate::decompress::{self};
+use crate::dir::{iter_block, visit_block, DirEntry};
+use crate::error::{Error, Result};
+use crate::inode::Inode;
+use crate::layout::DataLayout;
+use crate::superblock::{self, ComprCfgs, Superblock, EROFS_FEATURE_INCOMPAT_ZERO_PADDING};
+use crate::xattr::{self, XattrLongPrefix};
+use crate::zmap::{self, Z_EROFS_LCLUSTER_TYPE_PLAIN};
+use fs_core::BlockRead;
+use lru::LruCache;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Default capacity (in pcluster entries) for the decompression cache.
+///
+/// This bounds the NUMBER of entries only. It is not a memory ceiling on
+/// its own: a pcluster may legitimately decode to several megabytes
+/// (up to [`MAX_PCLUSTER_SIZE`], 12 MiB), so 256 of them could retain
+/// gigabytes. The memory ceiling is [`DEFAULT_PCLUSTER_CACHE_BYTES`],
+/// enforced alongside this count (#77). Callers can opt down, or out via
+/// `set_pcluster_cache_capacity(0)`.
+pub const DEFAULT_PCLUSTER_CACHE_CAPACITY: usize = 256;
+
+/// Most decoded bytes the decompression cache retains, whatever the entry
+/// count. Least-recently-used entries are evicted until the total fits; a
+/// single pcluster larger than this is decoded and served but not cached.
+pub const DEFAULT_PCLUSTER_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default capacity, in device blocks, of the metadata cache.
+///
+/// A different cache from the one above and for a different thing: that
+/// one holds decompressed pclusters, this one holds raw blocks, and the
+/// blocks it holds are the ones the codec never sees — inodes,
+/// directory blocks, xattr tables, extent maps. 512 blocks is 2 MiB at
+/// a 4 KiB block size, sized to hold the metadata a directory walk
+/// touches rather than to hold data, which passes straight through.
+pub const DEFAULT_METADATA_CACHE_BLOCKS: usize = 512;
+
+/// Internal state of the decompressed-pcluster LRU cache. Keyed by
+/// `(inode.nid, pcluster_blkaddr)` so the same compressed payload at
+/// the same on-disk blkaddr referenced by two different inodes never
+/// collides — an unlikely but legal arrangement under BIG_PCLUSTER
+/// where multiple inodes can share a blkaddr range.
+struct PclusterCache {
+    /// `None` when capacity was set to 0 (caching disabled). We keep
+    /// the Mutex around so the read path can observe the disabled
+    /// state cheaply without an outer Option dance.
+    // The (nid, pcluster_idx) -> decompressed-block mapping is local to
+    // this struct; introducing a top-level type alias would just push the
+    // complexity around without aiding readability.
+    #[allow(clippy::type_complexity)]
+    inner: Option<LruCache<PclusterKey, Arc<Vec<u8>>>>,
+    /// Decoded bytes currently retained by `inner`.
+    bytes: usize,
+    /// Ceiling on `bytes`.
+    byte_limit: usize,
+    /// Counts cache hits, for tests + diagnostics. Never wraps in
+    /// realistic workloads (u64 is fine).
+    hits: u64,
+    /// Counts cache misses (i.e. real decompress invocations). Pairs
+    /// with `hits` for hit-rate calculation in tests / perf demos.
+    misses: u64,
+}
+
+impl PclusterCache {
+    fn new(capacity: usize) -> Self {
+        let inner = NonZeroUsize::new(capacity).map(LruCache::new);
+        PclusterCache {
+            inner,
+            bytes: 0,
+            byte_limit: DEFAULT_PCLUSTER_CACHE_BYTES,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// Insert, then evict least-recently-used entries until the retained
+    /// bytes fit the byte limit as well as the entry count. No-op when
+    /// caching is disabled.
+    fn insert(&mut self, key: PclusterKey, value: Arc<Vec<u8>>) {
+        let Some(lru) = self.inner.as_mut() else {
+            return;
+        };
+        let len = value.len();
+        if len > self.byte_limit {
+            // Retaining it would evict everything else and still exceed
+            // the ceiling.
+            return;
+        }
+        self.bytes += len;
+        // `push` hands back whatever it displaced: the previous value for
+        // this key, or the LRU entry evicted by the entry-count bound.
+        if let Some((_, displaced)) = lru.push(key, value) {
+            self.bytes -= displaced.len();
+        }
+        while self.bytes > self.byte_limit {
+            match lru.pop_lru() {
+                Some((_, evicted)) => self.bytes -= evicted.len(),
+                None => break,
+            }
+        }
+    }
+}
+
+pub struct Filesystem {
+    /// Primary backing device. All metadata reads (superblock, COMPR_CFGS
+    /// blob, inodes, xattrs, the device table itself) go through this
+    /// device. Data reads with `device_id == 0` also go here.
+    primary: Arc<dyn BlockRead>,
+    /// The primary device underneath the metadata cache, for file data
+    /// (#69). The same handle as `primary` unless
+    /// [`Filesystem::open_with_cache`] put a cache in between.
+    ///
+    /// File data used to go through the cache one block at a time. A
+    /// one-block read never trips the cache's large-read bypass, so each
+    /// data block was cached on its merits, and reading one 2 MiB file
+    /// evicted every metadata block the default cache holds. Directory and
+    /// symlink blocks are still read through `primary`: path resolution
+    /// re-reads them, and they are what the cache is for.
+    data: Arc<dyn BlockRead>,
+    /// Extra backing devices for multi-device images. Indexed by
+    /// `(device_id - 1)`; a `device_id == k > 0` in a chunkmap or zmap
+    /// entry routes to `extras[k - 1]`. Stays empty for
+    /// single-device images opened via [`Filesystem::open`].
+    extras: Vec<Arc<dyn BlockRead>>,
+    sb: Superblock,
+    /// Lazily-loaded "packed inode" used when files carry the
+    /// `Z_EROFS_ADVISE_FRAGMENT_PCLUSTER` advise bit. The packed
+    /// inode is itself a regular compressed inode (often ztailpacked
+    /// or compacted); we read it through the standard `read_file`
+    /// path. We cache it via `OnceLock` so that fragment-bearing
+    /// files don't re-read the inode body on every byte access.
+    packed_inode: OnceLock<Inode>,
+    /// Lazily-loaded custom xattr prefix dictionary. Read on first call
+    /// to [`Filesystem::xattrs`] (or any other xattr resolver) and
+    /// cached for the lifetime of the filesystem since dictionary
+    /// contents don't change mid-image.
+    xattr_prefix_dict: OnceLock<Vec<XattrLongPrefix>>,
+    /// Parsed COMPR_CFGS blob (per-codec configuration). `None` means
+    /// the SB doesn't advertise `EROFS_FEATURE_INCOMPAT_COMPR_CFGS`
+    /// or the blob hasn't been read yet; populated on
+    /// [`Filesystem::open`] so the read path can pass codec configs
+    /// in without an extra device round-trip per cluster.
+    compr_cfgs: Option<ComprCfgs>,
+    /// LRU of decompressed pcluster bytes, keyed by
+    /// `(inode.nid, pcluster_blkaddr)`. Sequential reads of a multi-
+    /// block compressed inode otherwise pay the LZ4/LZMA/DEFLATE cost
+    /// once per block; with the cache they pay once per pcluster.
+    /// PLAIN clusters bypass the cache (already a single direct read).
+    pcluster_cache: Mutex<PclusterCache>,
+}
+
+/// The largest span a physical cluster may decode to.
+///
+/// This is `Z_EROFS_PCLUSTER_MAX_DSIZE`, the kernel's ceiling on a
+/// pcluster's DECODED length. It is not the same number as the ceiling
+/// on its length ON DISK, which is `Z_EROFS_PCLUSTER_MAX_SIZE` -- 1 MiB,
+/// the one `mkfs.erofs -C` sets and refuses to exceed.
+///
+/// That distinction was got wrong once, and the 1 MiB number was applied
+/// here. It refused ordinary images. Measured with erofs-utils on a
+/// 64 MiB file of zeros at a 4 KiB block size, largest decoded span per
+/// pcluster:
+///
+/// ```text
+///   -zlz4hc                     1,041,954     (just under 1 MiB)
+///   -zlz4hc -C16384             4,175,394
+///   -zlz4hc -C65536             8,192,000     (mkfs's own default cap)
+///   -zlz4hc -C1048576           8,192,000
+/// ```
+///
+/// So the compressed cluster is bounded at 1 MiB and what it decodes to
+/// is not. 12 MiB is what the kernel will accept.
+///
+/// The bound matters because a pcluster's decoded span is the size of
+/// the buffer the decoder writes into, and for the last pcluster of a
+/// file that span's end is simply the inode's declared size -- an
+/// unvalidated `u64`. A 1.3 MB image asked a 64 KiB read for a 281 TB
+/// allocation, which `handle_alloc_error` answers by aborting: the FFI
+/// boundary's `catch_unwind` never sees it and the host process dies.
+pub const MAX_PCLUSTER_SIZE: u64 = 12 * 1024 * 1024;
+
+/// What identifies a decompressed physical cluster.
+///
+/// The inode it belongs to, where it starts on the device, and which
+/// span of the file it covers. The span is part of it because two HEAD
+/// lclusters of one inode may name the same block address and cover
+/// different spans -- see `read_compressed_block`.
+type PclusterKey = (u64, u32, u64, u64);
+
+/// The longest a symbolic link's target can be.
+///
+/// `PATH_MAX`, because a symlink target is a path and the operating
+/// system will not accept a longer one. The inode's declared size is an
+/// unvalidated `u64`.
+pub const MAX_SYMLINK_TARGET: u64 = 4096;
+
+/// Where byte `off` of an interlaced PLAIN extent sits in its pcluster's
+/// `on_disk_len` bytes, when the extent starts `head_in_block` bytes into
+/// a block of `bs` (#49).
+///
+/// The kernel's `Z_EROFS_COMPRESSION_INTERLACED` copy takes the extent's
+/// first `bs - head_in_block` bytes from the tail of the last block and
+/// the rest from the start of the first: a rotation of the pcluster by
+/// `on_disk_len - (bs - head_in_block)`. For a one-block pcluster that is
+/// just `head_in_block`.
+fn interlaced_index(on_disk_len: usize, bs: usize, head_in_block: usize, off: usize) -> usize {
+    (on_disk_len - (bs - head_in_block) + off) % on_disk_len
+}
+
+/// How many bytes a physical cluster covers of the file, or a refusal.
+fn pcluster_span(start_byte: u64, end_byte: u64) -> Result<usize> {
+    let span = end_byte
+        .checked_sub(start_byte)
+        .ok_or(Error::BadInode("pcluster ends before it starts"))?;
+    if span > MAX_PCLUSTER_SIZE {
+        return Err(Error::BadInode(
+            "pcluster covers more of the file than a pcluster can",
+        ));
+    }
+    Ok(span as usize)
+}
+
+impl Filesystem {
+    /// Open an EROFS image. Reads + validates the superblock.
+    ///
+    /// We accept images with `EROFS_FEATURE_INCOMPAT_FRAGMENTS` set
+    /// even when `packed_nid == 0`: modern mkfs.erofs sets the
+    /// feature bit speculatively (e.g. when `-Eztailpacking` alone
+    /// is requested) and only populates `packed_nid` when an actual
+    /// fragment-bearing inode is emitted. The malformedness check is
+    /// therefore deferred to fragment-redirect time -- if a file's
+    /// zmap header claims a fragment but `packed_nid` is still zero
+    /// we return `Error::BadInode` from [`Self::packed_inode`].
+    pub fn open(dev: Arc<dyn BlockRead>) -> Result<Self> {
+        Self::open_with_cache(dev, DEFAULT_METADATA_CACHE_BLOCKS)
+    }
+
+    /// Open an image, caching `blocks` metadata blocks.
+    ///
+    /// # This is a second cache, not the first
+    ///
+    /// [`Filesystem`] already holds `pcluster_cache`, which keeps
+    /// **decompressed** pclusters: a hit there skips a decompression as
+    /// well as a read, which is why it sits above the codec.
+    ///
+    /// What that cache does not hold is anything the codec never
+    /// touched — the superblock, inodes, directory blocks, the xattr
+    /// tables, the extent maps. Every one of those was read from the
+    /// device each time it was wanted, including the same directory
+    /// re-read for every path resolved through it.
+    ///
+    /// This cache is keyed by device block and sits underneath both:
+    /// the pcluster cache's own misses are served from it when the
+    /// blocks are still held.
+    ///
+    /// `blocks` of zero disables it, which is what the measurement in
+    /// `tests/read_path_cost.rs` uses to take its baseline.
+    pub fn open_with_cache(dev: Arc<dyn BlockRead>, blocks: usize) -> Result<Self> {
+        if blocks == 0 {
+            return Self::open_with_devices(dev, Vec::new());
+        }
+        // The block size is not known until the superblock has been
+        // read, and the superblock is at a fixed offset, so this one
+        // read goes to the device directly.
+        let sb = superblock::read(&*dev)?;
+        let block_size = 1u64 << sb.blkszbits;
+        let cached: Arc<dyn BlockRead> =
+            fs_core::CachingDevice::read_only(dev.clone(), block_size, blocks);
+        Self::open_split(cached, dev, Vec::new())
+    }
+
+    /// Multi-device open. The caller supplies the primary device plus
+    /// one [`BlockRead`] per extra device the SB advertises (in
+    /// `device_id` order: `extras[0]` is `device_id == 1`,
+    /// `extras[1]` is `device_id == 2`, …).
+    ///
+    /// Validates `extras.len() == sb.extra_devices`; mismatches return
+    /// [`Error::BadSuperblock`] with the `"extra device count
+    /// mismatch"` reason. Use [`Filesystem::read_device_table`] before
+    /// this call if you need to inspect the SB's tag/blocks fields to
+    /// pick the right backings.
+    pub fn open_with_devices(
+        primary: Arc<dyn BlockRead>,
+        extras: Vec<Arc<dyn BlockRead>>,
+    ) -> Result<Self> {
+        let data = primary.clone();
+        Self::open_split(primary, data, extras)
+    }
+
+    /// `primary` serves metadata, `data` serves file contents; they are
+    /// the same image, so a read-only split has nothing to keep coherent.
+    fn open_split(
+        primary: Arc<dyn BlockRead>,
+        data: Arc<dyn BlockRead>,
+        extras: Vec<Arc<dyn BlockRead>>,
+    ) -> Result<Self> {
+        let sb = superblock::read(&*primary)?;
+        // Before anything is read on the strength of this superblock: an
+        // incompatible feature this reader does not implement changes
+        // what the rest of the image means (#51, #45).
+        sb.check_incompat_features()?;
+        if extras.len() != sb.extra_devices as usize {
+            return Err(Error::BadSuperblock("extra device count mismatch"));
+        }
+        // Parse the COMPR_CFGS blob eagerly when the SB advertises it.
+        // The blob is at most a few hundred bytes, sits at a fixed
+        // offset, and the parsed result lives for the FS handle's
+        // lifetime -- amortising the cost over every compressed-cluster
+        // read. Errors here propagate (a malformed blob is a hard image
+        // error; we'd rather fail open than risk wrong codec params).
+        let compr_cfgs = superblock::read_compr_cfgs(&*primary, &sb)?;
+        Ok(Filesystem {
+            primary,
+            data,
+            extras,
+            sb,
+            packed_inode: OnceLock::new(),
+            xattr_prefix_dict: OnceLock::new(),
+            compr_cfgs,
+            pcluster_cache: Mutex::new(PclusterCache::new(DEFAULT_PCLUSTER_CACHE_CAPACITY)),
+        })
+    }
+
+    /// Read the on-disk device table. Returns [`superblock::DeviceSlot`]
+    /// for each `device_id >= 1` (`device_id == 0` is the primary
+    /// device and has no slot of its own). Useful for callers that
+    /// need to inspect tags / sizes BEFORE opening the actual
+    /// extra-device backings to pass into [`Self::open_with_devices`].
+    pub fn read_device_table(&self) -> Result<Vec<superblock::DeviceSlot>> {
+        superblock::read_device_table(&*self.primary, &self.sb)
+    }
+
+    /// Resolve `device_id` to a backing handle. `0` is the primary
+    /// device; `>= 1` indexes into the extras table. Out-of-range ids
+    /// return [`Error::BadSuperblock`].
+    fn device_for(&self, device_id: u16) -> Result<&dyn BlockRead> {
+        if device_id == 0 {
+            Ok(&*self.primary)
+        } else {
+            let idx = device_id as usize - 1;
+            self.extras
+                .get(idx)
+                .map(|a| a.as_ref())
+                .ok_or(Error::BadSuperblock("device_id out of range"))
+        }
+    }
+
+    /// [`Self::read_block`] for file contents: `device_id == 0` reads the
+    /// primary device below the metadata cache rather than through it
+    /// (#69).
+    fn read_data(&self, device_id: u16, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let dev = self.data_device_for(device_id)?;
+        dev.read_at(offset, buf)?;
+        Ok(())
+    }
+
+    fn data_device_for(&self, device_id: u16) -> Result<&dyn BlockRead> {
+        if device_id == 0 {
+            Ok(&*self.data)
+        } else {
+            self.device_for(device_id)
+        }
+    }
+
+    /// Multi-device dispatch helper. Reads `buf.len()` bytes at byte
+    /// offset `offset` from the device identified by `device_id`.
+    /// `device_id == 0` is the primary device; `>= 1` routes through
+    /// the extras table. Used by chunked / zmap read paths so the
+    /// dispatch shape stays uniform across single- and multi-device
+    /// images.
+    pub fn read_block(&self, device_id: u16, offset: u64, buf: &mut [u8]) -> Result<()> {
+        let dev = self.device_for(device_id)?;
+        dev.read_at(offset, buf)?;
+        Ok(())
+    }
+
+    /// Builder-style override of the decompressed-pcluster cache
+    /// capacity. `0` disables caching entirely (useful for memory-
+    /// constrained configs and for the cache's own benchmark tests).
+    /// Replaces the existing cache wholesale, dropping any prior
+    /// entries. Default capacity is [`DEFAULT_PCLUSTER_CACHE_CAPACITY`].
+    pub fn with_pcluster_cache_capacity(self, n: usize) -> Self {
+        *self.pcluster_cache.lock().expect("cache lock") = PclusterCache::new(n);
+        self
+    }
+
+    /// Resize the decompressed-pcluster cache at runtime. `0` disables
+    /// caching; any other value resets the cache to a fresh LRU of
+    /// that capacity (existing entries dropped — simpler and safer
+    /// than trying to migrate them between LRU instances).
+    pub fn set_pcluster_cache_capacity(&self, n: usize) {
+        *self.pcluster_cache.lock().expect("cache lock") = PclusterCache::new(n);
+    }
+
+    /// Diagnostics + test hook: returns
+    /// `(entries, capacity, hits, misses)` for the decompressed-
+    /// pcluster cache. `capacity == 0` means the cache is disabled and
+    /// `entries` is always 0 in that mode. Surfaced as a public method
+    /// so unit tests can assert that hot-path reads actually populate
+    /// (and re-hit) the cache rather than silently re-decompressing.
+    pub fn pcluster_cache_stats(&self) -> (usize, usize, u64, u64) {
+        let g = self.pcluster_cache.lock().expect("cache lock");
+        let (entries, capacity) = match &g.inner {
+            Some(lru) => (lru.len(), lru.cap().get()),
+            None => (0, 0),
+        };
+        (entries, capacity, g.hits, g.misses)
+    }
+
+    /// Decoded COMPR_CFGS blob, if the SB advertises it. Returns
+    /// `None` when the feature bit is clear (the common case for
+    /// images built before the LZMA-via-cfgs convention took hold).
+    pub fn compr_cfgs(&self) -> Option<&ComprCfgs> {
+        self.compr_cfgs.as_ref()
+    }
+
+    /// Lazily-load + cache the custom xattr prefix dictionary. Returns a
+    /// borrowed slice; an empty dictionary is the common case (no
+    /// `--xattr-prefix=` flags at mkfs time) and incurs no I/O after the
+    /// first call.
+    pub fn xattr_prefix_dict(&self) -> Result<&[XattrLongPrefix]> {
+        if let Some(cached) = self.xattr_prefix_dict.get() {
+            return Ok(cached.as_slice());
+        }
+        let dict = xattr::read_xattr_prefix_dictionary(&*self.primary, &self.sb)?;
+        let _ = self.xattr_prefix_dict.set(dict);
+        Ok(self.xattr_prefix_dict.get().expect("just set").as_slice())
+    }
+
+    /// Read all xattrs of an inode and resolve each entry's full
+    /// (namespace-prefixed) name. Returns `(full_name, value)` pairs in
+    /// on-disk order: inline entries first, shared entries second.
+    ///
+    /// Pulls inline xattrs and any shared-area entries referenced by the
+    /// inline shared-index suffix, then resolves each entry's
+    /// `name_index + name` through the cached prefix dictionary so
+    /// custom-prefix attributes (e.g. those produced by
+    /// `mkfs.erofs --xattr-prefix=`) come back with their full
+    /// human-readable names like `user.dataitem.thing`.
+    pub fn xattrs(&self, inode: &Inode) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let entries = xattr::read_all_xattrs(&*self.primary, &self.sb, inode)?;
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dict = self.xattr_prefix_dict()?;
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            let full = xattr::resolve_with_dict(e.name_index, &e.name, dict)?;
+            out.push((full, e.value));
+        }
+        Ok(out)
+    }
+
+    pub fn superblock(&self) -> &Superblock {
+        &self.sb
+    }
+
+    pub fn root_inode(&self) -> Result<Inode> {
+        Inode::read(&*self.primary, &self.sb, self.sb.root_nid as u64)
+    }
+
+    pub fn read_inode(&self, nid: u64) -> Result<Inode> {
+        Inode::read(&*self.primary, &self.sb, nid)
+    }
+
+    /// Lazily-load + cache the superblock's "packed inode" (the
+    /// shared cross-file fragment store). Returns a borrowed
+    /// reference so the caller can pass it through `read_file` to
+    /// fetch fragment bytes. Only meaningful when the SB advertises
+    /// `EROFS_FEATURE_INCOMPAT_FRAGMENTS`; we don't gate on the bit
+    /// here because some images set the advise bit per-inode without
+    /// the SB-level bit (tolerated reads, ergonomic for one-off
+    /// writers — kernel mkfs.erofs always sets the SB bit).
+    fn packed_inode(&self) -> Result<&Inode> {
+        if let Some(cached) = self.packed_inode.get() {
+            return Ok(cached);
+        }
+        if self.sb.packed_nid == 0 {
+            return Err(Error::BadInode(
+                "packed_nid is zero; cannot load packed inode",
+            ));
+        }
+        let inode = Inode::read(&*self.primary, &self.sb, self.sb.packed_nid)?;
+        // Race-resistant cache fill: if another caller raced ahead,
+        // discard the local copy and use theirs.
+        let _ = self.packed_inode.set(inode);
+        Ok(self.packed_inode.get().expect("just set"))
+    }
+
+    /// List all entries under a directory inode. The directory's data
+    /// is laid out as N consecutive blocks of dirents starting at
+    /// `inode.raw_u * blocksize` for FLAT_PLAIN, or with the last block
+    /// inlined for FLAT_INLINE.
+    pub fn read_dir(&self, inode: &Inode) -> Result<Vec<DirEntry>> {
+        if !inode.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        let bs = self.sb.block_size();
+        let mut out = Vec::new();
+        let mut remaining = inode.size;
+        let mut block_idx: u64 = 0;
+        let total_blocks = inode.size.div_ceil(bs);
+        let zmap = self.zmap_for(inode)?;
+
+        while remaining > 0 {
+            let this_block = remaining.min(bs);
+            let mut buf = vec![0u8; this_block as usize];
+            self.read_data_block(inode, block_idx, total_blocks, zmap.as_ref(), &mut buf)?;
+            // Pad short last blocks back up to bs for iter_block's NUL
+            // scan -- iter_block expects to find the trailing zeros.
+            if buf.len() < bs as usize {
+                buf.resize(bs as usize, 0);
+            }
+            let entries = iter_block(&buf)?;
+            out.extend(entries);
+            remaining -= this_block;
+            block_idx += 1;
+        }
+        Ok(out)
+    }
+
+    /// Look up a single name in a directory.
+    ///
+    /// Linear scan. EROFS sorts dirents by name hash on disk so a
+    /// binary search is possible; this does not do it, which is a cost
+    /// on very large directories and nothing else.
+    ///
+    /// NOT BY LISTING (#61). This called `read_dir`, which gives every
+    /// entry an owned copy of its name, and then compared one of them: one
+    /// allocation per entry per path component. It now walks the same
+    /// blocks with [`visit_block`], comparing borrowed names. Every block is
+    /// still read and validated, so a malformed directory is refused exactly
+    /// as a listing would refuse it, and the first match wins as before.
+    pub fn lookup(&self, dir: &Inode, name: &[u8]) -> Result<Inode> {
+        if !dir.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        let bs = self.sb.block_size();
+        let total_blocks = dir.size.div_ceil(bs);
+        let zmap = self.zmap_for(dir)?;
+        let mut remaining = dir.size;
+        let mut block_idx: u64 = 0;
+        let mut found: Option<u64> = None;
+        let mut buf = Vec::new();
+        while remaining > 0 {
+            let this_block = remaining.min(bs);
+            buf.clear();
+            buf.resize(this_block as usize, 0);
+            self.read_data_block(dir, block_idx, total_blocks, zmap.as_ref(), &mut buf)?;
+            // Padded back to bs for the NUL scan, as in `read_dir`.
+            buf.resize(bs as usize, 0);
+            visit_block(&buf, |nid, _, entry| {
+                if found.is_none() && entry == name {
+                    found = Some(nid);
+                }
+            })?;
+            remaining -= this_block;
+            block_idx += 1;
+        }
+        match found {
+            Some(nid) => self.read_inode(nid),
+            None => Err(Error::NotFound),
+        }
+    }
+
+    /// Resolve a `/`-separated path starting at the root. Symlinks are
+    /// returned as-is (not followed); use [`Filesystem::resolve_path`]
+    /// for following.
+    pub fn lookup_path(&self, path: &str) -> Result<Inode> {
+        self.lookup_path_bytes(path.as_bytes())
+    }
+
+    /// Resolve a `/`-separated path given as bytes.
+    ///
+    /// THIS IS THE REAL ONE, and the `&str` wrapper above is the
+    /// convenience. EROFS directory entry names are raw bytes and the
+    /// format has no field that could say what encoding they are in, so
+    /// a name is not text until somebody decides what to read it as,
+    /// and this crate never decides. Components are compared byte for
+    /// byte against the on-disk entry, so a name handed out by a
+    /// listing always resolves when handed back (#148).
+    pub fn lookup_path_bytes(&self, path: &[u8]) -> Result<Inode> {
+        let mut node = self.root_inode()?;
+        for component in path.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+            node = self.lookup(&node, component)?;
+        }
+        Ok(node)
+    }
+
+    /// Read a symlink's target. EROFS stores the target string as the
+    /// symlink inode's data, with `i_size` = byte length of the target.
+    /// Layout is FLAT_INLINE for short targets and FLAT_PLAIN for longer
+    /// ones; both are handled by the regular [`Filesystem::read_file`]
+    /// path.
+    ///
+    /// Returns the raw bytes of the target (typically UTF-8, but EROFS
+    /// preserves whatever bytes were stored at mkfs time).
+    pub fn read_symlink_target(&self, inode: &Inode) -> Result<Vec<u8>> {
+        if !inode.is_symlink() {
+            return Err(Error::BadInode("read_symlink_target on non-symlink"));
+        }
+        // A symlink target is a path, and no path is longer than
+        // PATH_MAX. `Inode::size` is an unvalidated u64 off the disk,
+        // and this allocated it before reading a byte: an extended
+        // inode declaring 2^56 aborted the process out of
+        // `fs_erofs_readlink`, through `handle_alloc_error`, which
+        // `ffi_guard`'s `catch_unwind` cannot intercept.
+        if inode.size > MAX_SYMLINK_TARGET {
+            return Err(Error::BadInode(
+                "symlink target is longer than any path can be",
+            ));
+        }
+        let mut buf = vec![0u8; inode.size as usize];
+        if !buf.is_empty() {
+            self.read_file(inode, 0, &mut buf)?;
+        }
+        Ok(buf)
+    }
+
+    /// Resolve a path with optional symlink following.
+    ///
+    /// When `follow_symlinks` is false this is identical to
+    /// [`Filesystem::lookup_path`] -- a leaf symlink is returned as-is.
+    ///
+    /// When `follow_symlinks` is true, every symlink encountered (both
+    /// mid-path components and the leaf) is expanded: absolute targets
+    /// restart resolution from the root, relative targets resolve
+    /// against the symlink's parent directory.
+    ///
+    /// Loop / depth protection caps total symlink expansions at 40,
+    /// matching Linux's `MAXSYMLINKS`. On overflow, returns
+    /// `Error::BadInode("symlink loop")`.
+    pub fn resolve_path(&self, path: &str, follow_symlinks: bool) -> Result<Inode> {
+        if !follow_symlinks {
+            return self.lookup_path(path);
+        }
+
+        const MAXSYMLINKS: u32 = 40;
+        let mut budget: u32 = MAXSYMLINKS;
+
+        // `pending`: components yet to consume, leftmost first.
+        let mut pending: std::collections::VecDeque<String> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        // Path of components walked through so far (the directories
+        // *containing* `node`). Empty == `node` is the root. A relative
+        // symlink target resolves against this prefix.
+        let mut walked: Vec<String> = Vec::new();
+        let mut node = self.root_inode()?;
+
+        while let Some(component) = pending.pop_front() {
+            node = self.lookup(&node, component.as_bytes())?;
+            if node.is_symlink() {
+                if budget == 0 {
+                    return Err(Error::BadInode("symlink loop"));
+                }
+                budget -= 1;
+                let target = self.read_symlink_target(&node)?;
+                let target_str = std::str::from_utf8(&target)
+                    .map_err(|_| Error::BadInode("symlink target not UTF-8"))?;
+
+                let target_components: Vec<String> = target_str
+                    .split('/')
+                    .filter(|c| !c.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+
+                if target_str.starts_with('/') {
+                    // Absolute: restart from root, dropping walked.
+                    walked.clear();
+                    node = self.root_inode()?;
+                } else {
+                    // Relative: resolve against the symlink's parent
+                    // directory, which is `walked` (we haven't pushed
+                    // the symlink onto `walked` yet, since it's not a
+                    // real path component to keep).
+                    node = self.root_inode()?;
+                    for c in &walked {
+                        node = self.lookup(&node, c.as_bytes())?;
+                    }
+                }
+
+                // Splice target components in front of pending so they
+                // get consumed next.
+                for c in target_components.into_iter().rev() {
+                    pending.push_front(c);
+                }
+            } else {
+                walked.push(component);
+            }
+        }
+        Ok(node)
+    }
+
+    /// Read `buf.len()` bytes from a regular file inode starting at
+    /// `offset`.
+    ///
+    /// Handles every layout: FLAT_PLAIN, FLAT_INLINE, chunk-based and
+    /// compressed. Returns `OutOfRange` if the read would extend past
+    /// `inode.size`.
+    pub fn read_file(&self, inode: &Inode, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset.saturating_add(buf.len() as u64) > inode.size {
+            return Err(Error::OutOfRange);
+        }
+        if buf.is_empty() {
+            // Nothing asked for, so nothing read: not even the index a
+            // compressed file would open next.
+            return Ok(());
+        }
+        let bs = self.sb.block_size();
+        let total_blocks = inode.size.div_ceil(bs);
+        let zmap = self.zmap_for(inode)?;
+
+        let mut written = 0usize;
+        let mut cursor = offset;
+        while written < buf.len() {
+            let block_idx = cursor / bs;
+            let block_start = block_idx * bs;
+            // FLAT_INLINE's tail block is packed tight (no zero-pad to
+            // bs), so the buffer must be sized to actual content.
+            // FLAT_PLAIN tolerates either, since on-disk blocks are padded.
+            let valid_in_block = (inode.size - block_start).min(bs) as usize;
+            let in_block_off = (cursor % bs) as usize;
+            let take = (valid_in_block - in_block_off).min(buf.len() - written);
+
+            let mut block = vec![0u8; valid_in_block];
+            self.read_data_block_for(
+                inode,
+                block_idx,
+                total_blocks,
+                zmap.as_ref(),
+                &mut block,
+                in_block_off..in_block_off + take,
+            )?;
+            buf[written..written + take].copy_from_slice(&block[in_block_off..in_block_off + take]);
+
+            written += take;
+            cursor += take as u64;
+        }
+        Ok(())
+    }
+
+    /// The compressed index of `inode`, opened once for a whole read, or
+    /// `None` for a layout that has none.
+    ///
+    /// Every block of a compressed file used to reopen it -- reading and
+    /// parsing its header and recomputing the index geometry -- so a
+    /// 3 MiB file at 4 KiB blocks opened it 768 times in one `read_file`
+    /// (#60).
+    fn zmap_for<'s>(&'s self, inode: &'s Inode) -> Result<Option<zmap::ZMap<'s>>> {
+        match inode.format.layout {
+            DataLayout::Compression | DataLayout::CompressionLegacy => {
+                zmap::ZMap::open(&*self.primary, &self.sb, inode).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Read the `block_idx`-th data block of an inode into `out` (which
+    /// must be `<= block_size` bytes). `total_blocks` is the inode's
+    /// rounded-up block count, used to spot the tail-inline block for
+    /// FLAT_INLINE.
+    fn read_data_block(
+        &self,
+        inode: &Inode,
+        block_idx: u64,
+        total_blocks: u64,
+        zmap: Option<&zmap::ZMap<'_>>,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let whole = 0..out.len();
+        self.read_data_block_for(inode, block_idx, total_blocks, zmap, out, whole)
+    }
+
+    /// [`Self::read_data_block`] for a caller that needs only `wanted`
+    /// of the block. The rest is still filled, but a byte this crate
+    /// cannot vouch for fails the read only when it is one the caller
+    /// asked for; see [`Self::fill_from_one_pcluster_for`].
+    fn read_data_block_for(
+        &self,
+        inode: &Inode,
+        block_idx: u64,
+        total_blocks: u64,
+        zmap: Option<&zmap::ZMap<'_>>,
+        out: &mut [u8],
+        wanted: std::ops::Range<usize>,
+    ) -> Result<()> {
+        let bs = self.sb.block_size();
+        // Directory and symlink blocks are re-read by every path resolved
+        // through them, so they go through the metadata cache; file
+        // contents go around it (#69).
+        let read = |device_id: u16, off: u64, out: &mut [u8]| {
+            if inode.is_dir() || inode.is_symlink() {
+                self.read_block(device_id, off, out)
+            } else {
+                self.read_data(device_id, off, out)
+            }
+        };
+        match inode.format.layout {
+            DataLayout::FlatPlain => {
+                let off = inode.raw_u as u64 * bs + block_idx * bs;
+                // FLAT_PLAIN data lives on the primary device — there
+                // is no per-inode device_id slot for non-chunked layouts.
+                read(0, off, out)
+            }
+            DataLayout::FlatInline => {
+                if total_blocks > 0 && block_idx == total_blocks - 1 {
+                    // Tail block: inline, sits at body_end on the primary.
+                    let off = inode.body_end(&self.sb);
+                    read(0, off, out)
+                } else {
+                    let off = inode.raw_u as u64 * bs + block_idx * bs;
+                    read(0, off, out)
+                }
+            }
+            DataLayout::ChunkBased => {
+                let info = chunked::chunk_info(&self.sb, inode)?;
+                // chunk_size in blocks = 1 << chunk_bits.
+                let chunk_idx = block_idx >> info.chunk_bits;
+                let block_in_chunk = block_idx & ((1u64 << info.chunk_bits) - 1);
+                // Indexed chunkmap entries carry a per-chunk device_id;
+                // route the data read through the matching backing.
+                // The chunkmap itself is metadata and lives on the
+                // primary device (same as inodes / xattrs).
+                let (blkaddr, device_id) =
+                    chunked::lookup_chunk_blkaddr(&*self.primary, &self.sb, inode, chunk_idx)?;
+                if blkaddr == EROFS_NULL_ADDR {
+                    // Hole: zero-fill.
+                    out.fill(0);
+                    return Ok(());
+                }
+                let off = (blkaddr as u64 + block_in_chunk) * bs;
+                read(device_id, off, out)
+            }
+            DataLayout::Compression | DataLayout::CompressionLegacy => match zmap {
+                Some(zmap) => self.read_compressed_block(inode, block_idx, zmap, out, wanted),
+                None => {
+                    let zmap = zmap::ZMap::open(&*self.primary, &self.sb, inode)?;
+                    self.read_compressed_block(inode, block_idx, &zmap, out, wanted)
+                }
+            },
+        }
+    }
+
+    /// Decompress one block of a compressed inode. Phase 2 v0.3 supports
+    /// legacy + compacted-2B index formats, ztailpacking, AND multi-
+    /// lcluster pclusters (mkfs.erofs default since 1.5). Resolves the
+    /// FULL pcluster owning `block_idx`, decompresses its entire source
+    /// span at once, and copies the requested block out -- no caching.
+    /// FRAGMENTS / BIG_PCLUSTER / compacted-1B variants are still flagged
+    /// via [`zmap::ZMap::open`].
+    ///
+    /// Why this is harder than "decompress one lcluster": mkfs.erofs
+    /// collates contiguous lclusters into a single LZ4/LZMA frame
+    /// whenever the compressed bytes fit within one block. The HEAD
+    /// lcluster's blkaddr then points at a frame whose decompressed
+    /// output spans MULTIPLE lclusters' worth of source. Decompressing
+    /// only one lcluster's worth produces plausible-looking but wrong
+    /// bytes (LZ4 decompress_into is happy to stop early). The fix is
+    /// to walk forward through NONHEAD entries until the next HEAD,
+    /// compute the exact source span, and decompress the whole pcluster.
+    fn read_compressed_block(
+        &self,
+        inode: &Inode,
+        block_idx: u64,
+        zmap: &zmap::ZMap<'_>,
+        out: &mut [u8],
+        wanted: std::ops::Range<usize>,
+    ) -> Result<()> {
+        let bs = self.sb.block_size();
+        let block_start = block_idx * bs;
+        // A block can straddle a pcluster boundary (different mkfs
+        // policies may not align pclusters to block boundaries). Loop
+        // until we've filled the caller's buffer, advancing pcluster-
+        // by-pcluster through whatever this block covers.
+        let mut written: usize = 0;
+        while written < out.len() {
+            let cursor = block_start + written as u64;
+            let n = self.fill_from_one_pcluster_for(
+                inode.nid,
+                inode.is_dir() || inode.is_symlink(),
+                zmap,
+                cursor,
+                &mut out[written..],
+                wanted.start.saturating_sub(written)..wanted.end.saturating_sub(written),
+            )?;
+            if n == 0 {
+                // No bytes came back for `cursor`, so the cursor cannot
+                // move and asking again would give the same answer for
+                // ever. Zero-fill the rest of the block and stop.
+                //
+                // The test here must be the PER-CALL return, not the
+                // running `written` total: `written` is non-zero from
+                // the second iteration onwards, so testing it would
+                // catch only a zero on the very first call and turn
+                // every later one into an infinite loop.
+                out[written..].fill(0);
+                break;
+            }
+            written += n;
+        }
+        Ok(())
+    }
+
+    /// Resolve the pcluster containing `file_offset` and copy as many of
+    /// its remaining bytes into `out` as fit. Returns the number of
+    /// bytes written. Caller loops to span pcluster boundaries.
+    ///
+    /// `inode_nid` is folded into the cache key alongside the resolved
+    /// `pcluster_blkaddr` so two inodes that happen to point at the
+    /// same blkaddr (a possibility under BIG_PCLUSTER's shared-extent
+    /// patterns) never serve each other's bytes.
+    #[cfg(test)]
+    fn fill_from_one_pcluster(
+        &self,
+        inode_nid: u64,
+        zmap: &zmap::ZMap<'_>,
+        file_offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        self.fill_from_one_pcluster_as(inode_nid, false, zmap, file_offset, out)
+    }
+
+    /// Read one block's source bytes for [`Self::fill_from_one_pcluster_as`]:
+    /// through the metadata cache for a directory or symlink, around it
+    /// for file contents (#69).
+    ///
+    /// A compressed directory's decoded pcluster can be evicted, or the
+    /// pcluster cache switched off, and path resolution re-reads the
+    /// directory every time; its source belongs in the metadata cache as
+    /// much as a flat directory's blocks do.
+    fn read_source(
+        &self,
+        metadata: bool,
+        device_id: u16,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        if metadata {
+            self.read_block(device_id, offset, buf)
+        } else {
+            self.read_data(device_id, offset, buf)
+        }
+    }
+
+    /// [`Self::fill_from_one_pcluster`] for an inode whose source is
+    /// `metadata` (a directory or symlink) or file contents; see
+    /// [`Self::read_source`].
+    #[cfg(test)]
+    fn fill_from_one_pcluster_as(
+        &self,
+        inode_nid: u64,
+        metadata: bool,
+        zmap: &zmap::ZMap<'_>,
+        file_offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let whole = 0..out.len();
+        self.fill_from_one_pcluster_for(inode_nid, metadata, zmap, file_offset, out, whole)
+    }
+
+    /// [`Self::fill_from_one_pcluster_as`], told which of `out`'s bytes
+    /// the caller actually asked for. Every byte is still filled; one
+    /// that cannot be read truthfully fails the call only if it is in
+    /// `wanted`, and is zero otherwise -- so a block read that reaches an
+    /// unreadable extent on behalf of bytes beside it still succeeds.
+    fn fill_from_one_pcluster_for(
+        &self,
+        inode_nid: u64,
+        metadata: bool,
+        zmap: &zmap::ZMap<'_>,
+        file_offset: u64,
+        out: &mut [u8],
+        wanted: std::ops::Range<usize>,
+    ) -> Result<usize> {
+        let bs = self.sb.block_size();
+        if file_offset >= zmap.inode_size() {
+            // Past EOF: zero-fill caller's remaining buffer (the read
+            // loop already validated `offset + len <= inode.size`, but
+            // a partial block beyond EOF is benign zero-padding).
+            let n = out.len();
+            out.fill(0);
+            return Ok(n);
+        }
+
+        // FRAGMENT_PCLUSTER redirect: if the requested file_offset
+        // falls inside this inode's fragment range, the bytes
+        // logically live in the superblock's "packed inode" at
+        // `fragmentoff + (file_offset - fragment_source_start)`.
+        // This takes precedence over ztailpacking when both bits
+        // are set on the same map header (per `ZMap::has_fragment`'s
+        // doc). The packed inode is itself a regular compressed
+        // inode (often ztailpacked); we recurse into the standard
+        // `read_file` path to fetch its bytes.
+        if let Some((fragmentoff, frag_start, frag_end)) = zmap.fragment_range(&*self.primary)? {
+            if file_offset >= frag_start && file_offset < frag_end {
+                let in_frag = file_offset - frag_start;
+                let frag_remaining = (frag_end - file_offset) as usize;
+                let take = out.len().min(frag_remaining);
+                let packed = self.packed_inode()?;
+                let src_off = fragmentoff as u64 + in_frag;
+                if src_off.saturating_add(take as u64) > packed.size {
+                    return Err(Error::BadInode(
+                        "fragment range extends past packed inode size",
+                    ));
+                }
+                self.read_file(packed, src_off, &mut out[..take])?;
+                return Ok(take);
+            }
+        }
+
+        let extent = zmap.pcluster_extent(&*self.primary, file_offset)?;
+
+        // `pcluster_extent` is supposed to return the extent CONTAINING
+        // `file_offset`, and the two subtractions below both depend on
+        // that without saying so: one underflows if the start is past
+        // the offset, the other if the end is behind it. Neither is a
+        // theoretical worry — the same crafted-image class that produced
+        // the zero-length pcluster (a HEAD whose `clusterofs` exceeds the
+        // lcluster size, making the resolver walk back over a real HEAD)
+        // moves these bounds too. Unguarded, a debug build panics and a
+        // release build wraps to an enormous `usize`, so the failure mode
+        // differs between the tests and the thing that ships.
+        //
+        // Checked rather than clamped. `saturating_sub` would turn a
+        // corrupt image into a silently wrong read, which is the outcome
+        // this crate exists to avoid; a corrupt image should be refused.
+        //
+        // The message cannot name the offending offsets: every variant of
+        // `Error` carries `&'static str`, and the enum is not
+        // `#[non_exhaustive]`, so adding a `String` variant would break
+        // exhaustive matches in every consumer. Naming the broken
+        // invariant is worth more than the numbers here.
+        // Note the strict `>`. `file_offset == source_end_byte` yields a
+        // zero-length take, not an underflow, and that case already has an
+        // owner: the fill loop's zero-progress guard, whose regression test
+        // depends on reaching it. Rejecting it here would silently retire
+        // that test. This check is for the underflows alone.
+        if file_offset < extent.source_start_byte || file_offset > extent.source_end_byte {
+            return Err(Error::BadInode(
+                "pcluster extent does not bracket the requested file offset",
+            ));
+        }
+
+        let inline_tail = zmap.tail_inline_offset_and_size();
+        let is_inline_tail_pc = extent.is_last_pcluster && inline_tail.is_some();
+        let off_in_pcluster = (file_offset - extent.source_start_byte) as usize;
+        let pcluster_remaining = (extent.source_end_byte - file_offset) as usize;
+        let take = out.len().min(pcluster_remaining);
+
+        if extent.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN && is_inline_tail_pc {
+            // An uncompressed ztailpacked tail: the extent's bytes are
+            // the inline data after the inode, and there is no codec to
+            // hand them to. They went to the compressed path, which asked
+            // for PLAIN's codec and failed, so every file whose tail
+            // mkfs.erofs stored uncompressed was unreadable past its last
+            // block (#113).
+            let (inline_off, inline_len) = inline_tail.expect("checked above");
+            if zmap.has_interlaced_pcluster() {
+                // Interlaced, the inline data is laid out from the start
+                // of the tail's lcluster, as one block would be: byte `k`
+                // of the extent is inline byte `(start % bs + k) % bs`.
+                // That is how the kernel copies it, and how erofs-utils'
+                // own reader does.
+                let head_in_block = (extent.source_start_byte % bs) as usize;
+                let span = pcluster_span(extent.source_start_byte, extent.source_end_byte)?;
+                let inline_len = inline_len as usize;
+                // AN EXTENT WHOSE ROTATION RUNS PAST ITS INLINE DATA IS
+                // REFUSED (#125). `mkfs.erofs -b4096 -zlz4hc
+                // -Eall-fragments,ztailpacking` writes one: its packed
+                // inode ends in an interlaced inline tail whose bytes
+                // mkfs stored from the start of the inline data, sized as
+                // if they began at the extent start rather than
+                // `start % bs` into the lcluster. Read as the format says
+                // -- the kernel's reading -- every byte of it is wrong:
+                // in erofs-utils 1.9.1 the file packed there reads back
+                // different from its source through the Linux 6.1 driver,
+                // through `fsck.erofs --extract`, and through this crate,
+                // which filled the missing tail with zeros. Read as mkfs
+                // wrote it, it disagrees with the kernel. Neither is a
+                // reading anything can vouch for, so a caller that asks
+                // for these bytes gets an error. One that does not -- a
+                // file packed before it, whose last block this extent
+                // shares -- gets zeros for them and its own bytes intact.
+                if head_in_block + span > inline_len && head_in_block + span <= bs as usize {
+                    let asked = wanted.start < take && wanted.start < wanted.end;
+                    if asked {
+                        return Err(Error::BadInode(
+                            "interlaced inline PLAIN tail runs past its inline data \
+                             (mkfs.erofs -Eall-fragments,ztailpacking); its bytes cannot \
+                             be read truthfully",
+                        ));
+                    }
+                    out[..take].fill(0);
+                    return Ok(take);
+                }
+                let mut inline = vec![0u8; inline_len];
+                self.read_source(metadata, 0, inline_off, &mut inline)?;
+                for (k, byte) in out[..take].iter_mut().enumerate() {
+                    let off = off_in_pcluster + k;
+                    let at = interlaced_index(bs as usize, bs as usize, head_in_block, off);
+                    *byte = *inline.get(at).ok_or(Error::BadInode(
+                        "interlaced inline PLAIN tail shorter than its extent",
+                    ))?;
+                }
+                return Ok(take);
+            }
+            if off_in_pcluster + take > inline_len as usize {
+                return Err(Error::BadInode("inline PLAIN tail shorter than its extent"));
+            }
+            self.read_source(
+                metadata,
+                0,
+                inline_off + off_in_pcluster as u64,
+                &mut out[..take],
+            )?;
+            return Ok(take);
+        }
+
+        if extent.cluster_type == Z_EROFS_LCLUSTER_TYPE_PLAIN && !is_inline_tail_pc {
+            if zmap.has_interlaced_pcluster() {
+                // INTERLACED PLAIN (#49): the extent's bytes sit at their
+                // natural in-block positions, so the first
+                // `bs - start % bs` of them are the tail of the pcluster's
+                // last block and the rest wrap round to its start. The
+                // kernel's `Z_EROFS_COMPRESSION_INTERLACED` copy is a
+                // rotation of the pcluster by
+                // `blocks * bs - (bs - start % bs)`.
+                let blocks = extent.pcluster_block_count;
+                let on_disk_len = (blocks as usize)
+                    .checked_mul(bs as usize)
+                    .ok_or(Error::BadInode("INTERLACED PLAIN: pcluster size overflows"))?;
+                let span = pcluster_span(extent.source_start_byte, extent.source_end_byte)?;
+                if span > on_disk_len {
+                    return Err(Error::BadInode(
+                        "INTERLACED PLAIN: extent longer than its blocks",
+                    ));
+                }
+                let mut on_disk = vec![0u8; on_disk_len];
+                let dev_off = extent.pcluster_blkaddr as u64 * bs;
+                self.read_source(metadata, extent.device_id, dev_off, &mut on_disk)?;
+                let head_in_block = (extent.source_start_byte % bs) as usize;
+                for (k, byte) in out[..take].iter_mut().enumerate() {
+                    *byte = on_disk[interlaced_index(
+                        on_disk_len,
+                        bs as usize,
+                        head_in_block,
+                        off_in_pcluster + k,
+                    )];
+                }
+                return Ok(take);
+            }
+            // PLAIN (non-interlaced): raw uncompressed bytes. The
+            // pcluster is laid out contiguously starting at
+            // `pcluster_blkaddr * bs` and covers
+            // `[source_start_byte, source_end_byte)` of the file.
+            let off = extent.pcluster_blkaddr as u64 * bs + off_in_pcluster as u64;
+            self.read_source(metadata, extent.device_id, off, &mut out[..take])?;
+            return Ok(take);
+        }
+
+        // Compressed: read the whole pcluster's compressed payload and
+        // decompress it into a buffer sized to the full source span.
+        // `h_algorithmtype` packs HEAD1 in the low nibble and HEAD2 in
+        // the high nibble; `zmap.header_algo` does the per-cluster
+        // dispatch so the read path doesn't have to re-derive nibbles.
+        // Spec: public EROFS compression-format documentation
+        // (<https://erofs.docs.kernel.org/en/latest/design.html#compressed-data>).
+        //
+        // Cache fast path: a previously-decompressed pcluster is keyed
+        // by `(inode_nid, pcluster_blkaddr)`. On a hit we bypass the
+        // device read AND the codec invocation entirely, and just
+        // memcpy the requested slice out of the cached `Arc<Vec<u8>>`.
+        // This is the whole point of the cache — sequential block
+        // reads of a multi-block pcluster otherwise re-decompress the
+        // same payload on every call.
+        //
+        // THE SPAN IS PART OF THE KEY. Two HEAD lclusters of one inode
+        // may name the same `blkaddr` and cover different spans of the
+        // file, and the key used to be the address alone -- so the
+        // second one was served the first one's bytes, silently, and
+        // then indexed past the end of them. The comment here used to
+        // assert that the cached buffer was "sized to the pcluster's
+        // full source span", which is true only of the pcluster that
+        // put it there.
+        let cache_key = (
+            inode_nid,
+            extent.pcluster_blkaddr,
+            extent.source_start_byte,
+            extent.source_end_byte,
+        );
+        if let Some(cached) = self.cache_lookup(&cache_key) {
+            let slice =
+                cached
+                    .get(off_in_pcluster..off_in_pcluster + take)
+                    .ok_or(Error::BadInode(
+                        "cached pcluster is shorter than its extent",
+                    ))?;
+            out[..take].copy_from_slice(slice);
+            return Ok(take);
+        }
+
+        let algo = zmap.header_algo(extent.cluster_type)?;
+        let (src_off, src_len) = if is_inline_tail_pc {
+            let (off, sz) = inline_tail.expect("checked above");
+            (off, sz as usize)
+        } else {
+            let blocks = extent.pcluster_block_count;
+            // Cap reads at the end of the (routed) device so a generous
+            // last-pcluster bound doesn't trip ShortRead.
+            let dev = if metadata {
+                self.device_for(extent.device_id)?
+            } else {
+                self.data_device_for(extent.device_id)?
+            };
+            let dev_size = dev.size_bytes();
+            let off = extent.pcluster_blkaddr as u64 * bs;
+            let want = blocks * bs;
+            let capped = if off >= dev_size {
+                0
+            } else {
+                want.min(dev_size - off)
+            };
+            (off, capped as usize)
+        };
+        let mut compressed = vec![0u8; src_len];
+        if src_len > 0 {
+            // A file's compressed source goes around the metadata cache:
+            // its decoded result is what `pcluster_cache` keeps, so
+            // holding the source as well paid twice (#69). A directory's
+            // or symlink's goes through it, as its flat blocks do.
+            self.read_source(metadata, extent.device_id, src_off, &mut compressed)?;
+        }
+
+        let uncompressed_len = pcluster_span(extent.source_start_byte, extent.source_end_byte)?;
+        let mut decompressed = vec![0u8; uncompressed_len];
+        // For LZMA we plumb the COMPR_CFGS-derived dict_size / lc /
+        // lp / pb through; for the other codecs the second arg is
+        // ignored. `decompress_with_config_and_padding` falls back to LZMA1
+        // defaults when no config is present (ergonomic for older
+        // images that strip the LZMA1 header but pre-date COMPR_CFGS).
+        let lzma_cfg = self.compr_cfgs.as_ref().and_then(|c| c.lzma.as_ref());
+        let zero_padding = self.sb.feature_incompat & EROFS_FEATURE_INCOMPAT_ZERO_PADDING != 0;
+        // A deduplicated extent reuses the start of a pcluster another
+        // extent wrote, and its head says so: decode only as much as this
+        // extent covers. Every other extent must decode to exactly its
+        // span, or the index and the data disagree.
+        let decode = if extent.partial_ref {
+            decompress::decompress_prefix_with_config_and_padding
+        } else {
+            decompress::decompress_with_config_and_padding
+        };
+        decode(algo, lzma_cfg, zero_padding, &compressed, &mut decompressed)?;
+        out[..take].copy_from_slice(&decompressed[off_in_pcluster..off_in_pcluster + take]);
+        // Insert into cache AFTER the copy: the buffer is shared via
+        // `Arc` so concurrent readers don't pay extra allocation, and
+        // we don't hold the cache lock across the codec call.
+        self.cache_insert(cache_key, Arc::new(decompressed));
+        Ok(take)
+    }
+
+    /// Cache lookup that bumps the hit/miss counters and the LRU
+    /// recency in one shot. Returns `None` when caching is disabled
+    /// (capacity 0) or on a miss; the miss counter is only bumped
+    /// when caching is actually live, so disabled-mode reads don't
+    /// inflate the miss count and confuse the hit-rate stat.
+    fn cache_lookup(&self, key: &PclusterKey) -> Option<Arc<Vec<u8>>> {
+        let mut g = self.pcluster_cache.lock().expect("cache lock");
+        let lru = g.inner.as_mut()?;
+        if let Some(buf) = lru.get(key) {
+            let buf = Arc::clone(buf);
+            g.hits += 1;
+            Some(buf)
+        } else {
+            g.misses += 1;
+            None
+        }
+    }
+
+    /// Cache insert. No-op when caching is disabled (capacity 0).
+    fn cache_insert(&self, key: PclusterKey, value: Arc<Vec<u8>>) {
+        self.pcluster_cache
+            .lock()
+            .expect("cache lock")
+            .insert(key, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dir::{ftype, tests::synth_dir_block};
+    use crate::inode::tests::synth_compact;
+    use crate::layout::DataLayout;
+    use crate::superblock::tests::synth_sb;
+    use crate::superblock::EROFS_SUPER_OFFSET;
+    use crate::test_device::MemDev;
+    use fs_core::BlockRead;
+
+    /// Build a tiny image with:
+    /// - blocksize 4 KiB
+    /// - meta area at block 1
+    /// - root dir inode at NID 0 with a single child file "hello.txt"
+    /// - file at NID 1, FLAT_PLAIN, payload at block 2 = "hi\n" + zeros
+    fn build_image() -> Vec<u8> {
+        const BS: usize = 4096;
+        // 4 blocks: 0 = SB area, 1 = meta (inodes + dir block), 2 = file data.
+        // Put dir block in block 3 to keep things separated.
+        let mut img = vec![0u8; BS * 4];
+
+        // Superblock at byte 1024.
+        let sb = synth_sb(12, 0, 1, 4); // root_nid=0, meta_blkaddr=1
+        img[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb.len()]
+            .copy_from_slice(&sb);
+
+        // Root dir inode at NID 0 in meta area = byte 4096.
+        // FLAT_PLAIN, mode=dir, size = 4096 (one block of dirents),
+        // raw_blkaddr = 3 (dir data block).
+        let root = synth_compact(DataLayout::FlatPlain, 0x41ED, BS as u32, 3);
+        img[BS..BS + 32].copy_from_slice(&root);
+
+        // File inode at NID 1 = byte 4096 + 32 = 4128.
+        // FLAT_PLAIN, mode=regular file, size=3, raw_blkaddr = 2.
+        let file = synth_compact(DataLayout::FlatPlain, 0x81A4, 3, 2);
+        img[BS + 32..BS + 64].copy_from_slice(&file);
+
+        // File data at block 2 = byte 8192.
+        img[2 * BS..2 * BS + 3].copy_from_slice(b"hi\n");
+
+        // Dir block at block 3 = byte 12288, with one entry pointing at NID 1.
+        let dir = synth_dir_block(&[(1, ftype::REG_FILE, b"hello.txt")], BS);
+        img[3 * BS..4 * BS].copy_from_slice(&dir);
+
+        img
+    }
+
+    /// A symlink's target is a path, and the inode's declared size is
+    /// an unvalidated `u64`. `read_symlink_target` allocated it before
+    /// reading a byte, so an extended inode declaring 2^56 asked for
+    /// 72 petabytes -- and `handle_alloc_error` answers that by
+    /// aborting, which `ffi_guard`'s `catch_unwind` cannot intercept.
+    #[test]
+    fn a_symlink_longer_than_any_path_is_refused_before_the_buffer_exists() {
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+
+        let mut link = fs.lookup_path("/hello.txt").unwrap();
+        link.mode = 0xA1FF; // S_IFLNK | 0777
+        link.size = 1 << 56;
+        assert!(link.is_symlink());
+
+        let outcome = fs.read_symlink_target(&link);
+        assert!(
+            outcome.is_err(),
+            "a symlink declaring 2^56 bytes of target was accepted"
+        );
+    }
+
+    #[test]
+    fn a_pcluster_may_not_cover_more_of_the_file_than_a_pcluster_can() {
+        // mkfs.erofs 1.7.1 accepts -C1048576 and refuses -C2097152.
+        assert_eq!(
+            pcluster_span(0, MAX_PCLUSTER_SIZE).unwrap() as u64,
+            MAX_PCLUSTER_SIZE
+        );
+        assert!(pcluster_span(0, MAX_PCLUSTER_SIZE + 1).is_err());
+        // The shape the last pcluster of a file produces: its end is
+        // the inode's declared size.
+        assert!(pcluster_span(0, 1 << 48).is_err());
+        // An end before the start is not a span at all.
+        assert!(pcluster_span(4096, 0).is_err());
+        assert_eq!(pcluster_span(4096, 8192).unwrap(), 4096);
+    }
+
+    #[test]
+    fn open_and_read_root() {
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let root = fs.root_inode().unwrap();
+        assert!(root.is_dir());
+    }
+
+    #[test]
+    fn lookup_and_read_file() {
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/hello.txt").unwrap();
+        assert!(inode.is_regular_file());
+        assert_eq!(inode.size, 3);
+        let mut buf = [0u8; 3];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hi\n");
+    }
+
+    #[test]
+    fn out_of_range_read_rejected() {
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/hello.txt").unwrap();
+        let mut buf = [0u8; 16];
+        assert!(matches!(
+            fs.read_file(&inode, 0, &mut buf),
+            Err(Error::OutOfRange)
+        ));
+    }
+
+    /// Build an image with a chunk-based file at NID 0 and verify the
+    /// read path. Layout: blocksize 4 KiB, meta_blkaddr=1.
+    ///
+    /// File geometry: chunk_bits=0 (chunk == 1 block), 3 chunks total
+    /// (size = 12 KiB). chunkmap is the 4-byte compact form, written
+    /// inline immediately after the inode body. Three chunks:
+    ///   chunk 0 -> data block 4 ("AAAA..."), chunk 1 -> hole
+    ///   (NULL_ADDR), chunk 2 -> data block 5 ("CCCC...").
+    fn build_chunked_image() -> Vec<u8> {
+        const BS: usize = 4096;
+        // 6 blocks: 0=SB area, 1=meta (inode + chunkmap), 2/3 unused,
+        // 4=chunk0 data, 5=chunk2 data.
+        let mut img = vec![0u8; BS * 6];
+
+        let sb = synth_sb(12, 0, 1, 6);
+        img[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb.len()]
+            .copy_from_slice(&sb);
+
+        // Compact chunked inode at NID 0 with chunk_bits=0, INDEXES clear.
+        // synth_compact gives raw_format = (ChunkBased<<1) = 0x08; we then
+        // overwrite to set flags=0 explicitly (it already is 0).
+        let mut inode_buf = synth_compact(DataLayout::ChunkBased, 0x81A4, (BS * 3) as u32, 0);
+        // i_format already correct for flags=0; double-check by re-packing.
+        let raw_format: u16 = (DataLayout::ChunkBased as u16) << 1;
+        inode_buf[0x00..0x02].copy_from_slice(&raw_format.to_le_bytes());
+        img[BS..BS + 32].copy_from_slice(&inode_buf);
+
+        // Compact chunkmap (3 x __le32) immediately after the 32-byte inode.
+        let map_off = BS + 32;
+        img[map_off..map_off + 4].copy_from_slice(&4u32.to_le_bytes());
+        img[map_off + 4..map_off + 8].copy_from_slice(&EROFS_NULL_ADDR.to_le_bytes());
+        img[map_off + 8..map_off + 12].copy_from_slice(&5u32.to_le_bytes());
+
+        // chunk 0 data at block 4: filled with 'A'.
+        for b in &mut img[4 * BS..5 * BS] {
+            *b = b'A';
+        }
+        // chunk 2 data at block 5: filled with 'C'.
+        for b in &mut img[5 * BS..6 * BS] {
+            *b = b'C';
+        }
+
+        img
+    }
+
+    #[test]
+    fn chunked_read_present_chunks() {
+        let img = build_chunked_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.read_inode(0).unwrap();
+        assert!(inode.is_regular_file());
+        assert_eq!(inode.size, 4096 * 3);
+        // First byte of chunk 0.
+        let mut buf = [0u8; 4];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"AAAA");
+        // First byte of chunk 2 (offset 8192).
+        fs.read_file(&inode, 8192, &mut buf).unwrap();
+        assert_eq!(&buf, b"CCCC");
+    }
+
+    #[test]
+    fn chunked_read_hole_returns_zeros() {
+        let img = build_chunked_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.read_inode(0).unwrap();
+        // chunk 1 (offset 4096..8192) is a hole.
+        let mut buf = [0xFFu8; 16];
+        fs.read_file(&inode, 4096, &mut buf).unwrap();
+        assert_eq!(&buf, &[0u8; 16]);
+    }
+
+    #[test]
+    fn chunked_read_spanning_chunk_boundary() {
+        let img = build_chunked_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.read_inode(0).unwrap();
+        // Span the chunk0 -> chunk1 boundary: last 4 bytes of chunk 0
+        // ("AAAA") + first 4 bytes of chunk 1 (hole, zeros).
+        let mut buf = [0u8; 8];
+        fs.read_file(&inode, 4096 - 4, &mut buf).unwrap();
+        assert_eq!(&buf, b"AAAA\0\0\0\0");
+        // Span chunk1 -> chunk2 boundary: last 4 of hole + first 4 of chunk 2.
+        fs.read_file(&inode, 8192 - 4, &mut buf).unwrap();
+        assert_eq!(&buf, b"\0\0\0\0CCCC");
+    }
+
+    /// Build a tiny image via [`crate::mkfs::build_image`] containing
+    /// `/target.txt` with content "hello\n" and `/link` -> "target.txt".
+    fn build_symlink_image() -> Vec<u8> {
+        use crate::mkfs::{
+            build_image, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_FILE_MODE, DEFAULT_SYMLINK_MODE,
+        };
+        use std::collections::BTreeMap;
+        let mut entries: BTreeMap<String, Node> = BTreeMap::new();
+        entries.insert(
+            "target.txt".into(),
+            Node::File {
+                mode: DEFAULT_FILE_MODE,
+                data: b"hello\n".to_vec(),
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        );
+        entries.insert(
+            "link".into(),
+            Node::Symlink {
+                mode: DEFAULT_SYMLINK_MODE,
+                target: "target.txt".into(),
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        );
+        build_image(
+            Node::Dir {
+                mode: DEFAULT_DIR_MODE,
+                entries,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+            12,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn read_symlink_target_returns_target_string() {
+        let img = build_symlink_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let link = fs.lookup_path("/link").unwrap();
+        assert!(link.is_symlink());
+        let target = fs.read_symlink_target(&link).unwrap();
+        assert_eq!(target, b"target.txt");
+    }
+
+    #[test]
+    fn read_symlink_target_rejects_non_symlink() {
+        let img = build_symlink_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let regular = fs.lookup_path("/target.txt").unwrap();
+        assert!(matches!(
+            fs.read_symlink_target(&regular),
+            Err(Error::BadInode(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_path_no_follow_returns_symlink_inode() {
+        let img = build_symlink_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.resolve_path("/link", false).unwrap();
+        assert!(inode.is_symlink());
+    }
+
+    #[test]
+    fn resolve_path_follow_resolves_to_target() {
+        let img = build_symlink_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.resolve_path("/link", true).unwrap();
+        assert!(inode.is_regular_file());
+        assert_eq!(inode.size, 6);
+        let mut buf = [0u8; 6];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hello\n");
+    }
+
+    /// Build an image with `/a` -> "/a" -- an absolute self-loop.
+    fn build_loop_image() -> Vec<u8> {
+        use crate::mkfs::{build_image, Node, NodeMeta, DEFAULT_DIR_MODE, DEFAULT_SYMLINK_MODE};
+        use std::collections::BTreeMap;
+        let mut entries: BTreeMap<String, Node> = BTreeMap::new();
+        entries.insert(
+            "a".into(),
+            Node::Symlink {
+                mode: DEFAULT_SYMLINK_MODE,
+                target: "/a".into(),
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+        );
+        build_image(
+            Node::Dir {
+                mode: DEFAULT_DIR_MODE,
+                entries,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+            12,
+        )
+        .unwrap()
+    }
+
+    /// The interlaced copy, as the kernel does it (#49). This replaced a
+    /// synthetic image whose only lcluster was a PLAIN head 100 bytes into
+    /// its block, a layout the kernel refuses (nothing can own the first
+    /// 100 bytes); the real layout is exercised by
+    /// `oracle_interlaced_fragments_round_trip`.
+    #[test]
+    fn interlaced_index_is_the_kernels_rotation() {
+        const BS: usize = 4096;
+        // One block, extent starting 100 bytes in: its bytes are at their
+        // in-block positions, wrapping after the block's end.
+        assert_eq!(interlaced_index(BS, BS, 100, 0), 100);
+        assert_eq!(interlaced_index(BS, BS, 100, BS - 101), BS - 1);
+        assert_eq!(interlaced_index(BS, BS, 100, BS - 100), 0);
+        // Starting at the block boundary it is the identity.
+        assert_eq!(interlaced_index(BS, BS, 0, 17), 17);
+        // Two blocks: the first `BS - 100` bytes come from the tail of the
+        // LAST block, then the rest from the start of the first.
+        assert_eq!(interlaced_index(2 * BS, BS, 100, 0), BS + 100);
+        assert_eq!(interlaced_index(2 * BS, BS, 100, BS - 101), 2 * BS - 1);
+        assert_eq!(interlaced_index(2 * BS, BS, 100, BS - 100), 0);
+        assert_eq!(interlaced_index(2 * BS, BS, 0, 0), BS);
+    }
+
+    // --- zero-progress pcluster (the block-fill loop's exit guard) ------
+    //
+    // `read_compressed_block` fills a block by calling
+    // `fill_from_one_pcluster` in a loop, advancing a cursor by the
+    // bytes each call copied. A call that copies ZERO bytes leaves the
+    // cursor where it was, so the loop must notice and stop; if it
+    // tests the running total instead of the per-call return it only
+    // notices on the very first call, and a zero on any later call
+    // spins forever.
+    //
+    // A zero copy comes out of `pcluster_extent` reporting an extent
+    // whose `source_end_byte` has already been passed by the requested
+    // offset, which is what `PLAIN_ZERO_AT` below is engineered to
+    // produce.
+
+    /// Block whose fill exercises the loop, and the offset inside it at
+    /// which the resolver reports an empty extent. See
+    /// `build_zero_progress_image` for the arithmetic that lands here.
+    const SPIN_BLOCK_START: u64 = 3 * 4096;
+    const SPIN_FIRST_TAKE: usize = 100;
+    const SPIN_ZERO_AT: u64 = SPIN_BLOCK_START + SPIN_FIRST_TAKE as u64;
+
+    /// Build an image whose legacy zmap makes the SECOND fill of one
+    /// block resolve to a zero-length pcluster.
+    ///
+    /// The lever is a HEAD whose `clusterofs` exceeds the lcluster size
+    /// — something `mkfs.erofs` never writes, but nothing in the
+    /// on-disk format prevents an image from carrying. The resolver's
+    /// walk-back ("this HEAD's clusterofs is past my offset, so my
+    /// bytes belong to the previous pcluster") then steps back over a
+    /// real HEAD, and the forward scan that bounds the pcluster picks
+    /// that same stepped-over HEAD as the *next* head — putting
+    /// `source_end_byte` behind, not ahead of, the offset we asked
+    /// about.
+    ///
+    /// Four PLAIN lclusters over a 16 KiB file, block size 4 KiB and
+    /// lcluster size 4 KiB:
+    ///
+    /// | lc | clusterofs | blkaddr |
+    /// |----|------------|---------|
+    /// | 0  | 0          | 2       |
+    /// | 1  | 0          | 2       |
+    /// | 2  | 4196       | 3       |  <- 4196 > lcluster_size (4096)
+    /// | 3  | 101        | 4       |
+    ///
+    /// Reading block 3 (file bytes 12288..16384):
+    ///
+    /// - fill #1 asks about 12288. lc3's clusterofs (101) is past
+    ///   in-lcluster offset 0, so walk back to lc2; lc2's clusterofs
+    ///   (4196) is past a whole lcluster, so walk back again to lc1.
+    ///   Head is lc1 (source starts at 4096); the next head found
+    ///   scanning forward is lc2, so the source ends at
+    ///   `2*4096 + 4196 == 12388`. That is 100 bytes ahead of 12288 —
+    ///   a short but real copy.
+    /// - fill #2 asks about 12388. The same double walk-back lands on
+    ///   the same head with the same bound, 12388 — now exactly the
+    ///   offset being asked about. Zero bytes remain in the pcluster,
+    ///   so the fill copies nothing and the cursor does not move.
+    fn build_zero_progress_image() -> Vec<u8> {
+        build_zero_progress_image_with(4196)
+    }
+
+    fn build_zero_progress_image_with(spin_clusterofs: u16) -> Vec<u8> {
+        build_zp4(0, 0, spin_clusterofs, 101)
+    }
+
+    fn build_zp4(c0: u16, c1: u16, c2: u16, c3: u16) -> Vec<u8> {
+        const BS: usize = 4096;
+        const FILE_SIZE: u32 = 4 * BS as u32;
+        // 8 blocks: 0 = SB, 1 = meta (inodes + zmap), 2..6 = data,
+        // 7 = dir block.
+        let mut img = vec![0u8; BS * 8];
+        let sb = synth_sb(12, 0, 1, 8);
+        img[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb.len()]
+            .copy_from_slice(&sb);
+
+        // Root dir inode at NID 0, dirents at block 7.
+        let root = synth_compact(DataLayout::FlatPlain, 0x41ED, BS as u32, 7);
+        img[BS..BS + 32].copy_from_slice(&root);
+
+        // File inode at NID 1. CompressionLegacy so the zmap is the
+        // plain 8-bytes-per-lcluster full index rather than a compact
+        // bitstream — the entries below are then readable as written.
+        let file = synth_compact(DataLayout::CompressionLegacy, 0x81A4, FILE_SIZE, 0);
+        img[BS + 32..BS + 64].copy_from_slice(&file);
+
+        // zmap header sits at body_end (BS + 64) and is left all-zero:
+        // no advise bits (so no INTERLACED, which would disable the
+        // walk-back), LZ4, and lclusterbits 0 => lcluster size ==
+        // block size. The legacy index array starts 16 bytes further
+        // on (8-byte header + 8-byte reserved gap).
+        let idx = BS + 64 + 16;
+        let entry = |cluster_type: u16, clusterofs: u16, u: u32| -> [u8; 8] {
+            let mut e = [0u8; 8];
+            e[0..2].copy_from_slice(&cluster_type.to_le_bytes());
+            e[2..4].copy_from_slice(&clusterofs.to_le_bytes());
+            e[4..8].copy_from_slice(&u.to_le_bytes());
+            e
+        };
+        const PLAIN: u16 = Z_EROFS_LCLUSTER_TYPE_PLAIN as u16;
+        let entries = [
+            entry(PLAIN, c0, 2),
+            entry(PLAIN, c1, 2),
+            entry(PLAIN, c2, 3),
+            entry(PLAIN, c3, 4),
+        ];
+        for (i, e) in entries.iter().enumerate() {
+            img[idx + i * 8..idx + i * 8 + 8].copy_from_slice(e);
+        }
+
+        // The 100 bytes fill #1 copies: pcluster at blkaddr 2, 8192
+        // bytes into it => image offset 16384.
+        img[16384..16384 + SPIN_FIRST_TAKE].fill(0xC5);
+
+        let dir = synth_dir_block(&[(1, ftype::REG_FILE, b"spin.bin")], BS);
+        img[7 * BS..8 * BS].copy_from_slice(&dir);
+        img
+    }
+
+    /// A crafted extent whose end lies BEHIND the requested offset is
+    /// refused, rather than underflowing the length arithmetic.
+    ///
+    /// # How this state is reached
+    ///
+    /// Same class as the zero-progress image below, one step further. A
+    /// HEAD whose `clusterofs` exceeds the lcluster size makes the
+    /// resolver walk back over a real HEAD; with a second oversized
+    /// entry after it, the forward scan that bounds the pcluster lands
+    /// on a head that sits *before* the offset being asked about, so
+    /// `source_end_byte < file_offset`. `mkfs.erofs` never writes this,
+    /// and nothing in the format forbids it.
+    ///
+    /// # Why it is worth a test rather than a `saturating_sub`
+    ///
+    /// Measured against the unguarded code, the two build profiles
+    /// disagreed about what this image is:
+    ///
+    /// ```text
+    /// debug   → panicked at src/fs.rs:670: attempt to subtract with overflow
+    /// release → Ok(4096)
+    /// ```
+    ///
+    /// A release build reported a SUCCESSFUL 4096-byte read of a corrupt
+    /// image. That is the failure this crate exists to prevent, and it
+    /// is invisible to a test suite that runs in debug — which is why
+    /// the assertion below is run in both profiles by CI.
+    #[test]
+    fn an_extent_ending_behind_the_offset_is_refused() {
+        // c2 = 4196 is the oversized clusterofs from the zero-progress
+        // image; c3 = 4095 is the second one that pushes the bound back
+        // past the offset instead of onto it.
+        let img = build_zp4(0, 0, 4196, 4095);
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).expect("the image is structurally openable");
+        let inode = fs.lookup_path("/spin.bin").expect("the file resolves");
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).expect("the zmap parses");
+
+        let mut probe = vec![0u8; 4096];
+        let err = fs
+            .fill_from_one_pcluster(inode.nid, &zmap, 15000, &mut probe)
+            .expect_err(
+                "an extent that does not contain the offset must be refused; \
+                 unguarded this panicked in debug and returned Ok(4096) in release",
+            );
+        assert!(
+            format!("{err}").contains("does not bracket"),
+            "the refusal should name the broken invariant, got: {err}"
+        );
+    }
+
+    /// The offsets that are still legitimate keep working, so the guard
+    /// is a check on a broken invariant and not a blanket refusal of the
+    /// crafted image.
+    #[test]
+    fn the_bracket_guard_does_not_reject_valid_offsets() {
+        let img = build_zp4(0, 0, 4196, 4095);
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/spin.bin").unwrap();
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
+
+        let mut probe = vec![0u8; 4096];
+        for start in [0u64, 4096, 8192] {
+            let n = fs
+                .fill_from_one_pcluster(inode.nid, &zmap, start, &mut probe)
+                .unwrap_or_else(|e| panic!("offset {start} is inside a real extent, but: {e}"));
+            assert!(n > 0, "offset {start} should copy bytes, copied {n}");
+        }
+    }
+
+    /// The fill really does return zero at `SPIN_ZERO_AT`, and it is
+    /// not the first fill of the block — fill #1 copies 100 bytes
+    /// first. Without this, the loop test below could pass for the
+    /// wrong reason.
+    #[test]
+    fn zero_progress_pcluster_is_reachable_after_a_nonzero_fill() {
+        let img = build_zero_progress_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/spin.bin").unwrap();
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
+
+        let mut probe = vec![0u8; 4096];
+        let first = fs
+            .fill_from_one_pcluster(inode.nid, &zmap, SPIN_BLOCK_START, &mut probe)
+            .expect("first fill of the block");
+        assert_eq!(
+            first, SPIN_FIRST_TAKE,
+            "fill #1 must copy a short but non-zero run, so the loop is \
+             already past its first iteration when the zero arrives"
+        );
+
+        let second = fs
+            .fill_from_one_pcluster(inode.nid, &zmap, SPIN_ZERO_AT, &mut probe[first..])
+            .expect("second fill of the block");
+        assert_eq!(
+            second, 0,
+            "fill #2 must copy nothing: the resolved pcluster ends exactly \
+             at the offset being asked about"
+        );
+    }
+
+    /// A zero-copy fill on a LATER iteration must end the block-fill
+    /// loop, not spin on the same offset forever.
+    ///
+    /// Run on a worker thread with a deadline: a regression here is an
+    /// infinite loop, and an infinite loop in the test binary would
+    /// hang CI rather than fail it.
+    #[test]
+    fn zero_progress_pcluster_does_not_spin_forever() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let img = build_zero_progress_image();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+            let fs = Filesystem::open(dev).unwrap();
+            let inode = fs.lookup_path("/spin.bin").unwrap();
+            let mut buf = vec![0u8; 4096];
+            let outcome = fs
+                .read_file(&inode, SPIN_BLOCK_START, &mut buf)
+                .map(|()| buf);
+            let _ = tx.send(outcome);
+        });
+
+        let buf = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(outcome) => outcome.expect("read of the crafted block"),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "read_compressed_block did not return within 10s: the block-fill \
+                 loop is spinning on a zero-length pcluster at file offset \
+                 {SPIN_ZERO_AT}"
+            ),
+            Err(e) => panic!("worker thread died: {e:?}"),
+        };
+
+        // What fill #1 copied survives; the rest of the block, which no
+        // pcluster could supply, reads as zeros.
+        assert_eq!(&buf[..SPIN_FIRST_TAKE], &[0xC5u8; SPIN_FIRST_TAKE][..]);
+        assert!(
+            buf[SPIN_FIRST_TAKE..].iter().all(|&b| b == 0),
+            "the unfillable remainder of the block must be zeroed"
+        );
+    }
+    #[test]
+    fn resolve_path_symlink_loop_caps_at_40() {
+        let img = build_loop_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let err = fs.resolve_path("/a", true).unwrap_err();
+        match err {
+            Error::BadInode(msg) => assert_eq!(msg, "symlink loop"),
+            other => panic!("expected BadInode(\"symlink loop\"), got {other:?}"),
+        }
+    }
+
+    // --- pcluster decompression cache tests ----------------------------
+    //
+    // These exercise the LRU that sits in front of the codec, verifying
+    // that a compressed inode read twice in a row decompresses once,
+    // that capacity 0 disables caching, that capacity 1 evicts as
+    // expected, and that two different inodes pointing at the same
+    // blkaddr (synthetic test) don't cross-contaminate via the cache.
+
+    /// Build a multi-block compressed file via the in-tree mkfs. Returns
+    /// the image bytes and the file's payload so a test can compare
+    /// reads against ground truth. The payload is highly compressible
+    /// so each lcluster's frame is well below an on-disk block,
+    /// triggering the multi-lcluster pcluster path the cache benefits.
+    fn build_compressed_image_for_cache(name: &str, payload: &[u8]) -> Vec<u8> {
+        use crate::mkfs::{
+            build_image, CompressedAlgo, CompressedFileSpec, Node, NodeMeta, DEFAULT_DIR_MODE,
+            DEFAULT_FILE_MODE,
+        };
+        use std::collections::BTreeMap;
+        let mut entries: BTreeMap<String, Node> = BTreeMap::new();
+        entries.insert(
+            name.into(),
+            Node::CompressedFile(CompressedFileSpec {
+                mode: DEFAULT_FILE_MODE,
+                data: payload.to_vec(),
+                algo: CompressedAlgo::Lz4,
+                lclusterbits: 0,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+                index_format: CompressedFileSpec::default_index_format(),
+                ztailpacking: false,
+                target_pcluster_blocks: CompressedFileSpec::default_target_pcluster_blocks(),
+            }),
+        );
+        build_image(
+            Node::Dir {
+                mode: DEFAULT_DIR_MODE,
+                entries,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+            12,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pcluster_cache_hit_serves_repeat_reads_without_redecompress() {
+        // Multi-block compressible payload: 5 blocks of 'X'. With
+        // lclusterbits=0 each block is one lcluster; the LZ4 frame
+        // shrinks dramatically so multiple lclusters collate into a
+        // single pcluster. Reading the file end-to-end thus invokes
+        // the codec only once per pcluster -- the property the cache
+        // is meant to preserve across REPEATED full reads.
+        let bs = 4096usize;
+        let payload = vec![b'X'; 5 * bs];
+        let img = build_compressed_image_for_cache("c.bin", &payload);
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/c.bin").unwrap();
+
+        // First read: cache populates on each unique pcluster
+        // (resulting in some misses) and intra-pcluster repeat block
+        // accesses immediately hit the just-inserted entry. Both
+        // counters can be non-zero on the first pass; the contract
+        // we assert is "at least one miss happened" (the cache had
+        // to get filled SOMEWHERE) and "at least one entry remains".
+        let mut buf = vec![0u8; payload.len()];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+        let (entries_after_first, capacity, hits_after_first, misses_after_first) =
+            fs.pcluster_cache_stats();
+        assert_eq!(capacity, DEFAULT_PCLUSTER_CACHE_CAPACITY);
+        assert!(
+            entries_after_first >= 1,
+            "first read should populate at least one cache entry, got {entries_after_first}"
+        );
+        assert!(
+            misses_after_first >= 1,
+            "first read should record at least one miss (entries had to land somewhere)"
+        );
+
+        // Second read: every pcluster lookup must now be a hit; no
+        // additional misses. Decompression effectively amortised away.
+        let mut buf2 = vec![0u8; payload.len()];
+        fs.read_file(&inode, 0, &mut buf2).unwrap();
+        assert_eq!(buf2, payload);
+        let (_, _, hits_after_second, misses_after_second) = fs.pcluster_cache_stats();
+        assert!(
+            hits_after_second > hits_after_first,
+            "second read must register cache hits ({hits_after_first} -> {hits_after_second})"
+        );
+        assert_eq!(
+            misses_after_second, misses_after_first,
+            "second read must NOT decompress again ({misses_after_first} -> {misses_after_second})"
+        );
+    }
+
+    /// #77: the default cache was bounded by entry count alone, so 256
+    /// multi-megabyte decoded pclusters -- legal since the decoded-span
+    /// limit follows `Z_EROFS_PCLUSTER_MAX_DSIZE` -- were all retained.
+    /// The ceiling the documentation promises is 64 MiB of decoded
+    /// bytes, whatever size each pcluster decodes to.
+    #[test]
+    fn default_pcluster_cache_retains_at_most_64_mib_of_decoded_bytes() {
+        const MIB: usize = 1024 * 1024;
+        let bs = 4096usize;
+        let img = build_compressed_image_for_cache("a.bin", &vec![b'A'; 2 * bs]);
+        let fs = Filesystem::open(Arc::new(MemDev::new(img)) as Arc<dyn BlockRead>).unwrap();
+
+        // 40 pclusters of 4 MiB each: 160 MiB offered, well within the
+        // default entry count of 256. Zeroed allocations are not touched,
+        // so this does not commit 160 MiB of memory to the test.
+        let each = 4 * MIB;
+        for i in 0..40u64 {
+            fs.cache_insert((1, 0, i, i), Arc::new(vec![0u8; each]));
+        }
+        let (entries, _, _, _) = fs.pcluster_cache_stats();
+        assert!(
+            entries * each <= 64 * MIB,
+            "the default cache retained {entries} pclusters of {each} bytes = {} MiB, \
+             above the 64 MiB ceiling",
+            entries * each / MIB
+        );
+        assert!(entries > 0, "the cache retained nothing at all");
+    }
+
+    /// The byte accounting: re-inserting a key replaces rather than adds,
+    /// and one pcluster above the ceiling is served but never retained.
+    #[test]
+    fn pcluster_cache_byte_accounting_replaces_and_skips_oversize() {
+        const MIB: usize = 1024 * 1024;
+        let mut cache = PclusterCache::new(DEFAULT_PCLUSTER_CACHE_CAPACITY);
+        cache.insert((1, 0, 0, 0), Arc::new(vec![0u8; 40 * MIB]));
+        cache.insert((1, 0, 0, 0), Arc::new(vec![0u8; 40 * MIB]));
+        assert_eq!(cache.bytes, 40 * MIB, "a replaced value was counted twice");
+        assert_eq!(cache.inner.as_ref().unwrap().len(), 1);
+
+        cache.insert((1, 0, 1, 1), Arc::new(vec![0u8; 30 * MIB]));
+        assert_eq!(cache.bytes, 30 * MIB, "the LRU entry must go to fit");
+        assert_eq!(cache.inner.as_ref().unwrap().len(), 1);
+
+        cache.insert((1, 0, 2, 2), Arc::new(vec![0u8; 64 * MIB + 1]));
+        assert_eq!(cache.bytes, 30 * MIB, "an oversize pcluster was retained");
+        assert!(cache.inner.as_ref().unwrap().contains(&(1, 0, 1, 1)));
+    }
+
+    #[test]
+    fn pcluster_cache_evicts_at_capacity() {
+        // Build two distinct compressed images; open one filesystem
+        // per image (each image has its own NID space, but the cache
+        // is per-FS so we use one FS per file by re-opening per
+        // image). We squeeze the cache to capacity 1 and verify a
+        // SECOND distinct pcluster read evicts the first entry,
+        // observed via `pcluster_cache_stats` -- still 1 entry, but
+        // a fresh re-read of the FIRST file's pcluster is a miss
+        // (it would have been a hit at capacity >= 2).
+        let bs = 4096usize;
+        let payload_a = vec![b'A'; 5 * bs];
+
+        // File A: read once with cap=1 to populate, then verify hit.
+        let img_a = build_compressed_image_for_cache("a.bin", &payload_a);
+        let dev_a: Arc<dyn BlockRead> = Arc::new(MemDev::new(img_a));
+        let fs_a = Filesystem::open(dev_a).unwrap();
+        fs_a.set_pcluster_cache_capacity(1);
+        let inode_a = fs_a.lookup_path("/a.bin").unwrap();
+
+        // Populate cache from A.
+        let mut buf = vec![0u8; payload_a.len()];
+        fs_a.read_file(&inode_a, 0, &mut buf).unwrap();
+        let (entries_a, cap_a, _, _) = fs_a.pcluster_cache_stats();
+        assert_eq!(cap_a, 1);
+        assert_eq!(
+            entries_a, 1,
+            "with capacity 1 the cache holds at most one entry"
+        );
+
+        // Now re-read A: should be a hit (still in the cache).
+        let (_, _, hits_before, _) = fs_a.pcluster_cache_stats();
+        fs_a.read_file(&inode_a, 0, &mut buf).unwrap();
+        let (_, _, hits_after, _) = fs_a.pcluster_cache_stats();
+        assert!(hits_after > hits_before, "A still cached -> hits must grow");
+
+        // File B: separate FS, separate cache. We use the same
+        // capacity-1 setting and read B, then read A AGAIN through B's
+        // FS-handle-equivalent: actually we test eviction within ONE
+        // FS by reading TWO different files. To do that, build a
+        // single image containing both compressed files and read both
+        // through one fs.
+        let payload_a2 = vec![b'A'; 5 * bs];
+        let payload_b2 = vec![b'B'; 5 * bs];
+        // Build combined image with two compressed files.
+        use crate::mkfs::{
+            build_image, CompressedAlgo, CompressedFileSpec, Node, NodeMeta, DEFAULT_DIR_MODE,
+            DEFAULT_FILE_MODE,
+        };
+        use std::collections::BTreeMap;
+        let mk_node = |data: Vec<u8>| -> Node {
+            Node::CompressedFile(CompressedFileSpec {
+                mode: DEFAULT_FILE_MODE,
+                data,
+                algo: CompressedAlgo::Lz4,
+                lclusterbits: 0,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+                index_format: CompressedFileSpec::default_index_format(),
+                ztailpacking: false,
+                target_pcluster_blocks: CompressedFileSpec::default_target_pcluster_blocks(),
+            })
+        };
+        let mut entries: BTreeMap<String, Node> = BTreeMap::new();
+        entries.insert("a.bin".into(), mk_node(payload_a2.clone()));
+        entries.insert("b.bin".into(), mk_node(payload_b2.clone()));
+        let img_combined = build_image(
+            Node::Dir {
+                mode: DEFAULT_DIR_MODE,
+                entries,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+            12,
+        )
+        .unwrap();
+        let dev_c: Arc<dyn BlockRead> = Arc::new(MemDev::new(img_combined));
+        let fs = Filesystem::open(dev_c).unwrap();
+        fs.set_pcluster_cache_capacity(1);
+        let i_a = fs.lookup_path("/a.bin").unwrap();
+        let i_b = fs.lookup_path("/b.bin").unwrap();
+
+        let mut buf_a = vec![0u8; payload_a2.len()];
+        fs.read_file(&i_a, 0, &mut buf_a).unwrap();
+        assert_eq!(buf_a, payload_a2);
+
+        // Now read B -- this should EVICT A (capacity = 1).
+        let mut buf_b = vec![0u8; payload_b2.len()];
+        fs.read_file(&i_b, 0, &mut buf_b).unwrap();
+        assert_eq!(buf_b, payload_b2);
+
+        let (_, _, _, misses_before) = fs.pcluster_cache_stats();
+        // Re-read A: must be a MISS now (A was evicted by B).
+        fs.read_file(&i_a, 0, &mut buf_a).unwrap();
+        let (_, _, _, misses_after) = fs.pcluster_cache_stats();
+        assert!(
+            misses_after > misses_before,
+            "evicted A should re-MISS the cache after B displaced it ({misses_before} -> {misses_after})"
+        );
+    }
+
+    /// A compressed DIRECTORY's source is read through the metadata cache
+    /// (#69, Greptile on #105): with the pcluster cache off, re-reading it
+    /// must not reach the device again, while a file's source still goes
+    /// around the cache. The crate's writer compresses files only, so the
+    /// routing is asked directly with each answer for the same pcluster.
+    #[test]
+    fn a_compressed_directorys_source_is_read_through_the_metadata_cache() {
+        let bs = 4096usize;
+        let payload = vec![b'D'; 3 * bs];
+        let img = build_compressed_image_for_cache("d.bin", &payload);
+        let counting = Arc::new(fs_core::CountingDevice::new(Arc::new(MemDev::new(img))));
+        let fs =
+            Filesystem::open_with_cache(counting.clone(), DEFAULT_METADATA_CACHE_BLOCKS).unwrap();
+        fs.set_pcluster_cache_capacity(0);
+        let inode = fs.lookup_path("/d.bin").unwrap();
+        let zmap = zmap::ZMap::open(&*fs.primary, &fs.sb, &inode).unwrap();
+
+        let mut buf = vec![0u8; bs];
+        for (metadata, second_reads) in [(true, 0u64), (false, 1)] {
+            fs.fill_from_one_pcluster_as(inode.nid, metadata, &zmap, 0, &mut buf)
+                .unwrap();
+            counting.reset();
+            fs.fill_from_one_pcluster_as(inode.nid, metadata, &zmap, 0, &mut buf)
+                .unwrap();
+            let reads = counting.reads();
+            if metadata {
+                assert_eq!(
+                    reads, second_reads,
+                    "a directory's source re-read reached the device"
+                );
+            } else {
+                assert!(
+                    reads >= second_reads,
+                    "control: a file's source bypasses the cache"
+                );
+            }
+            assert!(buf.iter().all(|&b| b == b'D'));
+        }
+    }
+
+    #[test]
+    fn pcluster_cache_disabled_at_capacity_zero() {
+        let bs = 4096usize;
+        let payload = vec![b'Z'; 5 * bs];
+        let img = build_compressed_image_for_cache("c.bin", &payload);
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        fs.set_pcluster_cache_capacity(0);
+        let inode = fs.lookup_path("/c.bin").unwrap();
+
+        let mut buf = vec![0u8; payload.len()];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+        let (entries, capacity, hits, misses) = fs.pcluster_cache_stats();
+        assert_eq!(entries, 0, "disabled cache must hold zero entries");
+        assert_eq!(capacity, 0, "disabled cache reports zero capacity");
+        assert_eq!(hits, 0, "disabled cache yields zero hits");
+        assert_eq!(
+            misses, 0,
+            "disabled cache shouldn't bump miss counter either"
+        );
+
+        // Re-read still works (just slow): bytes must be correct.
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(buf, payload);
+        let (_, _, hits2, _) = fs.pcluster_cache_stats();
+        assert_eq!(hits2, 0, "still no hits after re-read with cache disabled");
+    }
+
+    #[test]
+    fn pcluster_cache_independent_per_inode() {
+        // Two compressed files in one image, each with its own NID.
+        // We populate the cache from one and confirm the other still
+        // misses on its first read -- proving the (nid, blkaddr)
+        // composite key prevents cross-inode bleed even when blkaddrs
+        // happen to coincide. (mkfs assigns distinct blkaddrs here, so
+        // the test's stronger guarantee is that "different NIDs always
+        // miss independently"; cf. the synthetic same-blkaddr test
+        // below in the integration suite.)
+        let bs = 4096usize;
+        let payload_a = vec![b'A'; 3 * bs];
+        let payload_b = vec![b'B'; 3 * bs];
+
+        use crate::mkfs::{
+            build_image, CompressedAlgo, CompressedFileSpec, Node, NodeMeta, DEFAULT_DIR_MODE,
+            DEFAULT_FILE_MODE,
+        };
+        use std::collections::BTreeMap;
+        let mk_node = |data: Vec<u8>| -> Node {
+            Node::CompressedFile(CompressedFileSpec {
+                mode: DEFAULT_FILE_MODE,
+                data,
+                algo: CompressedAlgo::Lz4,
+                lclusterbits: 0,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+                index_format: CompressedFileSpec::default_index_format(),
+                ztailpacking: false,
+                target_pcluster_blocks: CompressedFileSpec::default_target_pcluster_blocks(),
+            })
+        };
+        let mut entries: BTreeMap<String, Node> = BTreeMap::new();
+        entries.insert("a.bin".into(), mk_node(payload_a.clone()));
+        entries.insert("b.bin".into(), mk_node(payload_b.clone()));
+        let img = build_image(
+            Node::Dir {
+                mode: DEFAULT_DIR_MODE,
+                entries,
+                meta: NodeMeta::default(),
+                xattrs: Vec::new(),
+            },
+            12,
+        )
+        .unwrap();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let i_a = fs.lookup_path("/a.bin").unwrap();
+        let i_b = fs.lookup_path("/b.bin").unwrap();
+        assert_ne!(i_a.nid, i_b.nid, "two files must have distinct NIDs");
+
+        // Read A first -- populates cache for NID(a).
+        let mut buf_a = vec![0u8; payload_a.len()];
+        fs.read_file(&i_a, 0, &mut buf_a).unwrap();
+        let (_, _, _, misses_after_a) = fs.pcluster_cache_stats();
+
+        // Read B -- must MISS (different NID, distinct cache key).
+        let mut buf_b = vec![0u8; payload_b.len()];
+        fs.read_file(&i_b, 0, &mut buf_b).unwrap();
+        assert_eq!(buf_b, payload_b);
+        let (_, _, _, misses_after_b) = fs.pcluster_cache_stats();
+        assert!(
+            misses_after_b > misses_after_a,
+            "first read of B (different NID) MUST miss ({misses_after_a} -> {misses_after_b})"
+        );
+        // Bytes for A are still correct (no cross-bleed).
+        let mut buf_a_again = vec![0u8; payload_a.len()];
+        fs.read_file(&i_a, 0, &mut buf_a_again).unwrap();
+        assert_eq!(buf_a_again, payload_a);
+    }
+
+    #[test]
+    fn pcluster_cache_with_capacity_builder() {
+        // Builder-style override at open time is honoured, and stats
+        // reflect the chosen capacity.
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev)
+            .unwrap()
+            .with_pcluster_cache_capacity(7);
+        let (_, capacity, _, _) = fs.pcluster_cache_stats();
+        assert_eq!(capacity, 7, "builder-style override must take effect");
+    }
+
+    #[test]
+    fn pcluster_cache_plain_inode_does_not_populate() {
+        // PLAIN (uncompressed) reads bypass the cache by design. Read
+        // a FLAT_PLAIN file end-to-end and confirm the cache is still
+        // empty afterwards (no hits, no misses, no entries).
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        let inode = fs.lookup_path("/hello.txt").unwrap();
+        let mut buf = [0u8; 3];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"hi\n");
+        let (entries, _, hits, misses) = fs.pcluster_cache_stats();
+        assert_eq!(entries, 0);
+        assert_eq!(hits, 0);
+        assert_eq!(
+            misses, 0,
+            "PLAIN reads must not touch the decompression cache"
+        );
+    }
+
+    // --- multi-device support ----------------------------------------
+    //
+    // These tests exercise `Filesystem::open_with_devices` and verify
+    // that chunked reads with non-zero `device_id` route to the
+    // matching extra-device handle. Compressed pclusters always carry
+    // `device_id == 0` under the public spec, so multi-device routing
+    // is a chunked-only feature for now.
+
+    /// Build a synthetic 2-device EROFS image whose primary holds:
+    /// - SB at byte 1024 with `extra_devices = 1`, `devt_slotoff = 16`
+    ///   (so the device-table slot lives at byte 2048)
+    /// - device-table slot 0 at byte 2048 with tag "extra1"
+    /// - meta_blkaddr = 1: indexed chunked inode at NID 0 with two
+    ///   chunks. Chunk 0 -> device 0 / blkaddr 4 ("AAAA…"). Chunk 1 ->
+    ///   device 1 / blkaddr 0 ("BBBB…", served from the extra device).
+    ///
+    /// Returns `(primary_image, extra_device_image)`.
+    fn build_two_device_image() -> (Vec<u8>, Vec<u8>) {
+        const BS: usize = 4096;
+        // Primary: 6 blocks (24 KiB).
+        let mut primary = vec![0u8; BS * 6];
+
+        // SB with extra_devices = 1 and devt_slotoff = 16 (byte 2048).
+        let mut sb = synth_sb(12, 0, 1, 6);
+        sb[0x56..0x58].copy_from_slice(&1u16.to_le_bytes()); // extra_devices
+        sb[0x58..0x5A].copy_from_slice(&16u16.to_le_bytes()); // devt_slotoff
+        primary[EROFS_SUPER_OFFSET as usize..EROFS_SUPER_OFFSET as usize + sb.len()]
+            .copy_from_slice(&sb);
+
+        // Device-table slot 0 at byte 2048: tag "extra1", blocks=1,
+        // mapped_blkaddr=0.
+        let slot_off = 16 * 128; // = 2048
+        primary[slot_off..slot_off + 6].copy_from_slice(b"extra1");
+        primary[slot_off + 64..slot_off + 68].copy_from_slice(&1u32.to_le_bytes());
+
+        // Indexed-chunked inode at NID 0 (byte 4096). chunk_bits=0,
+        // INDEXES set; size = 2 blocks; raw_format mirrors the
+        // chunked.rs fixture (layout in bits 1..=3, flags in 4..=15).
+        let mut inode = synth_compact(DataLayout::ChunkBased, 0x81A4, (BS * 2) as u32, 0);
+        let raw_format: u16 = ((DataLayout::ChunkBased as u16) << 1)
+            | (crate::chunked::EROFS_CHUNK_FORMAT_INDEXES << 4);
+        inode[0x00..0x02].copy_from_slice(&raw_format.to_le_bytes());
+        // i_u low 16 bits also carry chunk-format flags (chunked.rs
+        // reads from i_u when non-zero — match its fallback path).
+        inode[0x10..0x12]
+            .copy_from_slice(&crate::chunked::EROFS_CHUNK_FORMAT_INDEXES.to_le_bytes());
+        primary[BS..BS + 32].copy_from_slice(&inode);
+
+        // Indexed chunkmap immediately after the 32-byte inode body.
+        // Entry 0: device_id=0, blkaddr=4. Entry 1: device_id=1,
+        // blkaddr=0 (i.e. block 0 of the extra device).
+        let map_off = BS + 32;
+        primary[map_off..map_off + 2].copy_from_slice(&0u16.to_le_bytes()); // advise
+        primary[map_off + 2..map_off + 4].copy_from_slice(&0u16.to_le_bytes()); // device_id
+        primary[map_off + 4..map_off + 8].copy_from_slice(&4u32.to_le_bytes()); // blkaddr
+        primary[map_off + 8..map_off + 10].copy_from_slice(&0u16.to_le_bytes());
+        primary[map_off + 10..map_off + 12].copy_from_slice(&1u16.to_le_bytes()); // device_id=1
+        primary[map_off + 12..map_off + 16].copy_from_slice(&0u32.to_le_bytes()); // blkaddr=0
+
+        // Chunk 0 data on the primary at block 4: filled with 'A'.
+        for b in &mut primary[4 * BS..5 * BS] {
+            *b = b'A';
+        }
+
+        // Extra device: 1 block, filled with 'B'.
+        let extra = vec![b'B'; BS];
+
+        (primary, extra)
+    }
+
+    #[test]
+    fn open_with_devices_validates_extras_count() {
+        // SB advertises 1 extra device but caller passes none -> error.
+        let (primary, _extra) = build_two_device_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary));
+        match Filesystem::open_with_devices(dev, Vec::new()) {
+            Err(Error::BadSuperblock(msg)) => {
+                assert!(msg.contains("extra device"), "msg = {msg:?}");
+            }
+            Err(other) => panic!("expected BadSuperblock, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn open_with_devices_rejects_too_many_extras() {
+        // Single-device image opened with a stray extra -> mismatch.
+        let img = build_image();
+        let primary: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let extra: Arc<dyn BlockRead> = Arc::new(MemDev::new(vec![0u8; 4096]));
+        match Filesystem::open_with_devices(primary, vec![extra]) {
+            Err(Error::BadSuperblock(_)) => {}
+            Err(other) => panic!("expected BadSuperblock, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn open_keeps_single_device_compat() {
+        // The legacy single-device `open` continues to work after the
+        // multi-device refactor (extras stays empty internally).
+        let img = build_image();
+        let dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(img));
+        let fs = Filesystem::open(dev).unwrap();
+        assert!(fs.read_device_table().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_device_table_surfaces_tags() {
+        let (primary, extra) = build_two_device_image();
+        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary));
+        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(extra));
+        let fs = Filesystem::open_with_devices(primary_dev, vec![extra_dev]).unwrap();
+        let slots = fs.read_device_table().unwrap();
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].tag_str(), "extra1");
+        assert_eq!(slots[0].blocks, 1);
+    }
+
+    #[test]
+    fn read_routes_to_correct_device() {
+        // Chunk 0 -> primary ('A's), chunk 1 -> extra device ('B's).
+        let (primary, extra) = build_two_device_image();
+        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary));
+        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(extra));
+        let fs = Filesystem::open_with_devices(primary_dev, vec![extra_dev]).unwrap();
+        let inode = fs.read_inode(0).unwrap();
+        assert!(inode.is_regular_file());
+
+        // Chunk 0: should be all 'A' from the primary.
+        let mut buf = [0u8; 8];
+        fs.read_file(&inode, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"AAAAAAAA");
+
+        // Chunk 1: must come from the EXTRA device.
+        fs.read_file(&inode, 4096, &mut buf).unwrap();
+        assert_eq!(&buf, b"BBBBBBBB");
+    }
+
+    #[test]
+    fn read_block_helper_dispatches() {
+        // Direct test of the dispatch helper: `device_id == 0` reads
+        // from the primary (the byte we pre-populate); `device_id ==
+        // 1` reads from the extra (different pre-populated byte).
+        // Both with explicit byte offsets so the helper's offset-passthrough
+        // is also exercised.
+        let primary_bytes = [b'P'; 64];
+        let extra_bytes = vec![b'E'; 64];
+        // Primary needs a parseable SB so the FS can be opened.
+        let (mut primary_img, _) = build_two_device_image();
+        // Stamp a recognisable byte at offset 100 of the primary.
+        primary_img[100] = b'P';
+
+        let primary_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(primary_img));
+        let extra_dev: Arc<dyn BlockRead> = Arc::new(MemDev::new(extra_bytes.clone()));
+        let fs = Filesystem::open_with_devices(primary_dev, vec![extra_dev]).unwrap();
+
+        let mut buf = [0u8; 1];
+        fs.read_block(0, 100, &mut buf).unwrap();
+        assert_eq!(buf[0], b'P');
+        fs.read_block(1, 0, &mut buf).unwrap();
+        assert_eq!(buf[0], b'E');
+
+        // device_id past the end of extras -> BadSuperblock.
+        let err = fs.read_block(2, 0, &mut buf).unwrap_err();
+        assert!(matches!(err, Error::BadSuperblock(_)));
+
+        // The unused `primary_bytes` keeps the compiler happy that
+        // we're matching on byte values, not addresses.
+        assert_ne!(primary_bytes[0], extra_bytes[0]);
+    }
+}

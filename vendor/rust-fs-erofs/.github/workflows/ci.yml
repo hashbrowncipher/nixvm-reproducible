@@ -1,0 +1,580 @@
+name: CI
+
+# EVERY JOB RUNS CHORE TASKS, so a green local `chore test` is the same
+# evidence as a green run here (see the test contract at the top of
+# chores.yml):
+#
+#   unit         `chore test:unit` on a runner with NO fixtures: the tests
+#                that need no tool, no fixture and no VM, in the debug
+#                profile that traps an arithmetic overflow. That the job
+#                passes with test-disks/ holding only the committed ZSTD
+#                image is what proves the split.
+#   fixtures     `chore fixtures`: the mkfs.erofs-made images, built in the
+#                fs-linux-test-harness VM under KVM on x86_64, and handed
+#                to the other jobs as an artifact (they are disk images,
+#                the same for every architecture).
+#   test         x86_64, where GitHub gives us KVM: `chore lint` and
+#                `chore test` — the whole gate, with EVERY erofs-utils call
+#                and every kernel mount happening inside the harness VM.
+#                Nothing installs erofs-utils on the runner, and the log
+#                shows `[oracle vm]` / `[kernel vm]` for each one.
+#   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
+#                Apple Silicon hosts link it) but GitHub's arm64
+#                runners have NO KVM, so no VM can run: this job runs the
+#                tiers that need none — lint, the unit tier, and the
+#                fixture-reading tests. Before the fixtures existed, that
+#                meant aarch64 read no mkfs.erofs image at all.
+#   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
+#                the guest. That is how a macOS host runs a Linux suite,
+#                and this job is what keeps that path working.
+#   cli          `chore cli:install` then `chore test:cli`: the command-line
+#                tools built in release mode, staged under every name first
+#                on PATH, and tested AS INSTALLED -- `rust-fs-erofs doctor`
+#                first, then tests/cli/*.sh. A change that breaks a tool
+#                fails the pull request, not the release. Then the release
+#                tarball is packaged from the same build and its layout
+#                checked by rust-fs-core's package-cli (run in place from
+#                ../rust-fs-core), the same packaging release.yml reaches
+#                through core's release-cli workflow, so a release is not
+#                the first time it is put together. No VM here: what erofs-utils
+#                and the kernel make of the tools' images is judged in the
+#                oracle and kernel tiers, in the `test` job.
+#   cli-windows  the same suite on windows-latest, against the tools from
+#                the .zip a release attaches for Windows, unpacked as a user
+#                unpacks it (#185).
+#   ci-ok        the one required check: green only when every job above
+#                ran and succeeded (failed, cancelled OR skipped fails it).
+#
+# WHAT IS NO LONGER HERE. A 604-line source build of erofs-utils 1.9.1 on
+# the runner, in two jobs; a `validate mkfs_erofs (fsck.erofs strict)` job
+# that shelled out to the writer and fsck by hand; and three `cargo test`
+# steps that printed 1,393 lines between them. The tool build moved into
+# the guest (scripts/vm-setup.sh), the validation became the `oracle`
+# tier, and the tiers print a verdict. #131 measured the old shape at
+# 6,035 lines across three jobs, with none of them kept.
+#
+# THE OUTPUT BUDGET IS IN THE TASKS, so it is in this workflow too. Each
+# tier writes its full output to tmp/logs/<tier>.log and prints a verdict;
+# a tier that prints more than its measured budget FAILS (exit 65), which
+# is how a job that starts emitting thousands of lines turns red here
+# rather than being noticed by whoever scrolls it next. Every job that
+# runs a tier uploads those logs with `if: always()`, so the detail
+# survives the runner.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  # NO BRANCH FILTER ON PULL REQUESTS. With `branches: [main]` a pull
+  # request based on anything else runs no CI at all — and still collects
+  # its review-bot ticks, so it reads as verified. Stacked pull requests
+  # are how work arrives here.
+  pull_request:
+  # The merge queue's run: main plus the queued pull requests, the run that
+  # decides whether they land. The queue reads ci-ok only from a workflow
+  # that triggers here.
+  merge_group:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHORE_VERSION: "0.11.0"
+
+jobs:
+  # Does this change need the full pipeline? rust-fs-core's
+  # scripts/code-changed.sh reads the change's paths and says false only when
+  # every one is documentation. The change is the pull request's diff, the
+  # merge queue group's (its base_sha to its head_sha: what the queue is about
+  # to land), or a push to main's (before to after); a tag or a push it cannot
+  # diff runs everything. The jobs that boot the VM or read its fixtures
+  # (test, test-arm64, suite-in-vm) run only when the answer is true, and
+  # ci-ok accepts their skip when, and only when, it is false.
+  changes:
+    name: changes (does this need the full pipeline?)
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.c.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Classify the change
+        id: c
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MQ_BASE: ${{ github.event.merge_group.base_sha }}
+          MQ_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          range=
+          case "$EVENT" in
+            pull_request) range="$PR_BASE...$PR_HEAD" ;;
+            merge_group) range="$MQ_BASE...$MQ_HEAD" ;;
+            push)
+              case "$REF" in
+                refs/heads/*)
+                  if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] &&
+                    git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+                    range="$PUSH_BEFORE...$PUSH_AFTER"
+                  fi ;;
+              esac ;;
+          esac
+          if [ -n "$range" ]; then
+            git diff --name-only "$range" | tee changed.txt
+            code="$(bash ../rust-fs-core/scripts/code-changed.sh < changed.txt)"
+          else
+            code=true
+          fi
+          echo "code=$code ($EVENT${range:+ $range})"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+  unit:
+    name: unit (no tools, no VM)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        # Pinned (CHORE_VERSION) and checked against the release's
+        # checksums: the siblings, the tools and the tests all come
+        # through it.
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core (the path dependency) and fs-linux-test-harness, at
+        # the refs pinned in chores.yml.
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: No generated fixtures are present
+        # The committed ZSTD image stays; everything `chore fixtures`
+        # makes must be absent, or this job is not proving the split.
+        run: |
+          set -euo pipefail
+          if ls test-disks/erofs-plain.img test-disks/erofs-lz4.img >/dev/null 2>&1; then
+            echo "::error::test-disks/ has generated images; this job must prove the unit tier needs none"
+            exit 1
+          fi
+      - name: chore test:unit
+        run: chore test:unit
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-unit
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  fixtures:
+    name: fixtures (harness VM, x86_64 KVM)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore fixtures
+        run: chore fixtures
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks/erofs-*.img
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: test (x86_64, oracles in the VM)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore tools
+        run: chore tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # THE EVIDENCE, NOT THE CLAIM. If a runner ever has erofs-utils on
+      # it, every one of its programs is replaced with a stub that fails
+      # loudly. Nothing this job runs may use them: the tools belong to
+      # the guest, and a test that reached for one here would turn the
+      # run red with a message saying so, rather than quietly passing on
+      # a version too old to mean anything.
+      - name: Make any erofs-utils on the runner unusable
+        run: |
+          set -eu
+          for tool in mkfs.erofs fsck.erofs dump.erofs erofsfuse; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        run: chore test
+      - name: Keep the tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-x86_64
+          path: tmp/logs/*.log
+          if-no-files-found: error
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+
+  test-arm64:
+    name: test (aarch64, no KVM on this runner)
+    needs: fixtures
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      - name: chore lint
+        run: chore lint
+      # `c_char` is signed on x86_64-linux and unsigned on aarch64-linux,
+      # so a cast through it can be real on one and a clippy error on the
+      # other (#89): only a native run here lints and executes.
+      - name: chore test:unit
+        run: chore test:unit
+      # Everything that reads a fixture but needs no VM. The oracle and
+      # kernel tiers cannot run here — GitHub's arm64 runners have no
+      # /dev/kvm — and they are not architecture-specific: they read the
+      # same bytes the x86_64 job's guest reads.
+      - name: chore test:images
+        run: chore test:images
+      - name: Keep the tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-aarch64
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  suite-in-vm:
+    name: suite in the guest (the macOS path)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # No Rust on the runner: the toolchain that matters is the one the
+      # guest installs from rust-toolchain.toml. That is the point of the
+      # job — on a Mac there is no usable host toolchain for these tests
+      # either.
+      - name: chore test:vm
+        run: chore test:vm
+      - name: Keep the tier logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-suite-in-vm
+          path: tmp/logs/*.log
+          if-no-files-found: error
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+
+  cli:
+    name: cli (the installed tools, on PATH)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cli-cargo-
+      - name: chore cli:install
+        run: chore cli:install
+      # FIRST on PATH, ahead of anything the runner has under the same
+      # names -- which doctor then reports as present and not run.
+      - name: The staged tools first on PATH
+        run: scripts/cli-install.sh --print-bin-dir >> "$GITHUB_PATH"
+      - name: chore test:cli
+        id: tier
+        run: chore test:cli
+      # The tarball release.yml attaches, from the build the tier just
+      # tested: bin/, the man pages, the completions, CAVEATS and LICENSE,
+      # each dotted name a relative symlink answering for this version.
+      - name: The release tarball, packaged and its layout checked
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p tmp/package
+          cd tmp/package
+          bash ../../../rust-fs-core/scripts/package-cli.sh "$version" linux-x86_64
+      - name: Keep the tier logs
+        # Not before the tier ran: there is no log then, and this step's red
+        # would hide the real one.
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-cli
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  # The tools as a Windows user gets them (#185): built for
+  # x86_64-pc-windows-msvc, packaged by rust-fs-core's package-cli into the
+  # .zip release-cli attaches, unpacked with PowerShell's Expand-Archive,
+  # and tested from there, first on PATH, by the same scripts/test-cli.sh
+  # suite the `cli` job runs. No chore: chore has no Windows build, so the
+  # sibling is fetched the way `chore siblings` fetches it, from the pin in
+  # chores.yml, and the tier runs its command line from there.
+  #
+  # Git Bash rewrites any argument that starts with / into a Windows path,
+  # `fs.erofs IMG ls /` included. MSYS_NO_PATHCONV turns that off for the
+  # suite alone, which hands the tools Windows-form paths itself
+  # (tests/cli/lib.sh); the build and the packaging rely on the rewriting,
+  # since cargo cannot read /d/a/.../Cargo.toml. A native symlink needs
+  # winsymlinks:nativestrict, or `ln -s` copies the file and mkfs never
+  # meets the symlink it is meant to leave out.
+  cli-windows:
+    name: cli (Windows, the release zip's tools on PATH)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      MSYS: winsymlinks:nativestrict
+    steps:
+      - uses: actions/checkout@v4
+      - name: The rust-fs-core sibling, at chores.yml's pin
+        run: |
+          set -euo pipefail
+          url="$(sed -n 's/^  FS_CORE_URL: *//p' chores.yml)"
+          ref="$(sed -n 's/^  FS_CORE_REF: *//p' chores.yml)"
+          [ -n "$url" ] && [ -n "$ref" ] || { echo "::error::no FS_CORE_URL/FS_CORE_REF in chores.yml" >&2; exit 1; }
+          git init --quiet ../rust-fs-core
+          git -C ../rust-fs-core remote add origin "$url"
+          git -C ../rust-fs-core fetch --quiet --depth 1 origin "$ref"
+          git -C ../rust-fs-core checkout --quiet FETCH_HEAD
+          echo "rust-fs-core at $ref ($(git -C ../rust-fs-core rev-parse --short HEAD))"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cli-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cli-cargo-
+      - name: Build the tools
+        run: cargo build --locked --release --features cli --bin rust-fs-erofs --quiet
+      - name: The release zip, packaged and its layout checked
+        id: pack
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          mkdir -p tmp/package
+          cd tmp/package
+          zip="$(bash ../../../rust-fs-core/scripts/package-cli.sh "$version" windows-x86_64 | tail -n 1)"
+          echo "zip=tmp/package/$zip" >> "$GITHUB_OUTPUT"
+      - name: Unpacked as a Windows user would, first on PATH
+        shell: pwsh
+        env:
+          ZIP: ${{ steps.pack.outputs.zip }}
+        run: |
+          $prefix = Join-Path $PWD 'tmp\cli-windows'
+          Expand-Archive -Path $env:ZIP -DestinationPath $prefix -Force
+          Join-Path $prefix 'bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: test:cli, the tools from the zip
+        id: tier
+        env:
+          MSYS_NO_PATHCONV: "1"
+        run: |
+          set -euo pipefail
+          bash ../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh
+          bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 130
+      - name: Keep the tier logs
+        if: always() && steps.tier.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-cli-windows
+          path: tmp/logs/*.log
+          if-no-files-found: error
+
+  # ONE CHECK GATES A MERGE, AND IT STANDS FOR EVERY JOB (#123).
+  #
+  # Branch protection names checks, and a check is a job name. Naming
+  # each one means the list has to be edited whenever a job is renamed,
+  # split into a matrix leg or added — and until someone does, the new
+  # work is required by nobody.
+  #
+  # `if: always()` because a job that was cancelled or skipped is not a
+  # job that passed, and an aggregate that only runs when its needs
+  # succeeded would be skipped itself — and a skipped required check
+  # never reports at all.
+  semver:
+    # `chore check:semver`: this tree's public API against the newest
+    # version on crates.io, refusing a break the version in Cargo.toml does
+    # not declare. Why, and what it cannot see, is at the top of
+    # ../rust-fs-core/scripts/semver-check.sh.
+    name: semver (public API against crates.io)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The version ../rust-fs-core/scripts/semver-check.sh expects. A prebuilt binary,
+      # checksum-verified by the action, rather than a ten-minute build.
+      CARGO_SEMVER_CHECKS_VERSION: "0.50.0"
+      # A failing tier prints only its verdict by default. Here the tail IS
+      # the answer -- which items broke -- so it is printed in full.
+      OUTPUT_BUDGET_FAIL_TAIL: "200"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core, the path dependency the current tree builds against.
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks@${{ env.CARGO_SEMVER_CHECKS_VERSION }}
+      - name: chore check:semver
+        shell: bash
+        run: chore check:semver
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [changes, unit, fixtures, test, test-arm64, suite-in-vm, cli, cli-windows, semver]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job ran and succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          # false only for a change to documentation alone: then, and only
+          # then, a skipped job is not a failed one.
+          CODE: ${{ needs.changes.outputs.code }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "code changed: $CODE"
+          bad="$(echo "$NEEDS" | jq -r --arg code "$CODE" '[to_entries[] | select(.value.result != "success" and ($code != "false" or .value.result != "skipped")) | .key] | join(", ")')"
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $bad (failed, cancelled or skipped)"
+            exit 1
+          fi
+          echo "all required jobs succeeded"

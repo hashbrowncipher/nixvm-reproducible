@@ -1,0 +1,113 @@
+[package]
+name = "rust-fs-erofs"
+version = "0.4.1"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust EROFS (Enhanced Read-Only File System) reader and writer. Clean-room implementation; reads mkfs.erofs 1.9 images (LZ4/LZMA/DEFLATE/ZSTD, compacted-2B, ztailpacking, fragments, dedupe, big_pcluster), and refuses rather than misreads the shapes it cannot vouch for and produces fsck.erofs-clean output."
+repository = "https://github.com/antimatter-studios/rust-fs-erofs"
+
+# The fuzz crate is its own package, on its own toolchain, and is not
+# part of this one. Without this, `cargo package` and `cargo publish`
+# try to include it and fail on the nightly-only dependency.
+exclude = ["fuzz"]
+
+# The name this crate had on crates.io: the semver check's baseline until
+# a release exists under the new one (rust-fs-core's semver-check.sh).
+[package.metadata.semver]
+former-name = "am-fs-erofs"
+
+[lib]
+name = "fs_erofs"
+crate-type = ["staticlib", "rlib"]
+
+# THE COMMAND-LINE TOOLS: one multi-call binary, named for the repository.
+# It dispatches on argv[0], the way busybox and e2fsprogs do, so the
+# release step installs it once as `rust-fs-erofs` and links `mkfs.erofs`
+# to it (cargo refuses a dot in a target name, so the dotted names are
+# never cargo's). `rust-fs-erofs <tool> ...` is the form nothing else on
+# PATH can shadow, and `cargo run --features cli -- mkfs ...` works before
+# anything is installed. It replaces the `mkfs_erofs` target.
+#
+# BEHIND THE `cli` FEATURE, so the static library a consumer links gains no
+# dependency from the tools: `required-features` keeps the target out of a
+# build that did not ask for it. scripts/test.sh and `chore lint` ask for
+# it, so the tests and clippy reach it.
+[[bin]]
+name = "rust-fs-erofs"
+path = "src/cli/main.rs"
+required-features = ["cli"]
+
+# WHAT THE RELEASE TARBALL SHIPS, read by rust-fs-core's package-cli.sh
+# (`../rust-fs-core/scripts/package-cli.sh`), which release.yml reaches through core's
+# release-cli workflow and ci.yml's `cli` job runs on every pull request.
+# Each dotted name is a relative symlink to bin/rust-fs-erofs, with its man
+# page in the section given here; the binary's own `generate names` must
+# list exactly these, or the packaging fails.
+[package.metadata.package-cli]
+names = { "mkfs.erofs" = 8, "fs.erofs" = 1 }
+licenses = ["LICENSE"]
+
+[features]
+# The command-line tools and nothing else. The plumbing they share --
+# dispatch, --version, doctor, the output contract, man pages and
+# completions -- is rust-fs-core's `cli` feature, turned on only here, so
+# the static library gains nothing. clap is MIT/Apache-2.0.
+cli = ["dep:clap", "rust-fs-core/cli"]
+
+[dependencies]
+rust-fs-core = { path = "../rust-fs-core", version = "0.3.9" }
+lz4_flex = { version = "0.11", default-features = false, features = ["safe-decode", "safe-encode"] }
+lzma-rs = "0.3"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# CRC32C (Castagnoli, polynomial 0x1EDC6F41) for the EROFS superblock
+# checksum (feature_compat bit 0). Apache-2.0 licensed; no proc-macro
+# deps so it stays cleanroom-safe.
+crc32c = "0.6"
+# ZSTD codec (algorithm id 3). `mkfs.erofs` calls `ZSTD_compress2`, which
+# emits an ordinary zstd frame — magic number and all — so a standard
+# decoder reads it. `ruzstd` is a pure-Rust decoder-only implementation;
+# MIT, no proc-macro deps, and no C to link.
+ruzstd = "0.8"
+# LRU cache for decompressed pcluster bytes — avoids re-paying the
+# LZ4/LZMA/DEFLATE cost on every block-level read of a multi-block
+# compressed inode. MIT licensed; pure-Rust; no proc-macro deps.
+lru = "0.12"
+# The command-line tools' argument parser, behind the `cli` feature (see
+# the `rust-fs-erofs` target above). No derive: the builder API keeps each
+# tool's command a function the man pages and completions can be made from.
+clap = { version = "4.5", optional = true, default-features = false, features = ["std", "help", "usage", "error-context", "suggestions"] }
+
+[dev-dependencies]
+# The test suite's one way in to a fixture, to an erofs-utils tool and to
+# the kernel — all three of which live in the fs-linux-test-harness VM.
+# Dev-only: it never reaches a consumer of this crate, and it is what
+# tests/test_contract.rs holds every test to.
+fs-erofs-test-support = { path = "tests/support" }
+lz4_flex = { version = "0.11", features = ["safe-encode"] }
+tempfile = "3"
+# YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml
+# and refuses if the debug run that lets the PR gate see an arithmetic
+# overflow has been removed or disabled. That guard hand-rolled its own
+# scanner and was defeated by ordinary YAML -- a quoted "if" key, a
+# commented-out trigger, and a `|-` block scalar. Quoted keys, block
+# styles and comments are the grammar, not edge cases, so the file is
+# parsed rather than scanned. Pure Rust, YAML 1.2 (so GitHub's `on:` key
+# stays the string `on` and is not folded into a boolean),
+# MIT/Apache-2.0, and no C to transpile -- unlike serde_yaml, which is
+# deprecated and wraps unsafe-libyaml. Dev-only: it never reaches a
+# consumer of this crate.
+saphyr = "0.0.12"
+# SHA-256 for tests/oracle_android.rs, which compares every file of a real
+# Android image against hashes the kernel's EROFS driver and fsck.erofs
+# produced. MIT/Apache-2.0, pure Rust. Dev-only.
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+panic = "unwind"

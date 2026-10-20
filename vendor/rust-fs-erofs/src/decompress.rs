@@ -1,0 +1,1379 @@
+//! Codec wrappers for EROFS compressed clusters.
+//!
+//! LZ4, LZMA, DEFLATE and ZSTD.
+//!
+//! On-disk format: EROFS stores raw codec output (no frame header),
+//! with ZSTD the exception that proves the rule.
+//! - LZ4: raw BLOCK output, decoded via `lz4_flex::block::decompress_into`.
+//! - LZMA: raw LZMA1 bitstream (NOT `.xz` framed). EROFS conveys the
+//!   LZMA properties (lc, lp, pb, dict_size) out-of-band via the
+//!   `z_erofs_lzma_cfgs` config block when
+//!   `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` is set; for v0.1 we assume
+//!   the lzma-rs defaults. Real images that use non-default props
+//!   need the parent zmap layer to plumb config through later.
+//! - DEFLATE: raw DEFLATE blocks (no zlib/gzip wrapper), decoded with
+//!   `flate2::Decompress::new(false)`.
+//! - ZSTD: an ordinary zstd frame, magic number and all. This is the
+//!   odd one out and it is worth saying why, because "EROFS stores raw
+//!   codec output" would lead a reader to strip a header that is
+//!   really there: `mkfs.erofs` compresses a pcluster with a plain
+//!   `ZSTD_compress2` call, which produces a complete frame. The
+//!   `z_erofs_zstd_cfgs` record in the superblock's COMPR_CFGS blob
+//!   carries a window log, but only so a decoder that streams into a
+//!   fixed ring buffer can size it up front; decoding a whole pcluster
+//!   at a time, as this crate does, never needs it.
+
+use std::io::{Cursor, Read};
+
+use flate2::{Decompress, FlushDecompress};
+
+use crate::error::{Error, Result};
+use crate::superblock::LzmaCfg;
+
+/// EROFS compression-algorithm IDs. The `feature_incompat` SB bit
+/// EROFS_FEATURE_INCOMPAT_ZERO_PADDING (0x1) and per-cluster advise
+/// bits decide which arm gets dispatched; this enum is the
+/// codec-layer surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Algorithm {
+    Lz4 = 0,
+    Lzma = 1,
+    Deflate = 2,
+    Zstd = 3,
+}
+
+impl Algorithm {
+    pub fn from_id(id: u8) -> Result<Self> {
+        match id {
+            0 => Ok(Algorithm::Lz4),
+            1 => Ok(Algorithm::Lzma),
+            2 => Ok(Algorithm::Deflate),
+            3 => Ok(Algorithm::Zstd),
+            n => Err(Error::UnsupportedLayout(n)),
+        }
+    }
+}
+
+/// Decompress one cluster. `input` is the raw on-disk compressed
+/// bytes; `output` must be sized to the EXACT decompressed length
+/// (callers know this from the cluster geometry: cluster_size for
+/// non-tail, residual for tail).
+pub fn decompress(algo: Algorithm, input: &[u8], output: &mut [u8]) -> Result<()> {
+    decompress_with_config_and_padding(algo, None, true, input, output)
+}
+
+/// Like [`decompress`] but threads a per-codec config through (e.g.
+/// the LZMA `dict_size` / `lc` / `lp` / `pb` parsed from the
+/// COMPR_CFGS blob). Pass `None` to use the codec defaults — that's
+/// equivalent to calling [`decompress`].
+///
+/// Why a separate entry point instead of always taking `Option`:
+/// callers without an SB-level config (synthetic-image tests, the
+/// mkfs writer paths) reach for the simpler API; only the read path
+/// in `fs.rs` plumbs the parsed COMPR_CFGS through here.
+pub fn decompress_with_config(
+    algo: Algorithm,
+    config: Option<&LzmaCfg>,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    decompress_with_config_and_padding(algo, config, true, input, output)
+}
+
+/// Like [`decompress_with_config`], but takes the superblock's
+/// `EROFS_FEATURE_INCOMPAT_ZERO_PADDING` state explicitly.
+///
+/// When `zero_padding` is set, the compressed frame may be right-aligned
+/// within its on-disk block and leading zero bytes are removed before the
+/// codec sees it. When it is clear, the input is passed to the codec
+/// unchanged. Keeping this decision at the filesystem boundary matters:
+/// an unadvertised leading zero is part of the compressed input, not padding.
+pub fn decompress_with_config_and_padding(
+    algo: Algorithm,
+    config: Option<&LzmaCfg>,
+    zero_padding: bool,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    decode(algo, config, zero_padding, false, input, output)
+}
+
+/// Like [`decompress_with_config_and_padding`], but `output` holds only
+/// a PREFIX of what the frame decodes to: decoding stops once `output`
+/// is full, and a frame with more left in it is not an error.
+///
+/// This is the kernel's "partial decoding", and a deduplicated image
+/// needs it. `mkfs.erofs -Ededupe` points an extent at a pcluster some
+/// earlier extent already wrote when the start of that pcluster's data
+/// matches, and marks the extent's HEAD with `Z_EROFS_LI_PARTIAL_REF`
+/// when it uses fewer bytes than the pcluster holds. The extent map says
+/// how many bytes the extent covers; nothing says how many the pcluster
+/// decodes to. A frame that ends BEFORE `output` is full is still
+/// refused: that extent claims bytes the pcluster does not have.
+///
+/// Only an extent that carries the bit may be read this way. Anywhere
+/// else a frame longer than its extent means the extent map and the
+/// data disagree, which the exact-length decoders refuse.
+pub fn decompress_prefix_with_config_and_padding(
+    algo: Algorithm,
+    config: Option<&LzmaCfg>,
+    zero_padding: bool,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    decode(algo, config, zero_padding, true, input, output)
+}
+
+fn decode(
+    algo: Algorithm,
+    config: Option<&LzmaCfg>,
+    zero_padding: bool,
+    prefix: bool,
+    input: &[u8],
+    output: &mut [u8],
+) -> Result<()> {
+    match algo {
+        Algorithm::Lz4 => decompress_lz4(input, output, zero_padding, prefix),
+        Algorithm::Lzma => {
+            let default = LzmaCfg::default();
+            let cfg = config.unwrap_or(&default);
+            decompress_lzma(input, output, cfg, zero_padding, prefix)
+        }
+        // DEFLATE already stops when its output is full, and checks only
+        // that it filled it.
+        Algorithm::Deflate => decompress_deflate(input, output, zero_padding),
+        Algorithm::Zstd => decompress_zstd(input, output, zero_padding, prefix),
+    }
+}
+
+fn decompress_lz4(input: &[u8], output: &mut [u8], zero_padding: bool, prefix: bool) -> Result<()> {
+    // Empty cluster: nothing to decode. EROFS never emits a zero-byte
+    // compressed cluster against a non-empty output, so treat input
+    // and output both being empty as a no-op.
+    if input.is_empty() && output.is_empty() {
+        return Ok(());
+    }
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "LZ4")?
+    } else {
+        input
+    };
+    if prefix {
+        return lz4_decode_prefix(real_input, output);
+    }
+    let written = lz4_flex::block::decompress_into(real_input, output)
+        .map_err(|_| Error::BadInode("LZ4 decompression failed"))?;
+    // Caller sized `output` to the exact decompressed length; a short
+    // write means the compressed payload didn't expand to fill it.
+    if written != output.len() {
+        return Err(Error::BadInode("LZ4 decompressed size mismatch"));
+    }
+    Ok(())
+}
+
+/// Decode an LZ4 block until `output` is full, and stop there.
+///
+/// `lz4_flex` has no partial mode: it refuses a block that decodes to
+/// more than the buffer it is given, which is exactly the shape a
+/// deduplicated extent has (see
+/// [`decompress_prefix_with_config_and_padding`]). The block format is
+/// small enough to walk here: a token whose high nibble is a literal
+/// length and low nibble a match length less four, each extended by
+/// bytes of 255 while they last, the literals, then a two-byte
+/// little-endian offset back into what has been decoded.
+///
+/// Every length and offset is checked against what exists: a literal
+/// run past the end of the input, an offset of zero or behind the start
+/// of the output, and an input that runs out before `output` is full are
+/// all refused, as `lz4_flex` would refuse them.
+fn lz4_decode_prefix(input: &[u8], output: &mut [u8]) -> Result<()> {
+    const FAILED: Error = Error::BadInode("LZ4 decompression failed");
+    fn length(input: &[u8], ip: &mut usize, mut len: usize) -> Result<usize> {
+        if len != 15 {
+            return Ok(len);
+        }
+        loop {
+            let b = *input.get(*ip).ok_or(FAILED)?;
+            *ip += 1;
+            len = len.checked_add(b as usize).ok_or(FAILED)?;
+            if b != 255 {
+                return Ok(len);
+            }
+        }
+    }
+    let end = output.len();
+    let (mut ip, mut op) = (0usize, 0usize);
+    while op < end {
+        let token = *input.get(ip).ok_or(FAILED)?;
+        ip += 1;
+        let literals = length(input, &mut ip, (token >> 4) as usize)?;
+        let literal_end = ip.checked_add(literals).ok_or(FAILED)?;
+        if literal_end > input.len() {
+            return Err(FAILED);
+        }
+        let take = literals.min(end - op);
+        output[op..op + take].copy_from_slice(&input[ip..ip + take]);
+        op += take;
+        ip = literal_end;
+        if op == end {
+            break;
+        }
+        // Only the last sequence may end after its literals, and this
+        // one has not filled `output`: the extent is longer than the
+        // pcluster's data.
+        let offset = input
+            .get(ip..ip + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .ok_or(FAILED)?;
+        ip += 2;
+        if offset == 0 || offset > op {
+            return Err(FAILED);
+        }
+        let matched = length(input, &mut ip, (token & 0x0F) as usize)?
+            .checked_add(4)
+            .ok_or(FAILED)?;
+        let take = matched.min(end - op);
+        if offset >= take {
+            output.copy_within(op - offset..op - offset + take, op);
+        } else {
+            // Overlapping: each byte may be one this match just wrote.
+            for k in op..op + take {
+                output[k] = output[k - offset];
+            }
+        }
+        op += take;
+    }
+    Ok(())
+}
+
+/// Strip the zero pad EROFS puts *before* a compressed frame, and
+/// refuse a block that is nothing but pad.
+///
+/// # Why the pad is at the front
+///
+/// `EROFS_FEATURE_INCOMPAT_ZERO_PADDING` right-aligns a codec frame
+/// inside its on-disk block, so the *leading* bytes are the zeros. The
+/// filesystem layer must check that feature bit before calling this helper.
+/// The pad is not valid input when the bit is clear.
+///
+/// When the feature is set, the leading-zero rule is lossless against
+/// un-padded input as long as a genuine frame never starts with a zero byte.
+/// That holds for all three codecs this crate reads, for a different reason
+/// each time:
+///
+/// * **LZ4** — the first byte is a token whose nibbles are the literal
+///   and match lengths. `0x00` means "no literals, no match", which
+///   decodes nothing, so no real frame begins with it.
+/// * **DEFLATE** — a first byte of `0x00` means BFINAL=0, BTYPE=00, a
+///   *stored* (uncompressed) block. mkfs.erofs never emits one, because
+///   a stored block does not compress; it always uses fixed or dynamic
+///   Huffman.
+/// * **LZMA** — the first byte is the packed properties byte, which
+///   encodes `(pb * 5 + lp) * 9 + lc`. Zero would mean lc=lp=pb=0,
+///   which no EROFS encoder emits.
+/// * **ZSTD** — the frame begins with the magic number 0xFD2FB528,
+///   stored little-endian, so the first byte on disk is 0x28. This is
+///   the only one of the four where the codec's own format guarantees
+///   it outright rather than the encoder's habits doing so.
+///
+/// So the assumption is per-codec, not universal, and each codec's
+/// reason is recorded here rather than restated in four places with
+/// different emphasis — which is how it was before, at 14, 4 and 8
+/// lines.
+///
+/// `codec` names the codec in the error, so an all-zero block still
+/// says which decoder rejected it.
+fn strip_leading_pad<'a>(input: &'a [u8], codec: &'static str) -> Result<&'a [u8]> {
+    let pad = input.iter().take_while(|&&b| b == 0).count();
+    let frame = &input[pad..];
+    if frame.is_empty() {
+        return Err(Error::BadInode(match codec {
+            "LZ4" => "LZ4 input is all zeros",
+            "LZMA" => "LZMA input is all zeros",
+            "ZSTD" => "ZSTD input is all zeros",
+            _ => "DEFLATE input is all zeros",
+        }));
+    }
+    Ok(frame)
+}
+
+/// `Z_EROFS_ZSTD_MAX_DICT_SIZE` — the largest dictionary window an EROFS
+/// ZSTD stream is permitted, which the format defines as
+/// `Z_EROFS_PCLUSTER_MAX_SIZE`: one mebibyte.
+///
+/// It is enforced on both sides upstream. `mkfs.erofs` refuses a
+/// `-zzstd,dictsize=` above it, and the kernel sizes its decompression
+/// workspace from the superblock's declared window log, which is bounded
+/// by the same number. So no legitimate image asks for more.
+pub const Z_EROFS_ZSTD_MAX_DICT_SIZE: u64 = 1024 * 1024;
+
+/// The same limit as a base-two logarithm, which is the shape the
+/// superblock's `windowlog` field is compared against.
+pub const Z_EROFS_ZSTD_MAX_DICT_LOG: u32 = 20;
+
+/// The window size a ZSTD frame header asks a decoder to allocate.
+///
+/// # Why this is read here rather than left to the decoder
+///
+/// A decoder allocates its sliding window from the frame header before
+/// it has decoded a single byte, and the header is bytes off the disk.
+/// `ruzstd` will honour a request up to a hundred megabytes; the zstd
+/// format itself allows nearly four terabytes. Either is an eager
+/// allocation driven by an image, once per pcluster read, and a crafted
+/// image would need only a handful of them.
+///
+/// The bound is not invented: [`Z_EROFS_ZSTD_MAX_DICT_SIZE`] is the
+/// format's own ceiling, and it is checked before the decoder is
+/// constructed rather than after — after is too late, because the
+/// allocation is the cost.
+///
+/// # The header, per RFC 8878 §3.1.1
+///
+/// ```text
+///   0..4  magic 0xFD2FB528, little-endian
+///      4  frame header descriptor
+///           bits 7..6  frame content size flag
+///           bit  5     single segment flag
+///           bit  2     content checksum flag
+///           bits 1..0  dictionary id flag
+///      5  window descriptor        (only when single segment is CLEAR)
+///         dictionary id            (0, 1, 2 or 4 bytes)
+///         frame content size       (0, 1, 2, 4 or 8 bytes)
+/// ```
+///
+/// With the single-segment flag set there is no window descriptor and
+/// the window is the frame's content size — the whole frame is decoded
+/// in one piece — so both spellings have to be read to know how large
+/// the allocation would be.
+fn zstd_window_size(frame: &[u8]) -> Result<u64> {
+    const MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+    let bad = || Error::BadInode("ZSTD frame header is not readable");
+    if frame.len() < 5 || frame[..4] != MAGIC {
+        return Err(bad());
+    }
+    let descriptor = frame[4];
+    let content_size_flag = descriptor >> 6;
+    let single_segment = descriptor & 0x20 != 0;
+    let dict_id_flag = descriptor & 0x03;
+
+    let mut pos = 5usize;
+    let window_descriptor = if single_segment {
+        None
+    } else {
+        let b = *frame.get(pos).ok_or_else(bad)?;
+        pos += 1;
+        Some(b)
+    };
+    // The dictionary id is skipped, not read: this crate never decodes
+    // against a dictionary, and a frame that wanted one would fail in
+    // the decoder. Its width still has to be stepped over to reach the
+    // content size.
+    pos += [0usize, 1, 2, 4][dict_id_flag as usize];
+
+    // A content size of "0 bytes" means the field is absent — except
+    // under single segment, where the flag value 0 means one byte.
+    let content_size_width = match content_size_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let content_size = match content_size_width {
+        0 => None,
+        n => {
+            let bytes = frame.get(pos..pos + n).ok_or_else(bad)?;
+            let mut v = 0u64;
+            for (i, b) in bytes.iter().enumerate() {
+                v |= u64::from(*b) << (8 * i);
+            }
+            // The two-byte spelling is stored with 256 subtracted, since
+            // a frame that small would have used the one-byte one.
+            Some(if n == 2 { v + 256 } else { v })
+        }
+    };
+
+    match window_descriptor {
+        // exponent and mantissa: base = 1 << (10 + exponent), and the
+        // mantissa adds eighths of the base.
+        Some(wd) => {
+            let exponent = u32::from(wd >> 3);
+            let mantissa = u64::from(wd & 7);
+            let base = 1u64
+                .checked_shl(10 + exponent)
+                .ok_or(Error::BadInode("ZSTD frame declares an impossible window"))?;
+            Ok(base + (base / 8) * mantissa)
+        }
+        None => content_size.ok_or_else(bad),
+    }
+}
+
+/// Decode one ZSTD-compressed pcluster.
+///
+/// `output` is sized to the pcluster's exact decoded span, and the frame
+/// must fill it exactly — no more and no less. That is stricter than
+/// erofs-utils' own userspace decoder, which reads the frame's declared
+/// content size and copies a sub-range out of it, but erofs-utils needs
+/// that because `dump.erofs` asks for arbitrary byte ranges. This crate
+/// only ever decodes whole pclusters, so a frame that decodes to a
+/// different length than the extent map says it should is a
+/// disagreement between two parts of the image, and the honest thing to
+/// do with a disagreement is refuse it.
+fn decompress_zstd(
+    input: &[u8],
+    output: &mut [u8],
+    zero_padding: bool,
+    prefix: bool,
+) -> Result<()> {
+    if input.is_empty() && output.is_empty() {
+        return Ok(());
+    }
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "ZSTD")?
+    } else {
+        input
+    };
+
+    // BEFORE the decoder exists, because constructing it is what spends
+    // the memory. The ceiling is the format's own dictionary limit, or
+    // the extent being filled when that is larger — a small frame may
+    // set the single-segment flag, in which case its "window" is just
+    // its content and is bounded by the extent anyway.
+    let ceiling = Z_EROFS_ZSTD_MAX_DICT_SIZE.max(output.len() as u64);
+    let window = zstd_window_size(real_input)?;
+    if window > ceiling {
+        return Err(Error::BadInode(
+            "ZSTD frame asks for a window larger than the format allows",
+        ));
+    }
+
+    let mut decoder = ruzstd::decoding::StreamingDecoder::new(real_input)
+        .map_err(|_| Error::BadInode("ZSTD frame header is not readable"))?;
+
+    // Read into the caller's buffer directly. BOUNDED BY CONSTRUCTION:
+    // the decoder is never given anywhere to put more than `output`
+    // holds, so a frame whose header claims a gigabyte costs nothing
+    // beyond the window the decoder allocates for itself.
+    let mut filled = 0usize;
+    while filled < output.len() {
+        let n = decoder
+            .read(&mut output[filled..])
+            .map_err(|_| Error::BadInode("ZSTD decompression failed"))?;
+        if n == 0 {
+            return Err(Error::BadInode("ZSTD decompressed size mismatch"));
+        }
+        filled += n;
+    }
+    // A prefix read stops here: the rest of the frame belongs to the
+    // extent that wrote it, not to this one.
+    if prefix {
+        return Ok(());
+    }
+    // And the frame must be spent. One more byte read is enough to tell:
+    // a frame with anything left over decoded to more than the extent it
+    // is supposed to cover.
+    let mut overflow = [0u8; 1];
+    match decoder.read(&mut overflow) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(Error::BadInode("ZSTD decompressed size mismatch")),
+        Err(_) => Err(Error::BadInode("ZSTD decompression failed")),
+    }
+}
+
+fn decompress_lzma(
+    input: &[u8],
+    output: &mut [u8],
+    cfg: &LzmaCfg,
+    zero_padding: bool,
+    prefix: bool,
+) -> Result<()> {
+    if input.is_empty() && output.is_empty() {
+        return Ok(());
+    }
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "LZMA")?
+    } else {
+        input
+    };
+
+    // Two on-disk dialects coexist:
+    // (a) Our writer emits the standard 13-byte LZMA1 header (5-byte
+    //     properties + 8-byte uncompressed size) before the
+    //     compressed stream; lzma-rs's default `lzma_decompress`
+    //     reads this directly.
+    // (b) mkfs.erofs strips the 13-byte header — properties live in
+    //     the `z_erofs_lzma_cfgs` config block when
+    //     `EROFS_FEATURE_INCOMPAT_COMPR_CFGS` is set. The caller
+    //     parses the blob and passes the resulting `LzmaCfg`
+    //     through; we synthesise a 13-byte header here from those
+    //     values and feed lzma-rs.
+    //
+    // We try (a) first; on failure, fall back to (b). The standard
+    // header sniffing is cheap and unambiguous because a valid LZMA1
+    // properties byte lives in 0..=224 — different from the typical
+    // values we'd see at the start of a stripped EROFS LZMA payload.
+    //
+    // Spec: LZMA1 header layout (general LZMA1 spec, not EROFS-
+    // specific) and the `z_erofs_lzma_cfgs` struct in the public
+    // format header `erofs_fs.h`.
+    if try_decompress_lzma_with_header(real_input, output).is_ok() {
+        return Ok(());
+    }
+    decompress_lzma_no_header(real_input, output, cfg, prefix)
+}
+
+/// The longest match an LZMA stream can emit, `MATCH_LEN_MAX`.
+const LZMA_MATCH_LEN_MAX: usize = 273;
+
+/// A `Write` sink that refuses to grow past a ceiling.
+///
+/// `lzma_rs::lzma_decompress` decodes into whatever sink it is given
+/// and stops when the stream says to, so a `Vec` grows to whatever the
+/// stream's own 13-byte header declared. That header is attacker bytes.
+pub(crate) struct Capped {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) limit: usize,
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len() + data.len() > self.limit {
+            return Err(std::io::Error::other(
+                "decoded output is longer than the extent it decodes",
+            ));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn try_decompress_lzma_with_header(input: &[u8], output: &mut [u8]) -> Result<()> {
+    // BOUNDED, because this attempt is made FIRST, for every LZMA
+    // cluster, and its failure is swallowed -- so a stream whose header
+    // declares an enormous unpacked size costs the full decode before
+    // the fallback is even reached. Measured against an unbounded
+    // `Vec`: 303 KB of input against a 4096-byte extent reached 946 MB
+    // resident and took two minutes before erroring.
+    //
+    // The ceiling is the extent's own size. A stream that decodes to
+    // more than that would fail the length check below anyway; this
+    // only stops it doing so after the memory is spent.
+    let mut sink = Capped {
+        buf: Vec::with_capacity(output.len()),
+        limit: output.len(),
+    };
+    let mut reader = Cursor::new(input);
+    lzma_rs::lzma_decompress(&mut reader, &mut sink)
+        .map_err(|_| Error::BadInode("LZMA decompression failed"))?;
+    let decoded = sink.buf;
+    if decoded.len() != output.len() {
+        return Err(Error::BadInode("LZMA decompressed size mismatch"));
+    }
+    output.copy_from_slice(&decoded);
+    Ok(())
+}
+
+fn decompress_lzma_no_header(
+    input: &[u8],
+    output: &mut [u8],
+    cfg: &LzmaCfg,
+    prefix: bool,
+) -> Result<()> {
+    // The properties byte and dictionary size; the unpacked size and the
+    // stream follow, per decode, in `lzma_decode_to`.
+    let mut framed: Vec<u8> = Vec::with_capacity(5);
+    // Properties byte = (pb * 5 + lp) * 9 + lc. LZMA1 imposes
+    // 0 <= lc <= 8, 0 <= lp <= 4, 0 <= pb <= 4 (so the byte is
+    // bounded by 0xE0). Reject out-of-range configs up front so
+    // synthesised headers stay valid for lzma-rs.
+    if cfg.lc > 8 || cfg.lp > 4 || cfg.pb > 4 {
+        return Err(Error::BadInode("LZMA cfg lc/lp/pb out of range"));
+    }
+    let props = (cfg.pb as u16 * 5 + cfg.lp as u16) * 9 + cfg.lc as u16;
+    framed.push(props as u8);
+    framed.extend_from_slice(&cfg.dict_size.to_le_bytes());
+    if !prefix {
+        let decoded = lzma_decode_exactly(&framed, input, output.len())?;
+        output.copy_from_slice(&decoded);
+        return Ok(());
+    }
+
+    // A PREFIX may end inside a match. The decoder runs until an
+    // operation reaches the size it was told, and a match straddling the
+    // end of the prefix carries it past -- which, told the prefix's own
+    // size, it reports as a size mismatch and keeps nothing. So the size
+    // it is told has to be where that match ends, somewhere in the next
+    // `LZMA_MATCH_LEN_MAX` bytes. lzma-rs names it in the mismatch
+    // ("... but decompressed to N"), which usually settles it in one
+    // retry; when the message does not parse, every candidate is tried
+    // in turn. Either way what is kept is the prefix of a decode that
+    // succeeded, never of one that failed.
+    let len = output.len();
+    let hint = match lzma_decode_to(&framed, input, len) {
+        Ok(decoded) if decoded.len() == len => {
+            output.copy_from_slice(&decoded);
+            return Ok(());
+        }
+        Ok(_) => return Err(Error::BadInode("LZMA decompressed size mismatch")),
+        Err(message) => message
+            .rsplit("decompressed to ")
+            .next()
+            .and_then(|n| n.trim().parse::<usize>().ok())
+            .filter(|&n| n > len && n <= len + LZMA_MATCH_LEN_MAX),
+    };
+    for size in hint.into_iter().chain(len + 1..=len + LZMA_MATCH_LEN_MAX) {
+        if let Ok(decoded) = lzma_decode_to(&framed, input, size) {
+            if decoded.len() == size {
+                output.copy_from_slice(&decoded[..len]);
+                return Ok(());
+            }
+        }
+    }
+    Err(Error::BadInode("LZMA decompression failed"))
+}
+
+/// Decode a headerless stream framed by [`decompress_lzma_no_header`] to
+/// exactly `size` bytes, or fail.
+fn lzma_decode_exactly(framed: &[u8], input: &[u8], size: usize) -> Result<Vec<u8>> {
+    let decoded = lzma_decode_to(framed, input, size)
+        .map_err(|_| Error::BadInode("LZMA decompression failed"))?;
+    if decoded.len() != size {
+        return Err(Error::BadInode("LZMA decompressed size mismatch"));
+    }
+    Ok(decoded)
+}
+
+/// One decode of `framed`'s 5-byte properties and `input`, told the
+/// unpacked size is `size`; the error is lzma-rs's own message.
+fn lzma_decode_to(
+    framed: &[u8],
+    input: &[u8],
+    size: usize,
+) -> std::result::Result<Vec<u8>, String> {
+    let mut stream: Vec<u8> = Vec::with_capacity(13 + input.len());
+    stream.extend_from_slice(&framed[..5]);
+    stream.extend_from_slice(&(size as u64).to_le_bytes());
+    stream.extend_from_slice(input);
+    let mut decoded: Vec<u8> = Vec::with_capacity(size);
+    let opts = lzma_rs::decompress::Options {
+        unpacked_size: lzma_rs::decompress::UnpackedSize::ReadHeaderButUseProvided(Some(
+            size as u64,
+        )),
+        memlimit: None,
+        allow_incomplete: true,
+    };
+    lzma_rs::lzma_decompress_with_options(&mut Cursor::new(stream), &mut decoded, &opts)
+        .map_err(|e| e.to_string())?;
+    Ok(decoded)
+}
+
+fn decompress_deflate(input: &[u8], output: &mut [u8], zero_padding: bool) -> Result<()> {
+    if input.is_empty() && output.is_empty() {
+        return Ok(());
+    }
+    let real_input = if zero_padding {
+        strip_leading_pad(input, "DEFLATE")?
+    } else {
+        input
+    };
+    // `false` selects raw DEFLATE (no zlib header/checksum), which is
+    // what EROFS stores.
+    let mut decoder = Decompress::new(false);
+    decoder
+        .decompress(real_input, output, FlushDecompress::Finish)
+        .map_err(|_| Error::BadInode("DEFLATE decompression failed"))?;
+    if decoder.total_out() as usize != output.len() {
+        return Err(Error::BadInode("DEFLATE decompressed size mismatch"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The LZMA-with-header attempt is made first, for every LZMA
+    /// cluster, and its failure is swallowed -- so an unbounded sink
+    /// meant a stream whose own header declares an enormous unpacked
+    /// size paid the full decode before the fallback was even reached.
+    /// Measured: 303 KB of input against a 4096-byte extent reached
+    /// 946 MB resident and took two minutes.
+    #[test]
+    fn the_decode_sink_refuses_to_grow_past_the_extent_it_fills() {
+        use std::io::Write;
+        let mut sink = Capped {
+            buf: Vec::new(),
+            limit: 8,
+        };
+        assert!(sink.write(b"12345678").is_ok());
+        assert_eq!(sink.buf.len(), 8);
+        assert!(sink.write(b"9").is_err(), "the sink grew past its limit");
+        assert_eq!(sink.buf.len(), 8, "the refused write was kept anyway");
+
+        // A single write larger than the whole limit is refused
+        // outright rather than partly accepted.
+        let mut sink = Capped {
+            buf: Vec::new(),
+            limit: 4,
+        };
+        assert!(sink.write(b"far too much").is_err());
+        assert!(sink.buf.is_empty());
+    }
+
+    #[test]
+    fn algorithm_from_id() {
+        assert_eq!(Algorithm::from_id(0).unwrap(), Algorithm::Lz4);
+        assert_eq!(Algorithm::from_id(1).unwrap(), Algorithm::Lzma);
+        assert_eq!(Algorithm::from_id(2).unwrap(), Algorithm::Deflate);
+        assert_eq!(Algorithm::from_id(3).unwrap(), Algorithm::Zstd);
+        assert!(matches!(
+            Algorithm::from_id(4),
+            Err(Error::UnsupportedLayout(4))
+        ));
+        assert!(matches!(
+            Algorithm::from_id(99),
+            Err(Error::UnsupportedLayout(99))
+        ));
+    }
+
+    /// A frame this crate compressed and then decompressed proves the
+    /// wrapper's arithmetic, not interoperability. Interoperability is
+    /// what `tests/zstd_image.rs` is for: a real `mkfs.erofs -zzstd`
+    /// image, and a freshly built one wherever the installed writer can
+    /// make one. These tests cover what an image cannot easily produce
+    /// — a frame that decodes to the wrong length, in both directions.
+    fn zstd_frame(payload: &[u8]) -> Vec<u8> {
+        ruzstd::encoding::compress_to_vec(payload, ruzstd::encoding::CompressionLevel::Fastest)
+    }
+
+    #[test]
+    fn round_trip_zstd() {
+        let original = b"the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let compressed = zstd_frame(&original);
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Zstd, &compressed, &mut output).unwrap();
+        assert_eq!(output, original);
+    }
+
+    /// EROFS right-aligns a frame inside its on-disk block under
+    /// ZERO_PADDING, so the leading bytes are zeros. A zstd frame
+    /// begins with the little-endian magic 0xFD2FB528, i.e. 0x28, so
+    /// skipping leading zeros can never eat part of a real frame.
+    #[test]
+    fn zstd_tolerates_the_leading_zero_pad() {
+        let original = b"padded on the left, as the format requires".repeat(10);
+        let mut padded = vec![0u8; 37];
+        padded.extend_from_slice(&zstd_frame(&original));
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Zstd, &padded, &mut output).unwrap();
+        assert_eq!(output, original);
+    }
+
+    /// A frame that decodes to FEWER bytes than the extent it is
+    /// supposed to fill. The stream is well-formed and ends cleanly, so
+    /// no codec can catch this; only the caller, which knows how long
+    /// the pcluster is, can refuse it. Getting this wrong would leave
+    /// the tail of the buffer as zeros and report success.
+    #[test]
+    fn a_zstd_frame_shorter_than_its_extent_is_refused() {
+        let compressed = zstd_frame(b"only sixteen byt");
+        let mut output = vec![0u8; 4096];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &compressed, &mut output),
+            Err(Error::BadInode("ZSTD decompressed size mismatch"))
+        ));
+    }
+
+    /// And a frame that decodes to MORE. erofs-utils' own userspace
+    /// decoder accepts this and copies a sub-range out, because
+    /// `dump.erofs` asks for arbitrary byte ranges; this crate only
+    /// ever decodes whole pclusters, so a longer frame means the extent
+    /// map and the frame disagree about the image.
+    #[test]
+    fn a_zstd_frame_longer_than_its_extent_is_refused() {
+        let compressed = zstd_frame(&b"x".repeat(4096));
+        let mut output = vec![0u8; 100];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &compressed, &mut output),
+            Err(Error::BadInode("ZSTD decompressed size mismatch"))
+        ));
+    }
+
+    #[test]
+    fn an_all_zero_zstd_block_says_which_codec_rejected_it() {
+        let mut output = vec![0u8; 16];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &[0u8; 64], &mut output),
+            Err(Error::BadInode("ZSTD input is all zeros"))
+        ));
+    }
+
+    /// The window a real frame asks for is small, and the guard must not
+    /// stand in its way. Checked against the frames this crate's own
+    /// encoder produces AND, in `tests/zstd_image.rs`, against the ones
+    /// mkfs.erofs does.
+    #[test]
+    fn a_real_frame_asks_for_a_window_the_guard_allows() {
+        for len in [1usize, 100, 4096, 65536] {
+            let frame = zstd_frame(&b"a".repeat(len));
+            let window = zstd_window_size(&frame).expect("readable header");
+            assert!(
+                window <= Z_EROFS_ZSTD_MAX_DICT_SIZE.max(len as u64),
+                "a {len}-byte payload produced a frame wanting a {window}-byte window"
+            );
+        }
+    }
+
+    /// A hand-built header asking for the largest window the zstd format
+    /// can express: exponent 31, mantissa 7, which is nearly four
+    /// terabytes. A decoder handed this allocates before it decodes
+    /// anything, so the refusal has to come first — and `ruzstd` would
+    /// have accepted it up to a hundred megabytes and this up to the
+    /// whole of it.
+    #[test]
+    fn a_frame_demanding_an_enormous_window_is_refused_before_it_is_decoded() {
+        // magic, descriptor (no single segment, no dict id, no content
+        // size), then the window descriptor.
+        let frame = [0x28, 0xb5, 0x2f, 0xfd, 0x00, (31 << 3) | 7];
+        let window = zstd_window_size(&frame).expect("the header is well formed");
+        assert!(
+            window > 3 << 40,
+            "expected a multi-terabyte window, got {window}"
+        );
+
+        let mut output = vec![0u8; 4096];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &frame, &mut output),
+            Err(Error::BadInode(
+                "ZSTD frame asks for a window larger than the format allows"
+            ))
+        ));
+    }
+
+    /// With the single-segment flag set there is no window descriptor at
+    /// all and the window is the frame's declared content size, so that
+    /// spelling has to be read too or the guard reports zero and waves
+    /// everything through.
+    #[test]
+    fn the_single_segment_spelling_of_the_window_is_read_as_well() {
+        // Descriptor: single segment set, content size flag 3 (8 bytes).
+        let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0xe0];
+        frame.extend_from_slice(&(1u64 << 40).to_le_bytes());
+        assert_eq!(zstd_window_size(&frame).unwrap(), 1 << 40);
+
+        let mut output = vec![0u8; 4096];
+        assert!(matches!(
+            decompress(Algorithm::Zstd, &frame, &mut output),
+            Err(Error::BadInode(
+                "ZSTD frame asks for a window larger than the format allows"
+            ))
+        ));
+    }
+
+    /// A truncated header is refused rather than read past.
+    #[test]
+    fn a_header_that_stops_early_is_refused() {
+        assert!(zstd_window_size(&[0x28, 0xb5, 0x2f, 0xfd, 0x00]).is_err());
+        assert!(zstd_window_size(&[0x28, 0xb5, 0x2f]).is_err());
+        // Right length, wrong magic.
+        assert!(zstd_window_size(&[0, 0, 0, 0, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn garbage_is_not_mistaken_for_a_zstd_frame() {
+        let mut output = vec![0u8; 16];
+        assert!(decompress(
+            Algorithm::Zstd,
+            &[0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3],
+            &mut output
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn round_trip_lz4() {
+        let original = b"the quick brown fox jumps over the lazy dog. \
+            the quick brown fox jumps over the lazy dog. \
+            the quick brown fox jumps over the lazy dog.";
+        let compressed = lz4_flex::block::compress(original);
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Lz4, &compressed, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    #[test]
+    fn zero_padding_feature_controls_leading_pad() {
+        let original = b"zero-padding is only valid when the superblock advertises it";
+        let compressed = lz4_flex::block::compress(original);
+        let mut padded = vec![0u8; 4];
+        padded.extend_from_slice(&compressed);
+
+        let mut output = vec![0u8; original.len()];
+        decompress_with_config_and_padding(Algorithm::Lz4, None, true, &padded, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        output.fill(0);
+        decompress_with_config_and_padding(Algorithm::Lz4, None, false, &compressed, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        let err =
+            decompress_with_config_and_padding(Algorithm::Lz4, None, false, &padded, &mut output)
+                .unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn zero_padding_feature_controls_zstd_leading_pad() {
+        let original = b"zero-padding is only valid when the superblock advertises it";
+        let compressed = zstd_frame(original);
+        let mut padded = vec![0u8; 4];
+        padded.extend_from_slice(&compressed);
+
+        let mut output = vec![0u8; original.len()];
+        decompress_with_config_and_padding(Algorithm::Zstd, None, true, &padded, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        output.fill(0);
+        decompress_with_config_and_padding(Algorithm::Zstd, None, false, &compressed, &mut output)
+            .unwrap();
+        assert_eq!(&output[..], &original[..]);
+
+        let err =
+            decompress_with_config_and_padding(Algorithm::Zstd, None, false, &padded, &mut output)
+                .unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    // Empty input + empty output is the documented contract: nothing
+    // to decode, output already correctly sized at zero, succeeds.
+    #[test]
+    fn empty_input_empty_output() {
+        let mut output = [0u8; 0];
+        decompress(Algorithm::Lz4, &[], &mut output).unwrap();
+        decompress(Algorithm::Lzma, &[], &mut output).unwrap();
+        decompress(Algorithm::Deflate, &[], &mut output).unwrap();
+    }
+
+    #[test]
+    fn wrong_output_size_rejected() {
+        let original = b"hello world, this is some test payload to compress";
+        let compressed = lz4_flex::block::compress(original);
+        let mut output = vec![0u8; original.len() + 50];
+        assert!(decompress(Algorithm::Lz4, &compressed, &mut output).is_err());
+    }
+
+    #[test]
+    fn round_trip_lzma() {
+        let original = b"the quick brown fox jumps over the lazy dog. \
+            the quick brown fox jumps over the lazy dog. \
+            the quick brown fox jumps over the lazy dog.";
+        let mut compressed: Vec<u8> = Vec::new();
+        let mut reader = Cursor::new(&original[..]);
+        lzma_rs::lzma_compress(&mut reader, &mut compressed).unwrap();
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Lzma, &compressed, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    #[test]
+    fn round_trip_deflate() {
+        use flate2::{Compress, Compression, FlushCompress};
+        let original = b"the quick brown fox jumps over the lazy dog. \
+            the quick brown fox jumps over the lazy dog. \
+            the quick brown fox jumps over the lazy dog.";
+        // `false` = raw DEFLATE (no zlib wrapper), matching EROFS.
+        let mut encoder = Compress::new(Compression::default(), false);
+        let mut compressed = vec![0u8; original.len() + 64];
+        encoder
+            .compress(original, &mut compressed, FlushCompress::Finish)
+            .unwrap();
+        compressed.truncate(encoder.total_out() as usize);
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Deflate, &compressed, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    // ---- error-path tests -------------------------------------------------
+    //
+    // Each codec wraps its underlying-library failure with
+    // `Error::BadInode`. These tests pin that contract so a future
+    // refactor can't quietly downgrade it (e.g. silently producing
+    // garbage on a malformed frame).
+
+    /// An LZ4 frame whose token byte is non-zero (so the leading-zero
+    /// strip is a no-op) but whose payload doesn't decode. `0xFF`
+    /// encodes "literal_length = 15 (extended)..." -- without the
+    /// extension byte and 15 literal bytes following, the decoder
+    /// rejects.
+    #[test]
+    fn decompress_lz4_rejects_malformed() {
+        let bad = [0xFFu8, 0x01, 0x02, 0x03];
+        let mut output = vec![0u8; 64];
+        let err = decompress(Algorithm::Lz4, &bad, &mut output).unwrap_err();
+        assert!(
+            matches!(err, Error::BadInode(_)),
+            "expected BadInode, got {err:?}"
+        );
+    }
+
+    /// LZ4 input that's all zeros: rejected because we can't tell what
+    /// real frame would have followed the pad.
+    #[test]
+    fn decompress_lz4_rejects_all_zeros() {
+        let bad = [0u8; 16];
+        let mut output = vec![0u8; 32];
+        let err = decompress(Algorithm::Lz4, &bad, &mut output).unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    /// LZMA: a non-zero leading byte that isn't a valid properties
+    /// byte, followed by garbage. Both the with-header and no-header
+    /// paths must reject.
+    #[test]
+    fn decompress_lzma_rejects_malformed() {
+        // 0xFF as a properties byte is invalid (max valid is 224); the
+        // synthesised-header fallback also can't make sense of this.
+        let bad = [0xFFu8; 64];
+        let mut output = vec![0u8; 32];
+        let err = decompress(Algorithm::Lzma, &bad, &mut output).unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decompress_lzma_rejects_all_zeros() {
+        let bad = [0u8; 32];
+        let mut output = vec![0u8; 16];
+        let err = decompress(Algorithm::Lzma, &bad, &mut output).unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    /// DEFLATE: a non-zero leading byte (so we don't trip the all-zero
+    /// arm) but the bits don't form a valid block header.
+    #[test]
+    fn decompress_deflate_rejects_malformed() {
+        // 0xFF then random; first byte's BFINAL=1, BTYPE=11 (reserved)
+        // is rejected by every DEFLATE decoder.
+        let bad = [0xFFu8, 0xFF, 0xFF, 0xFF];
+        let mut output = vec![0u8; 32];
+        let err = decompress(Algorithm::Deflate, &bad, &mut output).unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decompress_deflate_rejects_all_zeros() {
+        let bad = [0u8; 16];
+        let mut output = vec![0u8; 8];
+        let err = decompress(Algorithm::Deflate, &bad, &mut output).unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    /// `Algorithm::from_id` must reject any non-{0,1,2} id with an
+    /// `UnsupportedLayout` carrying the offending byte.
+    #[test]
+    fn algorithm_from_id_rejects_unknown_99_and_255() {
+        for id in [99u8, 255u8] {
+            match Algorithm::from_id(id) {
+                Err(Error::UnsupportedLayout(n)) => assert_eq!(n, id),
+                other => panic!("id={id}: expected UnsupportedLayout, got {other:?}"),
+            }
+        }
+    }
+
+    /// Round-trips at >= 4 KiB exercise the "input padding edge cases"
+    /// each codec calls out (LZ4 right-aligns within a block; DEFLATE
+    /// and LZMA strip leading zero pad). The 4 KiB threshold keeps the
+    /// payload large enough for each encoder to emit multi-byte
+    /// references / dictionary lookups, not just the trivial "all
+    /// literals" path the tiny round-trips above hit.
+    #[test]
+    fn round_trip_lz4_large_payload() {
+        // Mix of a deterministic LCG + a literal tail so the encoder
+        // can't trivially compress it to nothing but still finds enough
+        // repetition for matches.
+        let mut data = Vec::with_capacity(8192);
+        let mut x: u32 = 0xDEAD_BEEF;
+        for _ in 0..8192 {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            data.push((x >> 16) as u8);
+        }
+        for _ in 0..1024 {
+            data.extend_from_slice(b"abcdef");
+        }
+        let compressed = lz4_flex::block::compress(&data);
+        let mut output = vec![0u8; data.len()];
+        decompress(Algorithm::Lz4, &compressed, &mut output).unwrap();
+        assert_eq!(output, data);
+    }
+
+    #[test]
+    fn round_trip_lzma_large_payload() {
+        let mut data = Vec::with_capacity(8192);
+        for i in 0..8192 {
+            data.push(((i * 31) & 0xFF) as u8);
+        }
+        let mut compressed: Vec<u8> = Vec::new();
+        let mut reader = Cursor::new(&data[..]);
+        lzma_rs::lzma_compress(&mut reader, &mut compressed).unwrap();
+        let mut output = vec![0u8; data.len()];
+        decompress(Algorithm::Lzma, &compressed, &mut output).unwrap();
+        assert_eq!(output, data);
+    }
+
+    #[test]
+    fn round_trip_deflate_large_payload() {
+        use flate2::{Compress, Compression, FlushCompress};
+        let mut data = Vec::with_capacity(8192);
+        for i in 0..8192 {
+            data.push(((i * 17 + 5) & 0xFF) as u8);
+        }
+        let mut encoder = Compress::new(Compression::default(), false);
+        let mut compressed = vec![0u8; data.len() + 1024];
+        encoder
+            .compress(&data, &mut compressed, FlushCompress::Finish)
+            .unwrap();
+        compressed.truncate(encoder.total_out() as usize);
+        let mut output = vec![0u8; data.len()];
+        decompress(Algorithm::Deflate, &compressed, &mut output).unwrap();
+        assert_eq!(output, data);
+    }
+
+    /// LZ4 payload with leading zero pad simulates the
+    /// `EROFS_FEATURE_INCOMPAT_LZ4_0PADDING` right-alignment we
+    /// document in the codec body. Round-trips through the strip-pad
+    /// path that the basic round_trip_lz4 doesn't exercise.
+    #[test]
+    fn round_trip_lz4_with_leading_zero_pad() {
+        let original = b"some data to compress and round trip back through the codec";
+        let mut padded = vec![0u8; 16];
+        padded.extend_from_slice(&lz4_flex::block::compress(original));
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Lz4, &padded, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    /// Same right-alignment idea, applied to LZMA. The codec body
+    /// claims it strips leading zeros for every codec; pin it.
+    #[test]
+    fn round_trip_lzma_with_leading_zero_pad() {
+        let original = b"lzma payload that's long enough to actually compress";
+        let mut compressed: Vec<u8> = Vec::new();
+        let mut reader = Cursor::new(&original[..]);
+        lzma_rs::lzma_compress(&mut reader, &mut compressed).unwrap();
+        let mut padded = vec![0u8; 8];
+        padded.extend_from_slice(&compressed);
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Lzma, &padded, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    /// Encode a payload with lzma-rs and reshape its output into the
+    /// EROFS on-disk LZMA dialect: bare bitstream (no LZMA1 13-byte
+    /// header), with the LZMA1 init "discard byte" replaced by a
+    /// non-zero placeholder so the leading-zero strip in
+    /// `decompress_lzma` doesn't eat it.
+    ///
+    /// The LZMA1 RangeDecoder always reads-and-discards the first
+    /// byte of the bitstream (per the LZMA1 spec). lzma-rs's encoder
+    /// writes that byte as 0x00; mkfs.erofs writes whatever the range
+    /// coder produces (typically non-zero for non-trivial inputs).
+    /// EROFS's on-disk pad pattern (leading zeros) plus our reader's
+    /// leading-zero strip would eat lzma-rs's 0x00 discard byte if
+    /// fed verbatim, shifting the subsequent `code` window by one
+    /// byte and decoding garbage. We sidestep this by skipping the
+    /// 0x00 (`framed[14..]`) and prepending an arbitrary non-zero
+    /// placeholder so the strip leaves the byte alone and the
+    /// RangeDecoder correctly reads-and-discards it. The 4 bytes that
+    /// follow are then the same 4 bytes lzma-rs would have read as
+    /// the initial `code`.
+    fn build_erofs_bare_lzma_payload(original: &[u8]) -> (Vec<u8>, u32) {
+        let mut framed: Vec<u8> = Vec::new();
+        let mut reader = Cursor::new(original);
+        lzma_rs::lzma_compress(&mut reader, &mut framed).unwrap();
+        // Byte 13 is the LZMA1 init "discard byte" (0x00); we replace
+        // it with 0x01 so the leading-zero strip leaves it intact and
+        // RangeDecoder still discards exactly one byte.
+        assert_eq!(framed[13], 0x00, "lzma-rs init byte should be 0x00");
+        let mut bare = vec![0x01u8];
+        bare.extend_from_slice(&framed[14..]);
+        let dict_size = u32::from_le_bytes(framed[1..5].try_into().unwrap());
+        (bare, dict_size)
+    }
+
+    /// LZMA round-trip with a non-default `dict_size` plumbed via
+    /// `decompress_with_config`. lzma-rs's encoder defaults to a
+    /// dict_size of 8 MiB; the bitstream itself uses match distances
+    /// that fit within the dict the encoder advertised. We pass the
+    /// SAME dict_size back through the config (proving the plumbing
+    /// works without changing semantics).
+    #[test]
+    fn lzma_with_non_default_dict_size_round_trip() {
+        let original = b"lzma config-aware round trip with a non-default dict_size value!\
+            lzma config-aware round trip with a non-default dict_size value!";
+        let (bare, encoded_dict_size) = build_erofs_bare_lzma_payload(original);
+        // Pick a dict_size that's NOT the LzmaCfg default (1<<24 = 16
+        // MiB) and matches what the encoder used. This exercises the
+        // cfg-driven header synthesis: the synthesized header carries
+        // OUR cfg.dict_size, not the codec default.
+        assert_ne!(
+            encoded_dict_size,
+            LzmaCfg::default().dict_size,
+            "encoder dict differs from default"
+        );
+        let cfg = LzmaCfg {
+            dict_size: encoded_dict_size,
+            lc: 3,
+            lp: 0,
+            pb: 2,
+        };
+        let mut output = vec![0u8; original.len()];
+        decompress_with_config(Algorithm::Lzma, Some(&cfg), &bare, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    /// Same idea but pins the lc / lp / pb plumbing. lzma-rs's
+    /// encoder always emits (lc=3, lp=0, pb=2), so we feed those
+    /// EXACT values back through the config; if our props-byte
+    /// derivation `(pb*5 + lp)*9 + lc` is wrong, the synthesised
+    /// header's props byte would differ from what the encoder used
+    /// and decode would produce garbage / fail.
+    #[test]
+    fn lzma_with_custom_props_round_trip() {
+        let original = b"check lc/lp/pb propagation. \
+            check lc/lp/pb propagation. check lc/lp/pb propagation.";
+        let (bare, encoded_dict_size) = build_erofs_bare_lzma_payload(original);
+        let cfg = LzmaCfg {
+            dict_size: encoded_dict_size,
+            lc: 3,
+            lp: 0,
+            pb: 2,
+        };
+        let mut output = vec![0u8; original.len()];
+        decompress_with_config(Algorithm::Lzma, Some(&cfg), &bare, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    /// Out-of-range lc/lp/pb config values are rejected before the
+    /// codec sees them. Pin the contract so a caller can't sneak a
+    /// malformed config through.
+    #[test]
+    fn lzma_with_out_of_range_props_rejected() {
+        let cfg = LzmaCfg {
+            dict_size: 1 << 20,
+            lc: 9, // > 8
+            lp: 0,
+            pb: 2,
+        };
+        let mut output = vec![0u8; 16];
+        let err = decompress_with_config(Algorithm::Lzma, Some(&cfg), &[0xFFu8; 32], &mut output)
+            .unwrap_err();
+        assert!(matches!(err, Error::BadInode(_)), "got {err:?}");
+    }
+
+    /// And for DEFLATE.
+    #[test]
+    fn round_trip_deflate_with_leading_zero_pad() {
+        use flate2::{Compress, Compression, FlushCompress};
+        let original = b"deflate payload long enough to compress with some redundancy redundancy";
+        let mut encoder = Compress::new(Compression::default(), false);
+        let mut compressed = vec![0u8; original.len() + 64];
+        encoder
+            .compress(original, &mut compressed, FlushCompress::Finish)
+            .unwrap();
+        compressed.truncate(encoder.total_out() as usize);
+        let mut padded = vec![0u8; 4];
+        padded.extend_from_slice(&compressed);
+        let mut output = vec![0u8; original.len()];
+        decompress(Algorithm::Deflate, &padded, &mut output).unwrap();
+        assert_eq!(&output[..], &original[..]);
+    }
+
+    /// A deduplicated extent's data is the first N bytes of a pcluster
+    /// that decodes to more (#125). Every prefix of an LZ4 block decodes,
+    /// through literals and through matches, overlapping ones included,
+    /// to the same bytes as the prefix of the whole.
+    #[test]
+    fn every_prefix_of_an_lz4_block_decodes_to_the_prefix_of_its_data() {
+        let mut original = Vec::new();
+        for i in 0..3000u32 {
+            original.extend_from_slice(if i % 7 == 0 { b"xyz" } else { b"a" });
+            original.push((i % 251) as u8);
+        }
+        original.extend(std::iter::repeat_n(b'q', 700));
+        let compressed = lz4_flex::block::compress(&original);
+        for len in (0..original.len()).step_by(97).chain([original.len()]) {
+            let mut out = vec![0u8; len];
+            decompress_prefix_with_config_and_padding(
+                Algorithm::Lz4,
+                None,
+                false,
+                &compressed,
+                &mut out,
+            )
+            .unwrap_or_else(|e| panic!("prefix {len}: {e:?}"));
+            assert_eq!(out, original[..len], "prefix {len}");
+        }
+    }
+
+    /// The exact-length decode still refuses a block that decodes to more
+    /// than its extent: only an extent marked as a partial reference may
+    /// stop early.
+    #[test]
+    fn only_a_prefix_read_may_stop_before_the_block_ends() {
+        let original = vec![7u8; 5000];
+        let compressed = lz4_flex::block::compress(&original);
+        let mut out = vec![0u8; 4000];
+        assert!(decompress(Algorithm::Lz4, &compressed, &mut out).is_err());
+        decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &compressed,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, original[..4000]);
+    }
+
+    /// An extent that claims more than its pcluster holds is refused, and
+    /// so is a match reaching before the start of the output.
+    #[test]
+    fn a_prefix_read_refuses_what_the_block_does_not_hold() {
+        let original = b"hello, hello, hello, world".to_vec();
+        let compressed = lz4_flex::block::compress(&original);
+        let mut long = vec![0u8; original.len() + 1];
+        assert!(decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &compressed,
+            &mut long,
+        )
+        .is_err());
+        // Token: 1 literal, then a match at offset 5 with 1 byte decoded.
+        let crafted = [0x10, b'a', 0x05, 0x00];
+        let mut out = vec![0u8; 8];
+        assert!(decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &crafted,
+            &mut out,
+        )
+        .is_err());
+        // A literal run longer than the input.
+        let crafted = [0xF0, 0x10, b'a'];
+        assert!(decompress_prefix_with_config_and_padding(
+            Algorithm::Lz4,
+            None,
+            false,
+            &crafted,
+            &mut out,
+        )
+        .is_err());
+    }
+}
