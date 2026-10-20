@@ -116,12 +116,22 @@ fail if the required hardware or permissions are absent:
 cargo test --offline --locked --test pmu -- --ignored --test-threads=1
 ```
 
-PMU scheduling replaces wall-clock preemption and scheduler weighting. It does
-not make guest clocks, entropy, filesystem timestamps, or external I/O deterministic.
+PMU scheduling replaces scheduler weighting and uses branch quanta while tasks
+compete to run. It does not make guest clocks, entropy, filesystem timestamps,
+or external I/O deterministic.
 The syscall-count limit still applies. A loop with no conditional branches and
-no syscalls cannot exhaust a conditional-branch budget. Embedders can select this
-mode through `KvmBackend::with_branch_quantum`; direct vCPU users call
-`begin_slice()` before each dispatched slice.
+no syscalls cannot exhaust an active conditional-branch budget. Embedders can
+select this mode through `KvmBackend::with_branch_quantum`; direct vCPU users call
+`begin_slice()` before each dispatched slice and set
+`set_preemption_required(true)` while another task is runnable.
+
+The scheduler activates the counter only when more than one task is runnable.
+Solo execution leaves it disabled and adds no branch counts. The configured
+wall-clock quantum still yields to the kernel for timers and sleeping peers;
+`NIXVM_QUANTUM_MS=0` disables these timed yields. Runnable peers are checked
+before each guest entry from the kernel, including after clone, syscalls and
+wakeups. New contention starts a fresh branch quantum and suspends the wall-clock
+timer until execution is solo again.
 
 ### EROFS root layers
 
@@ -194,7 +204,8 @@ Useful environment variables (both harnesses):
 - `NIXVM_BRANCH_QUANTUM=N` — require KVM scheduling with an exact budget of
   `N` retired conditional branches per slice. Requires Linux/x86-64, a supported
   Intel CPU, access to guest-only perf counters, and `NIXVM_CPUS=1`. The backend
-  stops early on PMU overflow and single-steps to the target. Unsupported
+  counts only while tasks compete to run, stops early on PMU overflow and
+  single-steps to the target. Unsupported
   hardware, counter scheduling failures, and late overflows fail the run.
 - `NIXVM_INTERP=1` — skip the hardware-backend probe in `vcpu::select` and run
   on the software interpreter (a debugging/parity escape hatch).

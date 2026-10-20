@@ -1474,17 +1474,9 @@ impl Shared {
         i
     }
 
-    /// Pick the fairest runnable task for the serial scheduler / interactive
-    /// pump: the `Running`, un-parked task holding its vcpu with the *least*
-    /// virtual runtime (nice-weighted CPU consumed). Running one such task per
-    /// call — the callers loop — gives least-vruntime-first, proportional-share
-    /// scheduling instead of the old fixed pid-table order.
-    fn pick_serial_runnable(&mut self) -> Option<usize> {
-        // A parked task whose timed wait (or timer) has expired is runnable
-        // again: it re-traps its syscall and sees the timeout. Without this a
-        // compute-bound sibling keeps every sleeper parked (only a full stall
-        // re-checks them) — Go's sysmon never woke from its `usleep`, so
-        // goroutines were never preempted.
+    fn wake_expired_waiters(&mut self) {
+        // A due waiter retries its syscall to observe the timeout. Check at
+        // kernel boundaries so a current runnable task cannot hide its peer.
         let now = poll::now_ns();
         for p in self.procs.iter_mut().flatten() {
             if p.info.parked
@@ -1494,6 +1486,28 @@ impl Shared {
                 p.info.parked = false;
             }
         }
+    }
+
+    /// The caller is already running, so one runnable peer requires preemption.
+    /// Check deadlines here too: a syscall can make a sleeping peer due before
+    /// the current slice ends and before the scheduler picks its next task.
+    fn has_runnable_peer(&mut self, caller: i32) -> bool {
+        self.wake_expired_waiters();
+        self.procs.iter().flatten().any(|process| {
+            process.info.pid != caller
+                && process.info.run == RunState::Running
+                && !process.info.parked
+                && process.vcpu.is_some()
+        })
+    }
+
+    /// Pick the fairest runnable task for the serial scheduler / interactive
+    /// pump: the `Running`, un-parked task holding its vcpu with the *least*
+    /// virtual runtime (nice-weighted CPU consumed). Running one such task per
+    /// call — the callers loop — gives least-vruntime-first, proportional-share
+    /// scheduling instead of the old fixed pid-table order.
+    fn pick_serial_runnable(&mut self) -> Option<usize> {
+        self.wake_expired_waiters();
         let floor = self.min_vruntime;
         let best = (0..self.procs.len())
             .filter(|&i| {
@@ -2030,6 +2044,10 @@ impl Kernel {
         vcpu.begin_slice();
         let mut progressed = false;
         loop {
+            if vcpu.retired_branches().is_some() {
+                let required = self.shared.lock().unwrap().has_runnable_peer(cx.cur.pid);
+                vcpu.set_preemption_required(required);
+            }
             let branches_before = vcpu.retired_branches();
             // Charge this step's wall time (guest execution + syscall servicing)
             // to the task's CPU total — a blocked task ends its slice here and
@@ -8865,6 +8883,145 @@ mod tests {
             Box::new(self.clone())
         }
         fn reset(&mut self, _e: u64, _s: u64) {}
+    }
+
+    /// Records the scheduler's PMU policy while executing real clone/wait
+    /// handlers. A blocked syscall remains pending until the kernel returns it.
+    #[derive(Clone)]
+    struct PreemptionProbe {
+        script: ScriptVcpu,
+        pending: bool,
+        required: bool,
+        history: Arc<Mutex<Vec<(u64, bool)>>>,
+    }
+
+    impl Vcpu for PreemptionProbe {
+        fn run(&mut self, memory: &mut GuestMemory) -> Result<Exit, VcpuError> {
+            let exit = if self.pending {
+                Exit::Syscall
+            } else {
+                self.script.run(memory)?
+            };
+            self.pending = matches!(exit, Exit::Syscall);
+            let operation = if self.pending {
+                self.script.syscall_nr()
+            } else {
+                u64::MAX
+            };
+            self.history
+                .lock()
+                .unwrap()
+                .push((operation, self.required));
+            Ok(exit)
+        }
+        fn set_preemption_required(&mut self, required: bool) {
+            self.required = required;
+        }
+        fn retired_branches(&self) -> Option<u64> {
+            Some(0)
+        }
+        fn syscall_nr(&self) -> u64 {
+            self.script.syscall_nr()
+        }
+        fn syscall_args(&self) -> [u64; 6] {
+            self.script.syscall_args()
+        }
+        fn set_syscall_ret(&mut self, value: u64) {
+            self.pending = false;
+            self.script.set_syscall_ret(value);
+        }
+        fn reg(&self, index: usize) -> u64 {
+            self.script.reg(index)
+        }
+        fn set_reg(&mut self, index: usize, value: u64) {
+            self.script.set_reg(index, value);
+        }
+        fn pc(&self) -> u64 {
+            self.script.pc()
+        }
+        fn set_pc(&mut self, value: u64) {
+            self.script.set_pc(value);
+        }
+        fn sp(&self) -> u64 {
+            self.script.sp()
+        }
+        fn set_sp(&mut self, value: u64) {
+            self.script.set_sp(value);
+        }
+        fn set_tls(&mut self, value: u64) {
+            self.script.set_tls(value);
+        }
+        fn fork(&self) -> Box<dyn Vcpu> {
+            Box::new(self.clone())
+        }
+        fn reset(&mut self, entry: u64, stack: u64) {
+            self.script.reset(entry, stack);
+        }
+    }
+
+    #[test]
+    fn preemption_tracks_runnable_peers_across_clone_wait_and_exit() {
+        const WAIT4: u64 = 260;
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let cpu = PreemptionProbe {
+            script: ScriptVcpu {
+                ops: [NR_CLONE, WAIT4, NR_GETPID].into(),
+                cur_nr: 0,
+            },
+            pending: false,
+            required: false,
+            history: Arc::clone(&history),
+        };
+        let mut kernel = kernel_only();
+        let memory = GuestMemory::new(0x1_0000, 16 * PAGE);
+        assert_eq!(kernel.run(Box::new(cpu), memory).unwrap(), 0);
+        assert_eq!(
+            *history.lock().unwrap(),
+            [
+                (NR_CLONE, false), // parent is alone
+                (WAIT4, true),     // clone made a child runnable within this slice
+                (WAIT4, false),    // parent parked; child has no children to wait for
+                (NR_GETPID, false),
+                (u64::MAX, false), // child exits and wakes the parent
+                (WAIT4, false),    // parent reaps; no peer remains runnable
+                (NR_GETPID, false),
+                (u64::MAX, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn preemption_considers_only_runnable_peers_and_wakes_due_sleepers() {
+        let mut kernel = kernel_only();
+        let shared = kernel.shared.get_mut().unwrap();
+        for (pid, run, parked, deadline) in [
+            (1, RunState::Running, false, None),
+            (2, RunState::Running, true, None),
+            (3, RunState::Stopped(19), false, None),
+            (4, RunState::Zombie(ExitCause::Exited(0)), false, None),
+        ] {
+            shared.procs.push(Some(Process {
+                vcpu: Some(Box::new(DummyVcpu)),
+                info: ProcInfo {
+                    pid,
+                    run,
+                    parked,
+                    wake_deadline: deadline,
+                    ..ProcInfo::default()
+                },
+            }));
+        }
+        assert!(!shared.has_runnable_peer(1));
+        shared.procs[1].as_mut().unwrap().info.wake_deadline = Some(1);
+        assert!(shared.has_runnable_peer(1), "a due sleeper needs a turn");
+        shared.procs[1].as_mut().unwrap().info.parked = true;
+        shared.procs[1].as_mut().unwrap().info.wake_deadline = None;
+        assert!(!shared.has_runnable_peer(1));
+        shared.procs[1].as_mut().unwrap().info.parked = false;
+        assert!(
+            shared.has_runnable_peer(1),
+            "an explicit wake requires preemption"
+        );
     }
 
     fn kernel_only() -> Kernel {

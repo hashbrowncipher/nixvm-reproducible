@@ -216,7 +216,9 @@ pub struct KvmVcpu {
     /// Wall-clock preemption quantum: a per-thread timer armed around each
     /// `KVM_RUN` breaks the guest out with `Exit::Interrupted` after this long,
     /// so a compute-bound guest that never exits still yields the CPU. `None`
-    /// disables it. Cached from `NIXVM_QUANTUM_MS` (see [`preempt`] and
+    /// disables it. PMU counting suspends this timer while tasks compete to run;
+    /// solo execution still yields so the kernel can service timers and sleepers.
+    /// Cached from `NIXVM_QUANTUM_MS` (see [`preempt`] and
     /// [`crate::vcpu::preempt_quantum`]).
     quantum: Option<Duration>,
     pmu: Option<pmu::Pmu>,
@@ -406,11 +408,7 @@ impl KvmVcpu {
             in_syscall: false,
             watchpoint,
             ebp,
-            quantum: if branch_quantum.is_some() {
-                None
-            } else {
-                crate::vcpu::preempt_quantum()
-            },
+            quantum: crate::vcpu::preempt_quantum(),
             pmu: branch_quantum.map(pmu::Pmu::new),
             cur_cr3: None,
             tlb_flush_pending: false,
@@ -486,11 +484,10 @@ impl KvmVcpu {
         // exits is broken out after the quantum: the timer signal interrupts
         // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
         // after so a late expiry can't fire into an unrelated later slice.
-        let counter = self
-            .pmu
-            .as_mut()
-            .map(|pmu| pmu.start(self.fd.0))
-            .transpose()?;
+        let counter = match &mut self.pmu {
+            Some(pmu) => pmu.start(self.fd.0)?,
+            None => None,
+        };
         if let Some(q) = quantum {
             preempt::arm(q);
         }
@@ -551,11 +548,13 @@ impl KvmVcpu {
     /// reads the cached physical pool and CR3, so it works
     /// identically with or without `mem`.
     fn run_loop(&mut self, mem: Option<&GuestMemory>) -> Result<Exit, VcpuError> {
+        let pmu_enabled = self.pmu.as_ref().is_some_and(pmu::Pmu::enabled);
+        let quantum = if pmu_enabled { None } else { self.quantum };
         let started = Instant::now();
         loop {
             // Count time across internal exits too: a loop containing only
             // trapped RDTSC must yield even though each KVM_RUN is brief.
-            let remaining = self.quantum.map(|q| q.saturating_sub(started.elapsed()));
+            let remaining = quantum.map(|q| q.saturating_sub(started.elapsed()));
             if remaining.is_some_and(|q| q.is_zero()) {
                 return Ok(Exit::Interrupted);
             }
@@ -563,9 +562,9 @@ impl KvmVcpu {
                 return Ok(Exit::Interrupted);
             }
             let reason = self.run_once(remaining)?;
-            if self.pmu.is_some() && matches!(reason, sys::KVM_EXIT_DEBUG | sys::KVM_EXIT_INTR) {
-                // Host interrupts and the variable-length precision tail do not
-                // schedule guest tasks. Only the exact branch target does.
+            if pmu_enabled && matches!(reason, sys::KVM_EXIT_DEBUG | sys::KVM_EXIT_INTR) {
+                // Active PMU counting schedules only at the exact branch target.
+                // Host interrupts and the precision tail stay within that slice.
                 continue;
             }
             // Debug watchpoint hit: log the write (value + faulting pc) and
@@ -930,6 +929,12 @@ impl Vcpu for KvmVcpu {
     fn begin_slice(&mut self) {
         if let Some(pmu) = &mut self.pmu {
             pmu.begin_slice();
+        }
+    }
+
+    fn set_preemption_required(&mut self, required: bool) {
+        if let Some(pmu) = &mut self.pmu {
+            pmu.set_enabled(required);
         }
     }
 
