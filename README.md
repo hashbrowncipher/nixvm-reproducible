@@ -230,12 +230,16 @@ Useful environment variables (both harnesses):
   network.
 
 The x86 CPU identity and feature bits come from `cpuid.toml`, embedded at build
-time for both KVM and the interpreter. The profile includes AVX/AVX2 and a fixed
-832-byte x87/SSE/YMM XSAVE layout. KVM checks host support and rejects an
-incompatible hardware backend; automatic backend selection can use the interpreter.
+time for both KVM and the interpreter. The profile requires an Intel Ice Lake-SP
+or newer host. It includes AVX/AVX2, FMA, AES-NI, SHA, GFNI, VAES, `RDPID` and
+other extensions, with a fixed 832-byte x87/SSE/YMM XSAVE layout. KVM checks host
+support and rejects an incompatible hardware backend, such as Cascade Lake;
+automatic backend selection can use the interpreter. The interpreter reports the
+same CPUID but does not execute every advertised extension.
 `/proc/cpuinfo` and ELF hardware capabilities use the same profile. KVM emulates
-`RDTSC` and `RDTSCP` with a shared logical counter. See [CPU instruction policy](docs/cpu.md)
-for timestamp and randomness behavior.
+`RDTSC` and `RDTSCP` with a shared logical counter, and `RDPID` returns zero. See
+[CPU instruction policy](docs/cpu.md) for the feature list, interpreter coverage,
+timestamp and randomness behavior.
 
 ### Seeded randomness
 

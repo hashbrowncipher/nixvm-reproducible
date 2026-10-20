@@ -1,9 +1,10 @@
 # CPU instruction policy
 
 The x86 CPU profile in `cpuid.toml` is shared by KVM and the interpreter.
-It advertises both `RDTSC` and `RDTSCP`. Both return a logical timestamp in
-EDX:EAX; `RDTSCP` also returns a fixed `TSC_AUX` of zero in ECX. Host CPU identity
-and migration do not affect that value.
+It advertises `RDTSC`, `RDTSCP` and `RDPID`. `RDTSC` and `RDTSCP` return a logical
+timestamp in EDX:EAX; `RDTSCP` also returns a fixed `TSC_AUX` of zero in ECX, and
+`RDPID` returns the same zero. Host CPU identity and migration do not affect that
+value.
 
 KVM traps both timestamp instructions through CR4.TSD and the guest #GP handler.
 The kernel and all vCPUs share one `VirtualClock`, including after fork and exec.
@@ -45,6 +46,41 @@ count-only KVM execution returns control to the host; it does not advance time
 or complete guest waits. Embedder wall-clock budgets also remain host-only.
 
 KVM leaves the vDSO uncalibrated so clock functions use their syscall fallback.
+
+CR4.TSD does not trap `RDPID`, so KVM executes it natively from the guest's
+`IA32_TSC_AUX`. Creating a vCPU sets that MSR to zero, which covers new vCPUs,
+fork children and recycled pool slots. Exec resets a vCPU in place, and user code
+cannot write the MSR. The interpreter does not implement `RDPID`; see below.
+
+## Hardware floor and interpreter coverage
+
+The profile describes Intel Ice Lake-SP or newer, the fleet floor. Beyond
+x86-64-v3 (AVX, AVX2, FMA, F16C, BMI1, BMI2, `LZCNT`, `MOVBE`) it advertises
+AES-NI, `PCLMULQDQ`, ADX, SHA, GFNI, VAES, `VPCLMULQDQ`, `PREFETCHW`,
+`CLFLUSHOPT`, `CLWB` and `RDPID`. Cascade Lake lacks SHA, GFNI, VAES,
+`VPCLMULQDQ` and `RDPID`. KVM compares the profile with the host's supported
+CPUID and rejects a host that lacks any advertised feature; it never removes a
+feature from the profile. Automatic backend selection can then use the
+interpreter.
+
+The profile keeps `RDRAND`, `RDSEED`, TSX, AVX-512, PKU and FSGSBASE off, and
+advertises no XSAVE extensions (`XSAVEOPT`, `XSAVEC`, `XSAVES`, `XGETBV` with
+ECX = 1). XSAVE manages only the x87, SSE and YMM components.
+
+Both backends report the same CPUID, but the interpreter executes only part of
+the profile. This divergence is accepted:
+
+| Features | KVM | Interpreter |
+|---|---|---|
+| FMA, F16C, `LZCNT`, `PREFETCHW`, `CLFLUSHOPT` | Executes | Executes |
+| AES-NI, `PCLMULQDQ`, SHA, GFNI, VAES, `VPCLMULQDQ`, ADX, `RDPID`, `CLWB` | Executes | #UD, reported as IllegalInstruction |
+
+A program that finds one of these features in CPUID and uses it runs on KVM and
+receives `SIGILL` under the interpreter. The memory forms of `ADCX`, the AES-NI
+rounds and `GF2P8MULB` read a 16-byte-aligned operand before the interpreter
+rejects the opcode, so a misaligned operand raises #GP and an unmapped one a page
+fault. `tests/cpuid.rs` executes one instruction per feature on both backends and
+records each outcome.
 
 ## Randomness instructions: works as intended
 

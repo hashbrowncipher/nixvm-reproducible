@@ -3,9 +3,10 @@
 //! aarch64 interpreter, but decodes variable-length x86 instructions instead
 //! of fixed 4-byte ones).
 //!
-//! It implements the complete user-mode (CPL 3) instruction set of the CPU it
-//! advertises through `CPUID` (see `X86Interp::cpuid`) and the loader's
-//! `AT_HWCAP` —
+//! It implements the user-mode (CPL 3) instruction set below. `CPUID` (see
+//! `X86Interp::cpuid`) and the loader's `AT_HWCAP` report the profile it shares
+//! with KVM, which also advertises extensions this interpreter lacks (see the
+//! end of this comment) —
 //!
 //! * **general purpose**: every integer instruction valid in 64-bit mode, in
 //!   all operand sizes (8/16/32/64) and addressing forms (ModRM/SIB/disp,
@@ -33,14 +34,22 @@
 //!   `TZCNT`/`MOVBE`, with `XSAVE`/`XRSTOR`/`XGETBV` managing the x87/SSE/AVX
 //!   state components.
 //! * `CPUID`, `RDTSC`/`RDTSCP`, `RDRAND`, `CMPXCHG16B`, `POPCNT`,
-//!   `FXSAVE`/`FXRSTOR`, `LAHF`/`SAHF`, fences/prefetches/`CLFLUSH`, and
-//!   `SYSCALL`.
+//!   `FXSAVE`/`FXRSTOR`, `LAHF`/`SAHF`, fences, prefetches (incl.
+//!   `PREFETCHW`), `CLFLUSH`/`CLFLUSHOPT`, and `SYSCALL`.
 //!
-//! Instructions outside the advertised feature set (AVX-512, AES-NI,
-//! `PCLMULQDQ`, SHA, ADX, `RDSEED`, TSX, …) decode as `#UD`, exactly as on a
-//! CPU without them. The `0x66`/`0xF2`/`0xF3` prefixes select among SIMD
-//! opcode variants ("mandatory prefixes") when an SSE opcode follows, and
-//! operand size / `REP` otherwise.
+//! The shared profile advertises AES-NI, `PCLMULQDQ`, SHA, GFNI, VAES,
+//! `VPCLMULQDQ`, ADX, `RDPID` and `CLWB` for KVM, but this interpreter does not
+//! implement them: they decode as `#UD` although `CPUID` reports them. That
+//! divergence is accepted (`docs/cpu.md`). The memory forms of `ADCX`, the
+//! AES-NI rounds and `GF2P8MULB` (`66 0F 38` opcodes) read a 16-byte-aligned
+//! operand before the opcode is rejected, so a misaligned or unmapped operand
+//! raises `#GP` or a page fault instead. Instructions the profile does not
+//! advertise either (AVX-512, `RDSEED`, TSX, …) decode as `#UD`, as on a CPU
+//! without them.
+//!
+//! The `0x66`/`0xF2`/`0xF3` prefixes select among SIMD opcode variants
+//! ("mandatory prefixes") when an SSE opcode follows, and operand size / `REP`
+//! otherwise.
 
 // Opcode dispatch: many arms legitimately share a body (aliases, groups),
 // and the register-vs-memory ModRM split reads best as a `match`.

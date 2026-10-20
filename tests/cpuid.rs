@@ -177,7 +177,7 @@ enum Interpreter {
     Executes,
     /// `#UD` at the feature's first instruction.
     Undefined,
-    /// `#GP` at the feature's first instruction. Unknown `66 0F 38` opcodes read a
+    /// `#GP` at the feature's first instruction. Unimplemented `66 0F 38` opcodes read a
     /// 16-byte-aligned source before the interpreter rejects the opcode, so a misaligned
     /// memory operand faults before the `#UD` a CPU without the feature would raise.
     MisalignedOperand,
