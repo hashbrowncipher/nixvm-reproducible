@@ -49,6 +49,8 @@ interp = []
 # read-only guest root. Off by default so the core stays dependency-free and
 # wasm-buildable; only mounting a real image needs it.
 fstool = ["dep:fstool"]
+# Host-opened EROFS images and a merged stack of immutable root layers.
+erofs = ["dep:rust-fs-erofs", "dep:rust-fs-core"]
 # In-process gzip decompression of a `.tar.gz` root image, via the `compcol`
 # compression collection (the same one `fstool` uses). Lets the browser demo
 # decompress the Alpine minirootfs itself instead of relying on the browser's
@@ -73,6 +75,10 @@ tunnel = ["dep:pktkit"]
 [dependencies]
 # Portable runtime libraries are feature-gated. The KVM instruction decoder is
 # target-gated; the host-only CPUID parser is under build-dependencies.
+rust-fs-erofs = { version = "=0.4.1", path = "vendor/rust-fs-erofs", optional = true }
+rust-fs-core = { version = "=0.3.9", optional = true }
+# The core links no third-party runtime dependencies. Optional runtime libraries
+# are feature-gated; the host-only CPUID parser is under build-dependencies.
 # `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
 # Since 0.4.28 each filesystem is its own feature (a `default-features = false`
 # build gets none and doesn't compile); enable the ones nixvm reads/builds:

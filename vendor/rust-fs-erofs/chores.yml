@@ -1,0 +1,763 @@
+version: "3"
+chore_min_version: 0.10.0
+
+# THE CONTRACT THIS FILE EXISTS TO OWN.
+#
+# How to build rust-fs-erofs is knowledge that belongs to rust-fs-erofs. It used to
+# live in a consumer's build scripts — four scripts, 757 lines between
+# them, byte-identical once you normalise the driver name, of which three
+# lines per script were actually about the filesystem: the cargo invocation,
+# the header name and the archive name.
+#
+# `staticlib` is the whole interface a consumer needs, AND IT TAKES NO
+# OUTPUT DIRECTORY. It builds into this crate's own dist/; `chore artifact`
+# prints the absolute path of that DIRECTORY, and a consumer copies its
+# contents. Nothing outside this repo should know the target triple, the
+# cargo profile, or where cargo puts things — and nothing outside it
+# chooses where the output lands.
+#
+# `artifact` PRINTS A DIRECTORY, NOT A FILE. That is the one place this
+# differs from rust-blk-probe, whose single binary lets its `artifact` name
+# a file: this crate produces libfs_erofs.a AND the headers beside it, so
+# there is no single path to name.
+#
+# THE TEST CONTRACT (the harness README's "Consumer test contract" is the
+# general form; rust-fs-ext4 is the template this follows):
+#
+#   chore siblings     check out ../rust-fs-core and ../fs-linux-test-harness
+#                      at their pinned refs
+#   chore tools        install and verify what the HOST needs: python3, and
+#                      the VM (Vagrant, QEMU, KVM/HVF). NOT erofs-utils
+#   chore fixtures     build test-disks/erofs-*.img — mkfs.erofs-made, so in
+#                      the harness VM (vm:*)
+#   chore test:unit    tests that need no tool, no fixture and no VM
+#   chore test:images  tests that read a fixture but need no VM
+#   chore test:oracle  the driver writes, erofs-utils reads back (fsck.erofs
+#                      for consistency, dump.erofs for content and metadata),
+#                      and mkfs.erofs writes what the driver reads
+#   chore test:kernel  the driver writes, THE REAL KERNEL reads back: our
+#                      images loop-mounted by Linux in the guest, plus the
+#                      damaged image it has to refuse
+#   chore test:vm      the whole suite compiled and run INSIDE the guest
+#   chore test         everything, exactly as CI runs it
+#   chore test:android a real Android EROFS image, Google-built, read
+#                      against what the kernel and fsck.erofs read in it.
+#                      ITS OWN TIER AND IN NOTHING ELSE: the fixture is not
+#                      ours to redistribute, so it is downloaded, and only
+#                      the nightly android.yml workflow runs it. Inside the
+#                      tier a missing fixture FAILS (#54)
+#
+# WHERE THINGS RUN, and why.
+#
+#   THE ORACLE TOOLS RUN IN THE GUEST, ALWAYS. erofs-utils on a
+#   workstation is whatever that machine has, and here that is worse
+#   than usual: Debian 12 packages 1.5 and Ubuntu 24.04 packages 1.7.1,
+#   neither of which knows the options the writer tests use; and
+#   `mkfs.erofs` only compiles ZSTD in when libzstd was present at
+#   configure time, which most packaged builds were not. One Debian
+#   guest, one source build of 1.9.1, the same answers everywhere.
+#   There is no host path to fall back to: tests/test_contract.rs fails
+#   the suite if a test runs one here.
+#
+#   THE KERNEL ORACLES MOUNT IN THE GUEST, ALWAYS. A loop mount needs
+#   root and an EROFS driver; the host has neither to spare, and what
+#   stood here before was a `sudo -n mount` that skipped on every
+#   machine without passwordless sudo (#117).
+#
+#   THE LINUX TESTS RUN ON LINUX. On a Linux host that is this host, and
+#   `chore test` compiles and runs them here. On a Mac nothing Linux-shaped
+#   runs natively: `chore test` runs `test:vm` instead, which builds and
+#   runs the same sources inside the guest.
+#
+# NOTHING SKIPS: a missing tool, fixture or VM fails the test that needed
+# it, naming the task that provides it.
+#
+# QUIET BY DEFAULT, --verbose ON REQUEST, AND THE BUDGET IS A NUMBER.
+#
+#   A task prints a VERDICT: one line per tier, a final count, and the path
+#   of the log holding everything else. A failure prints the excerpt.
+#   `chore test -- --verbose` (or OUTPUT_BUDGET_VERBOSE=1) streams the whole
+#   run.
+#
+#   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
+#   in full, including the per-call `[oracle vm]` and `[kernel vm]` evidence
+#   that `--show-output` produces. What changed is where it is read from.
+#
+#   Each tier carries an OUTPUT BUDGET -- a line and a byte count that fails
+#   the run (exit 65) when the tier prints more than it is allowed to, told
+#   apart from a failing suite by its status. A green run of this
+#   repository's CI printed 6,035 lines across three jobs and kept none of
+#   them (#131); the budgets below are MEASURED, on this arm64 KVM host,
+#   from the run recorded in the pull request that added them:
+#
+#     tier      measured          budget            headroom, and why
+#     tier      measured          budget            headroom, and why
+#     unit      643 l / 35,194 B  740 l / 40,000 B  ~15%. The tests' own output:
+#               453 tests                           the build runs first,
+#                                                   outside the budget (#189),
+#                                                   so a cold cache no longer
+#                                                   counts. From main run
+#                                                   37545116802's unit.log,
+#                                                   792 l / 42,371 B cold,
+#                                                   less its 149 cargo and
+#                                                   rustup lines
+#     images     13 l /    684 B  120 l /  8,000 B  the first --release tier in
+#                 3 tests                           a job, so it pays the cold
+#                                                   build too: 73 l cold
+#     oracle    529 l / 41,268 B  700 l / 55,000 B  runs warm in CI (unit and
+#                87 tests                           images built already): ~18%
+#     kernel     24 l /  1,173 B  130 l /  9,000 B  warm in CI; sized for cold
+#                 2 tests                           anyway, it is cheap to
+#     suite     771 l / 39,019 B  900 l / 50,000 B  measured COLD; warm in CI
+#               545 tests                           at 709 l, so ~17% on cold
+#     vm        898 l / 45,000 B  1,150 l / 60,000  measured COLD, from
+#               545 tests                       B   `vm:destroy` + `test:vm`:
+#                                                   a fresh box, the erofs-utils
+#                                                   source build and a full
+#                                                   in-guest build, 695s. ~28%,
+#                                                   because vagrant's boot
+#                                                   retries ("Connection reset.
+#                                                   Retrying...") are noise this
+#                                                   repository does not control
+#     scripts     3 l /     77 B   30 l /  2,000 B  one shell test today, and
+#                                                   the glob picks up the next
+#     cli        19 l /    683 B   28 l /  1,000 B  the installed tools, no cargo
+#               137 checks                          output at all: 19 lines on a
+#                                                   Mac with erofs-utils linked
+#                                                   (doctor names it as not run),
+#                                                   one fewer on a runner without
+#                                                   it. Every file is three lines
+#                                                   when it passes, so a new one
+#                                                   is a visible step. Was 12 l /
+#                                                   466 B with mkfs.erofs alone,
+#                                                   16 l / 604 B before the docs
+#     android     8 l /    358 B   11 l /    470 B  the test alone, measured on
+#                 1 test                            the runner from a cold cargo
+#                                                   cache (android.yml run
+#                                                   38004890949): the build runs
+#                                                   before the tier since #195,
+#                                                   so the cache state no longer
+#                                                   reaches it. ~30%. Was 88 l /
+#                                                   4,005 B -> 115 l / 5,200 B
+#                                                   with the cold build inside,
+#                                                   which a lockfile change grew
+#                                                   to 156 l (run 37607539617).
+#                                                   The first row, 100 l / 3,500
+#                                                   B, was measured on a host
+#                                                   with no downloads and no
+#                                                   colour, and failed its first
+#                                                   run (#166). Replaced gsi,
+#                                                   which could never pass
+#                                                   (#133) and so was never
+#                                                   measured
+#
+#   A COLD BUILD ADDS 63 `Compiling` LINES, measured on this crate's graph
+#   (74 packages in Cargo.lock) by `cargo clean` then the suite tier: 709
+#   lines warm against 771 cold. It lands on whichever tier runs FIRST in
+#   a job, and on BOTH profiles -- `unit` is the only debug tier, so it
+#   would pay its own, which is why `test:unit` builds before its tier
+#   starts counting (#189). The release tiers still pay it, which is why
+#   `images`, the smallest, carries the largest proportional headroom: it
+#   legitimately prints 13 lines and legitimately prints 73.
+#
+#   Raise one DELIBERATELY when a tier grows, the way the executed-test
+#   floors are raised. A budget nobody can breach measures nothing.
+#
+#   Why it is worth a task's while: a passing run that prints three thousand
+#   lines hides the twenty that matter, and every reader pays for it --
+#   a person scrolling, a CI log viewer, and an agent working here, which
+#   re-reads its transcript on every step and so pays for one loud run many
+#   times over. See the fs-linux-test-harness README, "Output: quiet by
+#   default, --verbose on request".
+vars:
+  TRIPLE: aarch64-apple-darwin
+  LIBNAME: fs_erofs
+
+  # The sibling pins. One place, read by `chore siblings` and — through
+  # that task — by CI. URL as well as ref: the family is not all in one
+  # org, and a URL rebuilt from a repo name points at a repository that
+  # does not exist for exactly the ones that are not.
+  FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
+  # v0.2.13, AND THE FLOOR IS ABOUT ../rust-fs-core/scripts/output-budget.sh, not about
+  # any type this crate uses.
+  #
+  # v0.2.11 is the first release that PACKAGES the wrapper, which
+  # ../rust-fs-core/scripts/tier.sh resolves through `cargo metadata` and copies into the
+  # run; v0.2.10, which this repository pinned before, does not contain it
+  # at all. But v0.2.11 and v0.2.12 read the log ALOUD when a tier fails
+  # -- forty lines of tail -- and v0.2.13 (rust-fs-core#164) is where a
+  # failure became one line naming the log. Measured against the two
+  # releases:
+  #
+  #   v0.2.12   demo: FAILED (exit 3)
+  #             --- last 40 lines of /tmp/x.log
+  #             ... the log, read back ...
+  #   v0.2.13   demo: FAILED (exit 3) — 2 lines in /tmp/x.log
+  #
+  # Pinning v0.2.12 would therefore have satisfied the `--version`
+  # contract -- both answer `rust-fs-core-output-budget 1` -- while
+  # quietly giving up the behaviour this migration is for, and only on the
+  # failure path, where nobody looks until it is too late. The rest of the
+  # family (ext4, xfs, btrfs, ntfs, the four image crates, go-networkfs)
+  # pins v0.2.13 for the same reason.
+  #
+  # v0.2.23 is the first release with ../rust-fs-core/scripts/package-cli.sh and the
+  # release-cli workflow release.yml calls (#181): the tarball's packaging
+  # is core's now, and the path sibling must carry it.
+  #
+  # v0.3.9 packages the tools for Windows when release.yml asks
+  # (`windows: true`), and doctor finds a name as its .exe there (#185).
+  FS_CORE_REF: v0.3.9
+  LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
+  # v0.3.0 is the release with `vm.sh session`, which the test runner runs
+  # cargo through so a run gives the VM and the machine-wide slot back
+  # however it ends; v0.2.0 answers it with "unknown command".
+  LINUX_HARNESS_REF: v0.3.0
+
+# The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
+# harness is a sibling that `chore siblings` itself checks out: without
+# it this file must still load far enough to run that task. Every task
+# here that needs the VM says so when the harness is absent.
+#
+# No `dir:` — see the harness's vm.chores.yml: its tasks must run from
+# this repository's root, where fs-linux-test-harness.toml is.
+includes:
+  vm:
+    taskfile: ../fs-linux-test-harness/vm.chores.yml
+    optional: true
+
+# The reaper: any chore invocation stops a VM nothing else brought down
+# (a killed `chore fixtures`, a script run by hand). Fails soft, and does
+# nothing before the harness is checked out.
+lifecycle:
+  after_all:
+    - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh reap'
+
+
+tasks:
+  siblings:
+    desc: Check out the sibling repos this crate builds and tests against, at their pinned refs
+    # init + fetch-by-ref rather than clone: a ref here may be a bare
+    # commit, which `git clone --branch` cannot name. REFUSES TO MOVE A
+    # DIRTY SIBLING — a checkout is destructive to uncommitted work.
+    cmds:
+      - |
+        set -eu
+        # SIBLINGS LIVE BESIDE THE MAIN TREE, NOT BESIDE THIS CHECKOUT.
+        #
+        # `../$name` was resolved from wherever the task ran, and a thread
+        # worktree is not next to the main checkout -- it lives under the
+        # agent's own directory. A sibling set is a property of the machine,
+        # not of a checkout: one copy on disk is the whole point of siblings
+        # over submodules, and it holds only if every checkout of every crate
+        # agrees where that copy is. --git-common-dir names the main tree from
+        # a worktree AND from the main checkout, so this answers the same from
+        # anywhere.
+        #
+        # --path-format=absolute is required, not tidiness: without it a main
+        # checkout reports a bare `.git` and this resolves to `//$name`.
+        common="$(git rev-parse --path-format=absolute --git-common-dir)"
+        siblings_root="$(cd "$common/../.." && pwd)"
+        printf '%s\t%s\t%s\n' \
+          rust-fs-core          '{{.FS_CORE_URL}}'       '{{.FS_CORE_REF}}' \
+          fs-linux-test-harness '{{.LINUX_HARNESS_URL}}' '{{.LINUX_HARNESS_REF}}' \
+        | while IFS="$(printf '\t')" read -r name url ref; do
+            dir="$siblings_root/$name"
+            # -e, not -d: a worktree's .git is a FILE naming its gitdir, and every
+            # working copy here is a worktree, a pinned sibling included.
+            if [ ! -e "$dir/.git" ]; then
+              echo "siblings: cloning $name at $ref"
+              git init --quiet "$dir"
+              git -C "$dir" remote add origin "$url"
+              git -C "$dir" fetch --quiet origin "$ref"   # not --depth 1: merge-base needs history
+              git -C "$dir" checkout --quiet FETCH_HEAD
+              continue
+            fi
+            if [ -n "$(git -C "$dir" status --porcelain)" ]; then
+              echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
+              exit 1
+            fi
+            git -C "$dir" fetch --quiet origin main "$ref"
+            # THE PIN IS A FLOOR, NOT A TARGET, AND THE SIBLING STAYS ON A BRANCH.
+            #
+            # One copy of core is shared by every crate on the machine, so a
+            # task that checks out the pinned ref whenever HEAD differs moves
+            # the checkout BACKWARDS: the oldest pin in the family wins. And
+            # checking out a tag DETACHES, which reads as a deliberate state
+            # that nothing complains about while it goes stale.
+            #
+            # So: guarantee a FLOOR, and never move anyone off their branch. A
+            # checkout that already contains the pinned ref is left exactly as
+            # it is. Only one genuinely below the floor is moved, and only by
+            # fast-forwarding a main that is already checked out. Anything else
+            # is reported for a human.
+            current="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+            if git -C "$dir" merge-base --is-ancestor "$ref" HEAD; then
+              echo "siblings: $name at or ahead of $ref (on $current)"
+            elif [ "$current" = "main" ] && git -C "$dir" merge --ff-only --quiet origin/main 2>/dev/null; then
+              echo "siblings: $name fast-forwarded to $(git -C "$dir" rev-parse --short HEAD)"
+            else
+              echo "siblings: $name is on '$current' and below $ref; this task will not move it." >&2
+              echo "          It is one checkout shared by every crate here -- move it yourself." >&2
+              exit 1
+            fi
+          done
+
+  tools:
+    desc: "Install and verify what the HOST needs: python3, and the VM the oracle tools live in"
+    cmds: ['scripts/tools.sh']
+
+  fixtures:
+    desc: Build every test-disks/erofs-*.img fixture (mkfs.erofs-made, in the fs-linux-test-harness VM)
+    # Up to date while the recipe is unchanged and every image exists;
+    # --force rebuilds. The VM comes down when the build ends, however
+    # it ends (build-fixtures.sh sources the harness's vm-session.sh).
+    #
+    # THIS LIST AND IMAGES IN build-fixtures.sh MUST AGREE, and both must
+    # agree with SPECS in test-disks/guest-build-images.sh.
+    sources:
+      - test-disks/build-fixtures.sh
+      - test-disks/guest-build-images.sh
+      - scripts/vm-setup.sh
+    generates:
+      - test-disks/erofs-plain.img
+      - test-disks/erofs-lz4.img
+      - test-disks/erofs-lz4hc.img
+      - test-disks/erofs-lzma.img
+      - test-disks/erofs-deflate.img
+      - test-disks/erofs-zstd.img
+      - test-disks/erofs-b1024.img
+      - test-disks/erofs-b512.img
+      - test-disks/erofs-bigpcluster.img
+      - test-disks/erofs-ztailpacking.img
+      - test-disks/erofs-chunked.img
+    # A hung boot must not hold the VM and the machine-wide slot for ever.
+    timeout: 60m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds: ['test-disks/build-fixtures.sh']
+
+  # EVERY TIER SAYS HOW FEW TESTS STILL COUNT AS HAVING RUN IT.
+  #
+  # `tier.sh` fails a tier that PRINTS more than its budget; nothing
+  # failed a tier that printed almost nothing because it RAN almost
+  # nothing. The tiers select their targets by grep in
+  # `scripts/test-targets.sh`, so a helper renamed or a predicate edited
+  # empties a selection -- and `cargo test` with no matching target exits
+  # 0, which `tier.sh` then reports as `ok (2 lines)`.
+  #
+  # Each floor below is MEASURED and recorded with its tier. Each call
+  # prints what it counted (`unit: 440 tests executed (floor 400)`), so
+  # the numbers to raise them to are in the next run's log; raising one
+  # is a deliberate change, and a floor only ever goes up.
+  #
+  # THE SAME CALL IS THE SKIP GATE (#129): a tier whose log reports any
+  # test `ignored` fails, whatever it executed, naming the tests.
+  # tests/scripts/skip-gate.sh proves it refuses one.
+  #
+  # `scripts` has none: it prints a PASS line per shell test rather than
+  # cargo's result lines, so the counter here would read zero for a tier
+  # that ran everything.
+  test:unit:
+    desc: 'Tests that need no tool, no fixture and no VM: the library, the binaries, and every tests/*.rs that reaches none of them'
+    # In the DEBUG profile, which is the point: overflow-checks are on
+    # here and off in release, and EXPECT_OVERFLOW_CHECKS=1 arms
+    # overflow_checks::the_build_the_gate_asked_to_check_does_check in
+    # src/lib.rs to prove it. tests/ci_profile.rs checks that the CI
+    # workflow still runs this task.
+    #
+    # Which targets: scripts/test-targets.sh, derived from the tests
+    # rather than listed here. CI runs this job with no fixtures present,
+    # which is what proves the split.
+    #
+    # BUILT FIRST, OUTSIDE THE BUDGET (#189). The same command with
+    # `--no-run`: on a cold cache it is what installs the pinned toolchain,
+    # downloads the crates and compiles them, and none of that is the
+    # tier's output. Inside tier.sh it was 149 lines of a 792-line log
+    # (run 37471725686), enough to refuse a tier whose tests all passed.
+    # `--quiet` keeps a warm run silent. tests/ci_profile.rs requires this
+    # step to build exactly what the tier runs.
+    cmds:
+      - 'scripts/test.sh --locked --no-run --quiet $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 bash ../rust-fs-core/scripts/tier.sh test:unit unit 740 40000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored unit 420'
+
+  test:images:
+    desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
+    # The tier CI's aarch64 job runs: GitHub's arm64 runners have no
+    # /dev/kvm, so no VM can start there. Before the fixtures existed
+    # that job read no mkfs.erofs image at all, on the architecture this
+    # crate actually ships on.
+    cmds:
+      - '../rust-fs-core/scripts/tier.sh test:images images 120 8000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored images 3'
+
+  test:oracle:
+    desc: 'erofs-utils and this crate read each other — every tool call made inside the harness VM'
+    # --show-output keeps what each passing oracle test checked (the
+    # `[oracle vm]` lines: every tool invocation and its verdict), so a
+    # green run carries its evidence rather than a count. It goes to
+    # tmp/logs/oracle.log, not the terminal -- the evidence is kept, and
+    # reading it is a choice rather than a toll. `--verbose` streams it
+    # live.
+    #
+    # NO `vm:up` HERE, deliberately. The first oracle call in each test
+    # process brings the VM up (idempotent, milliseconds when it is
+    # already running) and every later call rides one shared SSH
+    # connection. scripts/test.sh runs cargo inside a harness session
+    # (`vm.sh session`), so the VM comes down and the machine-wide slot is
+    # released when the tier ends, however it ends and however it was
+    # started — one boot for the tier. The `after_all` reaper is the net
+    # for a run that never reached scripts/test.sh.
+    cmds:
+      - scripts/tools.sh --check
+      - '../rust-fs-core/scripts/tier.sh test:oracle oracle 700 55000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      # 90: the 87 measured before the tools, plus tests/cli_mkfs_oracle.rs
+      # and tests/cli_fs_oracle.rs's eight, less a margin. Only goes up.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored oracle 90'
+
+  test:kernel:
+    desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
+    # The gap fsck.erofs cannot close: it reads the format from the same
+    # specification this crate does, and Linux is the thing the images
+    # are for. These tests write with the Rust API, mount read-only in
+    # the guest, and compare names, types, modes, sizes, symlink targets
+    # and SHA-256 of contents against what was written — plus a
+    # deliberate corruption the kernel has to refuse.
+    cmds:
+      - scripts/tools.sh --check
+      - '../rust-fs-core/scripts/tier.sh test:kernel kernel 130 9000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+    # 5: the 3 measured on main at ca0c577 (CI run 36351672753) -- the
+    # third being the readlink kernel oracle #139 added -- plus the two
+    # #125 added: the deduplicated images read back through the kernel,
+    # and the all-fragments,ztailpacking file it misreads being the one
+    # this crate refuses. 6 with tests/cli_mkfs_kernel.rs: the kernel
+    # reading back the image the `mkfs.erofs` tool builds; 7 with
+    # tests/cli_fs_kernel.rs: `fs.erofs` reading what the kernel reads;
+    # 8 with tests/acl_oracle.rs: POSIX ACLs agreeing with the kernel's;
+    # 10 with tests/hardlink_oracle.rs: link counts and inode identity,
+    # compact and extended inodes.
+    # tests/scripts/kernel-floor.sh fails if this falls below the number of
+    # tests the tier holds.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored kernel 10'
+
+  test:android:
+    desc: 'A real Android EROFS image, read against the kernel and fsck.erofs — needs tests/fixtures/download-android-erofs.sh first'
+    # NOT PART OF `chore test`. The image is Google's to distribute, so it
+    # is fetched (tests/fixtures/download-android-erofs.sh), never
+    # committed, and a pull request cannot be made to depend on a 712 MB
+    # download. .github/workflows/android.yml runs this tier nightly with
+    # the fixture cached. What it is not any more is a suite that reports
+    # ok having opened no image: inside the tier a missing fixture fails,
+    # naming the script (#54).
+    #
+    # THE BUDGET IS THE TEST'S OUTPUT ALONE, measured on the runner from a
+    # cold cargo cache with the build moved out of the tier (android.yml
+    # run 38004890949 on #198): 8 lines, 358 bytes -- cargo's Finished and
+    # Running lines, then the test. ~30% over that is 11 lines / 470 bytes.
+    # It was 115 / 5200 while the tier also carried the cold build, which
+    # a lockfile change grew past it (#166, #195).
+    #
+    # THE BUILD IS NOT THE TIER'S (#195). android.yml's cargo cache is keyed
+    # on Cargo.lock, so the first nightly run after any lockfile change is
+    # cold, and a cold build inside the tier printed 156 lines against the
+    # 115 it had then, with the one test passing (run 37607539617). The first
+    # command builds exactly what the tier runs, outside tier.sh, so the
+    # toolchain install, the downloads and the Compiling lines never reach
+    # tmp/logs/android.log; the tier compiles nothing.
+    cmds:
+      - 'scripts/test.sh --locked --release --no-run --quiet $(scripts/test-targets.sh android)'
+      - '../rust-fs-core/scripts/tier.sh test:android android 11 470 -- scripts/test.sh --locked --release $(scripts/test-targets.sh android)'
+    # One test, so one is the honest floor; it exists to catch the
+    # selection going empty, not to measure the suite's size.
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored android 1'
+
+  test:vm:
+    desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
+    # scripts/guest-suite.sh, through the harness's [test] guest_command.
+    # The toolchain and the build directory live on the VM's own disk, so
+    # the first run pays a full build and later runs are incremental.
+    # FLTH_KEEP_VM=1 keeps the VM up for the next one.
+    timeout: 120m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds:
+      # The sibling crates this one builds against are staged on the
+      # share first: the guest is given THIS repository, not the
+      # directory that holds it, so a path dependency on ../rust-fs-core
+      # has nothing to resolve to until it is put there. From the pinned
+      # checkout's HEAD, so what the guest builds against is what
+      # `chore siblings` pinned and nothing uncommitted.
+      - |
+        set -eu
+        [ -x ../fs-linux-test-harness/scripts/vm.sh ] || {
+          echo "test:vm needs the harness sibling -- run 'chore siblings'." >&2
+          exit 1
+        }
+        share="$(../fs-linux-test-harness/scripts/vm.sh share)"
+        for sibling in rust-fs-core; do
+          [ -e "../$sibling/.git" ] || {
+            echo "test:vm: ../$sibling is not checked out -- run 'chore siblings'." >&2
+            exit 1
+          }
+          dest="$share/siblings/$sibling"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          git -C "../$sibling" archive --format=tar HEAD | tar -x -C "$dest"
+        done
+        # --verbose is ours, not cargo's: tier.sh reads it out of CLI_ARGS
+        # and streams, and it must not also reach the in-guest `cargo test`,
+        # where it would mean something else entirely.
+        guest_args=""
+        for arg in ${CLI_ARGS:-}; do
+          case "$arg" in --verbose|-v) continue ;; esac
+          guest_args="$guest_args $arg"
+        done
+        # shellcheck disable=SC2086  # the words are the point
+        ../rust-fs-core/scripts/tier.sh test:vm vm 1150 60000 -- \
+          ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
+        bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored vm 520
+
+  test:
+    desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
+    # WE RUN THE LINUX TESTS ON LINUX. This host is Linux, so they run
+    # here; on a Mac there is no EROFS, no loop mount and no erofs-utils
+    # worth trusting, so the same sources are built and run inside the
+    # guest instead (`test:vm`). Not a reduced run and not a skip: the
+    # whole suite, one Linux away.
+    cmds:
+      - |
+        set -eu
+        # --verbose belongs to the whole run, and test:native's tiers are
+        # separate chore invocations: an exported variable is what reaches
+        # them, which is why tier.sh reads OUTPUT_BUDGET_VERBOSE as well as
+        # the flag.
+        case " ${CLI_ARGS:-} " in
+          *" --verbose "*|*" -v "*) export OUTPUT_BUDGET_VERBOSE=1 ;;
+        esac
+        if [ "$(uname -s)" != Linux ]; then
+          echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."
+          exec "{{.CHORE_EXE}}" test:vm
+        fi
+        "{{.CHORE_EXE}}" test:native
+
+  test:native:
+    desc: 'The suite on this (Linux) host: unit (debug), the fixtures, the oracles, the kernel oracles, everything (release), the scripts'
+    # Checks for the host tools and the fixtures FIRST and fails naming
+    # the task that provides them, rather than letting several hundred
+    # tests each fail on the same missing image.
+    #
+    # test:oracle and test:kernel run before the whole suite, which runs
+    # those tests again: the price of their evidence being in every log,
+    # and of `test` staying plainly "everything".
+    #
+    # NOT test:android. That tier needs a downloaded fixture no pull
+    # request fetches, and `test` must mean the same thing on every
+    # machine.
+    cmds:
+      - task: test:unit
+      - scripts/tools.sh --check
+      - test-disks/build-fixtures.sh --check
+      - task: test:images
+      - task: test:oracle
+      - task: test:kernel
+      # `all`, not a bare `cargo test`: that would also select the
+      # Android suite, whose fixture no machine here can be expected to
+      # have.
+      - '../rust-fs-core/scripts/tier.sh "test:native (whole suite, release)" suite 900 50000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh all)'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored suite 520'
+      - task: test:scripts
+      # The command-line tools, built and staged from this checkout, then
+      # tested as installed. A separate invocation because test:cli reads
+      # PATH, and the staged directory has to come first on it.
+      - task: cli:install
+      - 'PATH="$(scripts/cli-install.sh --print-bin-dir):$PATH" "{{.CHORE_EXE}}" test:cli'
+      # THE LAST LINE: one number across the tiers, and where the detail is.
+      - scripts/test-verdict.sh unit images oracle kernel suite cli
+
+  cli:install:
+    desc: 'Build the command-line tools (release, --features cli) and stage them as an install prefix: tmp/cli/bin under every name, tmp/cli/share the man pages and completions'
+    # The layout an install has: the multi-call binary as rust-fs-erofs and
+    # each dotted name a relative symlink to it. It prints the PATH line;
+    # `test:cli` tests whatever PATH finds, so that directory goes first.
+    cmds: ['scripts/cli-install.sh']
+
+  test:cli:
+    desc: 'The command-line tools AS INSTALLED, found on PATH: doctor first, then every tests/cli/test-*.sh'
+    # Tests the installed artifact, not a cargo target: the same suite
+    # checks `chore cli:install`'s staging (test:native puts it first on
+    # PATH) and a Homebrew install. `rust-fs-erofs doctor` runs before any
+    # tool is tested and fails the tier if a name is missing or shadowed --
+    # erofs-utils' own mkfs.erofs, when it is linked, is the one it will
+    # find -- naming the fix. See scripts/test-cli.sh.
+    #
+    # No VM: what erofs-utils and the kernel make of the tools' images is
+    # the oracle and kernel tiers' question (tests/cli_*_oracle.rs), where
+    # every tool call already happens in the guest.
+    #
+    # BUDGET, measured: see the table at the top of this file.
+    # FLOOR: each file prints a `test result: ok. N passed` line, which
+    # test-floor.sh sums as it does cargo's. 66 checks executed when the
+    # tier was added (mkfs.erofs and the names), 114 with fs.erofs, 137
+    # with the man pages and completions; the floor is about 95% of that,
+    # and it only goes up.
+    cmds:
+      - '../rust-fs-core/scripts/tier.sh test:cli cli 28 1000 -- scripts/test-cli.sh'
+      - 'bash ../rust-fs-core/scripts/test-floor.sh --refuse-ignored cli 130'
+
+  test:scripts:
+    desc: The shell tests (tests/scripts/*.sh), every one by glob
+    # By glob, so a test added later needs no edit here -- a guard that
+    # has to be registered somewhere else is a guard that gets silently
+    # skipped.
+    cmds:
+      - |
+        set -eu
+        ../rust-fs-core/scripts/tier.sh test:scripts scripts 30 2000 -- bash -c '
+          set -eu
+          for t in tests/scripts/*.sh; do
+            echo "== $t"
+            bash "$t"
+          done
+        '
+
+  staticlib:
+    desc: Build the static library and its headers into this crate's dist/
+    # NO `out` ARGUMENT, deliberately. A library does not write into its
+    # consumer. It builds into its own dist/ and a consumer asks where that
+    # is — `chore artifact` prints the path. Inverting it that way means this
+    # crate can change its output layout without every consumer knowing, and
+    # it stays independently usable with no consumer at all.
+    vars:
+      OUT: 'dist'
+
+    # Freshness, replacing the 101 lines of stamp-file and mtime comparison
+    # the old scripts carried. Content checksums, so touching a file does not
+    # trigger a rebuild and reverting one does not hide behind a newer mtime.
+    #
+    # These patterns are LITERAL on purpose. chore records a fingerprint by
+    # calling fingerprint.Save WITHOUT a renderer (internal/run/run.go:313),
+    # so a pattern containing {{ }} is expanded against the raw text, matches
+    # nothing, and stores the empty-set hash — the task then never registers
+    # as up to date. Measured 2026-08-27 against chore 0.6.0.
+    sources:
+      - Cargo.toml
+      - 'src/**/*.rs'
+      - 'include/*.h'
+      # fs_core.h is a source of ours because we ship it (see the cp below).
+      # THIS PATH AND THE cp MUST AGREE, and nothing checks that they do —
+      # it is the same path Cargo.toml resolves rust-fs-core from.
+      - '../rust-fs-core/include/fs_core.h'
+      # The task's own definition. Without it an edit to cmds:, a cp path or
+      # vars.TRIPLE leaves the fingerprint unchanged, so chore reports
+      # `task: staticlib is up to date` and ships the previous artefacts.
+      # tests/chore_manifest.rs refuses its removal (#90).
+      - chores.yml
+
+    # Templated, which is fine here where it is not fine above: the check
+    # renders these correctly, and every entry is an exact path rather than a
+    # glob, so a missing artifact is caught by the pattern failing to match.
+    generates:
+      - '{{.OUT}}/lib{{.LIBNAME}}.a'
+      - '{{.OUT}}/include/{{.LIBNAME}}.h'
+
+    cmds:
+      # Idempotent, and it replaces a 25-line "is the target installed" dance:
+      # rustup answers "up to date" without touching the network when it is.
+      # It runs here rather than in the consumer because the triple is ours.
+      - 'rustup target add {{.TRIPLE}}'
+      - 'cargo build --release --target {{.TRIPLE}}'
+      - 'mkdir -p "{{.OUT}}/include"'
+      - 'cp target/{{.TRIPLE}}/release/lib{{.LIBNAME}}.a "{{.OUT}}/lib{{.LIBNAME}}.a"'
+      - 'cp include/{{.LIBNAME}}.h "{{.OUT}}/include/{{.LIBNAME}}.h"'
+      # Shipping fs_core.h is ours: the header we emit #includes it, so a
+      # consumer handed only fs_erofs.h cannot compile.
+      - 'cp "../rust-fs-core/include/fs_core.h" "{{.OUT}}/include/fs_core.h"'
+
+  lint:
+    desc: Formatting and clippy, exactly as CI runs them
+    # `--locked` is not decoration. It makes the build fail rather than
+    # silently update Cargo.lock, which is what keeps a local gate and
+    # CI checking the same dependency versions — and it is what the
+    # release process relies on.
+    #
+    # This exists so the CI gate can be reproduced locally. If the two
+    # ever differ, this is the copy that is wrong.
+    #
+    # agents-core-check is here rather than in a test tier because a stale
+    # agent guide is a lint problem: AGENTS.md is still a valid file, it
+    # just no longer says what the rest of the family says. It prints one
+    # line. ci.yml runs the same script as its own step, because CI does
+    # not call chore.
+    cmds:
+      - bash ../rust-fs-core/scripts/ci-gate.sh
+      - cargo fmt --check
+      - bash ../rust-fs-core/scripts/agents-core-check.sh
+      # The family scripts are rust-fs-core's alone: fails on a committed copy,
+      # or a call to a local copy.
+      - bash ../rust-fs-core/scripts/family-check.sh
+      # `--features cli`: the command-line tools' target requires it, and
+      # clippy silently leaves out a target whose features are off.
+      - cargo clippy --locked --all-targets --features cli -- -D warnings
+
+  build:
+    desc: Debug build
+    cmds: ['cargo build']
+
+  clean:
+    desc: Remove this crate's cargo output
+    cmds: ['cargo clean']
+
+  artifact:
+    desc: Print the absolute path of the directory holding the built outputs
+    # `silent: true` is what makes this usable as a VALUE — without it chore
+    # echoes each command and a caller capturing stdout gets the echo too.
+    # PATTERNS.md: "a value — a flag string, a container status, a path" is a
+    # task called through {{.CHORE_EXE}}.
+    silent: true
+    # NO `deps: [staticlib]`. chore prints "task: staticlib is up to date" on
+    # STDOUT, which a caller capturing this as a value receives as PART OF THE
+    # VALUE — measured on rust-blk-probe, where the capture came back as two
+    # lines and the caller's path check failed. A value-returning task returns
+    # a value and does nothing else; the caller builds first, then asks. Two
+    # calls, on purpose.
+    #
+    # IT PRINTS A DIRECTORY, NOT A FILE, and that is the one place this differs
+    # from rust-blk-probe's `artifact`. That crate produces a single binary, so
+    # it can name a file. This one produces libfs_erofs.a AND the headers beside
+    # it, so there is no single path to name — A CONSUMER COPIES THE CONTENTS of
+    # what this prints. A consumer that treats it as a file path will silently
+    # copy the wrong thing.
+    cmds:
+      - 'cd "{{.OUT}}" && pwd -P'
+    vars:
+      OUT: 'dist'
+
+  check:semver:
+    desc: Refuse a public-API break the version in Cargo.toml does not declare
+    # Against the newest version on crates.io, with cargo-semver-checks: a
+    # break needs the 0.x minor to move, an addition the patch. Why, and what
+    # it cannot see, is at the top of the script. No `sources:` on purpose --
+    # the baseline is the registry, which moves without this tree changing,
+    # so a fingerprint would call a stale answer up to date.
+    #
+    # THE BUDGET is rust-fs-ext4's measurement of the same script: 11 lines /
+    # 489 bytes passing with the baseline's rustdoc cached, one line more when
+    # it is built. Its lines are fixed, not per item, so 40 / 4,000 leaves
+    # room for a warning block without hiding a flood. No floor: it is one
+    # check, not a suite.
+    cmds:
+      - '../rust-fs-core/scripts/tier.sh semver semver 40 4000 -- bash ../rust-fs-core/scripts/semver-check.sh'
+
+  check:ci-gate:
+    desc: The one required check stands for every job in ci.yml
+    # A chore task naming a script, and nothing else -- the script is what can
+    # be tested, reviewed and run without chore at all.
+    #
+    # This was tests/ci_aggregate_gate.rs. It was the wrong container twice
+    # over: it parses a YAML file and compares strings, exercising nothing this
+    # crate ships, and as a cargo test it counted towards the executed-test
+    # floor the gate itself enforces -- so the suite could satisfy its floor
+    # partly by checking its own CI config.
+    cmds:
+      - bash ../rust-fs-core/scripts/ci-gate.sh

@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! nixvm run [--mem <bytes>] [--workdir <dir>] [--root <dir>] [--arch <arch>] -- <cmd> [args...]
+//! nixvm run --erofs <base> [--erofs <layer>]... -- <cmd> [args...]
 //! nixvm shell
 //! nixvm version
 //! ```
@@ -37,6 +38,8 @@ fn main() -> ExitCode {
 
 fn cmd_run(args: &[String]) -> ExitCode {
     let mut builder = Sandbox::builder();
+    let mut erofs_layers = Vec::new();
+    let mut directory_root = false;
     let mut i = 0;
     // Parse options until the `--` separator, then the rest is the command.
     let command: Vec<String> = loop {
@@ -59,11 +62,28 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 i += 2;
             }
             Some("--root") => {
+                if !erofs_layers.is_empty() {
+                    eprintln!("nixvm: --root and --erofs cannot be combined");
+                    return ExitCode::FAILURE;
+                }
                 let Some(dir) = args.get(i + 1) else {
                     eprintln!("nixvm: --root needs a directory");
                     return ExitCode::FAILURE;
                 };
                 builder = builder.root_dir(dir);
+                directory_root = true;
+                i += 2;
+            }
+            Some("--erofs") => {
+                if directory_root {
+                    eprintln!("nixvm: --root and --erofs cannot be combined");
+                    return ExitCode::FAILURE;
+                }
+                let Some(path) = args.get(i + 1).filter(|path| !path.starts_with("--")) else {
+                    eprintln!("nixvm: --erofs needs an image path");
+                    return ExitCode::FAILURE;
+                };
+                erofs_layers.push(path.clone());
                 i += 2;
             }
             Some("--arch") => {
@@ -92,6 +112,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    if !erofs_layers.is_empty() {
+        builder = builder.root_erofs_layers(erofs_layers);
+    }
     match builder.command(command).run() {
         Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1)),
         Err(e) => {
@@ -117,12 +140,15 @@ fn print_usage() {
     eprintln!(
         "nixvm — a portable Linux syscall sandbox\n\n\
          USAGE:\n    \
-         nixvm run [--mem <size>] [--workdir <dir>] [--root <dir>] [--arch <arch>]\n              \
+         nixvm run [--mem <size>] [--workdir <dir>] [--root <dir> | --erofs <image>...]\n              \
+                   [--arch <arch>]\n              \
                    [--env KEY=VAL]... -- <cmd> [args...]\n    \
          nixvm shell\n    \
          nixvm version\n\n\
          The current directory is exposed inside the sandbox at /work.\n\
          --root uses an extracted host rootfs directory as the guest root.\n\
+         --erofs loads root layers in base-to-top order (repeat for more layers;\n\
+         requires the erofs feature). Guest writes use an ephemeral tmpfs upper.\n\
          The guest architecture follows the command's ELF binary (an x86_64\n\
          root runs as x86_64 on any host); --arch aarch64|x86_64 pins it."
     );

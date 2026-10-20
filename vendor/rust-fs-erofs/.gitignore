@@ -1,0 +1,55 @@
+/target
+# AND ANY NESTED ONE. `/target` is anchored at the root, so it does not match
+# tests/support/target -- the support crate is its own package and cargo gives
+# it its own build directory when it is built on its own (`cargo test -p
+# fs-erofs-test-support`). 14 files and 2.2 MB of fingerprints and lockfiles
+# were committed that way in #134.
+target/
+# Cargo.lock is committed: reproducible, locked dependency resolution for
+# the build/test/clippy gates (cargo … --locked). Do not re-ignore.
+*.img
+# ...except this one fixture, which IS committed. A mkfs.erofs built
+# without libzstd cannot produce a zstd image, and most packaged builds
+# are not built with it, so `tests/zstd_image.rs` carries the image
+# rather than depending on what happens to be installed. Named
+# individually rather than un-ignoring the whole directory, so a stray
+# local image dropped in test-disks/ still stays out.
+!test-disks/erofs-zstd-4k.img
+*audit*
+.history
+
+# The Android EROFS fixture (tests/fixtures/download-android-erofs.sh)
+# and the zip it is cut from. Google's to distribute, not this
+# repository's. The *.img rule above already covers the image, but be
+# explicit for the .zip it keeps with ANDROID_EROFS_KEEP_ZIP=1 as well.
+tests/fixtures/*.img
+tests/fixtures/*.tar*
+tests/fixtures/*.zip
+
+# chore fingerprint cache (sources:/generates: checksums). Derived data.
+.chore/
+
+# THE SUITE'S SCRATCH DIRECTORY, AND IT IS INSIDE THE REPOSITORY ON
+# PURPOSE. The oracle tools run in the fs-linux-test-harness VM, which
+# sees this repository at the path the host knows it by and nothing else
+# of the host -- so an image under /tmp is a path the tool asked to read
+# it cannot open. scripts/test.sh and fs_erofs_test_support::temp_dir
+# both put scratch here, and the tier logs live in tmp/logs/.
+/tmp/
+
+# The harness's shared directory (fs-linux-test-harness.toml's [share]):
+# what a run hands across to the guest and back.
+/.vm-share/
+
+# Build output. `chore staticlib` writes the archive and headers here for a
+# consumer to copy out of (`chore artifact` prints this directory).
+/dist/
+.DS_Store
+
+# THE FUZZ CORPUS IS COMMITTED ON PURPOSE, and `*.img` above would
+# otherwise swallow it silently. The images under fuzz/corpus/ are not
+# build output or fixtures a script regenerates on demand -- they are
+# the seeds the gate in tests/fuzz_decoders.rs replays and mutates, and
+# without them that suite has nothing to run and says so only once CI
+# has already gone red.
+!fuzz/corpus/**

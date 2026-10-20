@@ -54,6 +54,10 @@ pub enum RootSource {
     Dir(PathBuf),
     /// A squashfs image file used read-only as the lower layer (needs `fstool`).
     Squashfs(PathBuf),
+    /// Host EROFS images in base-to-top order. The last image wins conflicts;
+    /// directories merge with overlayfs whiteout and opacity semantics.
+    /// Requires the `erofs` feature.
+    Erofs(Vec<PathBuf>),
     /// A named image resolved through the [`ImageStore`] (squashfs; needs
     /// `fstool` and a cached image).
     Image(ImageRef),
@@ -233,6 +237,27 @@ impl SandboxBuilder {
     #[must_use]
     pub fn root_squashfs(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.root = RootSource::Squashfs(path.into());
+        self
+    }
+
+    /// Use one EROFS image as the read-only root beneath a writable tmpfs.
+    /// Requires the `erofs` feature.
+    #[must_use]
+    pub fn root_erofs(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.root = RootSource::Erofs(vec![path.into()]);
+        self
+    }
+
+    /// Merge EROFS images in base-to-top order beneath a writable tmpfs.
+    /// Images are opened read-only at startup and retained for the run.
+    /// An empty list is a configuration error. Requires the `erofs` feature.
+    #[must_use]
+    pub fn root_erofs_layers<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.config.root = RootSource::Erofs(paths.into_iter().map(Into::into).collect());
         self
     }
 
@@ -559,6 +584,7 @@ impl Sandbox {
                 }
             }
             RootSource::Squashfs(path) => open_squashfs(path),
+            RootSource::Erofs(paths) => open_erofs(paths),
             RootSource::Image(image) => {
                 let store = ImageStore::default_location();
                 let path = store
@@ -567,6 +593,39 @@ impl Sandbox {
                 open_squashfs(&path)
             }
         }
+    }
+}
+
+fn open_erofs(paths: &[PathBuf]) -> Result<Option<Box<dyn MountFs>>, Error> {
+    if paths.is_empty() {
+        return Err(Error::Config(
+            "an EROFS root needs at least one image".into(),
+        ));
+    }
+    #[cfg(all(feature = "erofs", any(unix, windows)))]
+    {
+        let mut layers: Vec<Box<dyn MountFs>> = Vec::with_capacity(paths.len());
+        for path in paths {
+            let image = crate::fs::ErofsMount::open(path).map_err(|error| {
+                Error::Config(format!("open EROFS {}: {error}", path.display()))
+            })?;
+            layers.push(Box::new(image));
+        }
+        let stack = crate::fs::LayerStack::new(layers)
+            .map_err(|error| Error::Config(format!("merge EROFS layers: {error}")))?;
+        Ok(Some(Box::new(stack)))
+    }
+    #[cfg(not(feature = "erofs"))]
+    {
+        Err(Error::Config(
+            "an EROFS root requires the `erofs` feature".into(),
+        ))
+    }
+    #[cfg(all(feature = "erofs", not(any(unix, windows))))]
+    {
+        Err(Error::Config(
+            "host EROFS image files require unix or windows".into(),
+        ))
     }
 }
 
@@ -651,6 +710,25 @@ fn page_align_down(v: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn erofs_roots_reject_an_empty_layer_list() {
+        let error = Sandbox::builder()
+            .root_erofs_layers(Vec::<PathBuf>::new())
+            .run()
+            .unwrap_err();
+        assert!(error.to_string().contains("at least one image"));
+    }
+
+    #[cfg(not(feature = "erofs"))]
+    #[test]
+    fn erofs_roots_report_the_missing_feature() {
+        let error = Sandbox::builder()
+            .root_erofs("root.erofs")
+            .run()
+            .unwrap_err();
+        assert!(error.to_string().contains("requires the `erofs` feature"));
+    }
 
     /// `movz x0,#code ; movz x8,#93 ; svc #0` — the guest `exit(code)`.
     fn exit_words(code: u16) -> Vec<u8> {

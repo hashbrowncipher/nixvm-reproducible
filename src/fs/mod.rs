@@ -8,6 +8,8 @@
 //! Backends (added over Phases 4, 7):
 //!
 //! * **squashfs** — the read-only Alpine root image.
+//! * **erofs** — host-opened read-only EROFS images (optional `erofs` feature).
+//! * **layers** — a format-independent stack of immutable filesystem layers.
 //! * **overlay** — copy-on-write: a writable upper (tmpfs) over a read-only
 //!   lower (squashfs), giving `/` its mutable-but-ephemeral behavior.
 //! * **passthrough** — maps a host directory (the cwd) to `/work`, read-write.
@@ -21,8 +23,11 @@
 use std::io;
 
 pub mod devfs;
+#[cfg(feature = "erofs")]
+pub mod erofs;
 #[cfg(feature = "fstool")]
 pub mod fstoolfs;
+pub mod layers;
 pub mod mount;
 pub mod overlay;
 #[cfg(unix)]
@@ -33,8 +38,11 @@ pub mod tar;
 pub mod tmpfs;
 
 pub use devfs::DevFs;
+#[cfg(feature = "erofs")]
+pub use erofs::ErofsMount;
 #[cfg(feature = "fstool")]
 pub use fstoolfs::FsToolMount;
+pub use layers::LayerStack;
 pub use mount::MountTable;
 pub use overlay::Overlay;
 #[cfg(unix)]
@@ -105,6 +113,14 @@ pub struct DirEntry {
 pub trait MountFs: std::fmt::Debug + Send {
     // ---- required (read side) ----
     fn stat(&mut self, rel: &str) -> Option<Attrs>;
+    /// Metadata with a lookup error. Layer merging must fall through only on
+    /// ENOENT: an unreadable higher layer must not expose an older entry.
+    /// Backends with detailed errors override this; `stat` remains the
+    /// convenience interface used by the syscall and mount-table paths.
+    fn try_stat(&mut self, rel: &str) -> io::Result<Attrs> {
+        self.stat(rel)
+            .ok_or_else(|| io::Error::from_raw_os_error(2))
+    }
     fn read_at(&mut self, rel: &str, off: u64, buf: &mut [u8]) -> io::Result<usize>;
     fn readdir(&mut self, rel: &str) -> io::Result<Vec<DirEntry>>;
 

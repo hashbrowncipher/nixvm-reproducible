@@ -1,0 +1,31 @@
+# .github-guard — declarations github-guard reads (see the github-guard skill:
+# https://github.com/antimatter-studios/agent-skills/blob/main/.claude/skills/github-guard/README.md).
+# git-config format: check with `git config -f .github-guard --list`, and
+# double-quote any value containing # or ;.
+
+# What must pass before main takes a merge. github-guard reads this from the
+# default branch on the server and applies it to branch protection.
+#
+#   ci-ok   ci.yml: the one always-run gate. It fails when any job it needs
+#           failed, was cancelled or was skipped: the unit tier with no
+#           generated fixtures, the mkfs.erofs-made fixtures built in the
+#           fs-linux-test-harness VM, the whole suite (lint, unit, images,
+#           the erofs-utils oracles, the kernel mounts) on x86_64, the tiers
+#           that need no VM on aarch64, and the suite compiled and run
+#           inside the guest.
+#
+# Requiring the gate rather than each job means a job can be renamed, split or
+# made conditional without leaving a required check that never reports, which
+# would block every pull request with nothing to point at. The list this
+# replaced named `test-ubuntu-latest`, `test-ubuntu-24.04-arm` and
+# `validate mkfs_erofs (fsck.erofs strict)` — three names that had to be
+# edited by hand, and two of which no longer exist.
+#
+# release.yml is deliberately absent: it triggers on a version tag, so
+# requiring any check of its would block every pull request forever.
+#
+# ../rust-fs-core/scripts/ci-gate.sh checks both halves — that ci-ok needs every job in
+# ci.yml, and that this file requires ci-ok and nothing else — and `chore
+# lint` runs it.
+[checks]
+	required = ci-ok
