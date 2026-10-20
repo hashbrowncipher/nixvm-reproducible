@@ -12,11 +12,11 @@
 //! trampoline) in `vm`.
 //!
 //! Availability: creating the VM needs a readable+writable `/dev/kvm`, so a
-//! host without KVM (or a CI runner without the device) gets a graceful error
+//! host without KVM or supported guest-only perf counters gets a graceful error
 //! from [`KvmBackend::new`] and the caller falls back to the interpreter.
 //! Unlike HVF there is no entitlement/codesigning step — the tests below run
-//! under plain `cargo test` wherever `/dev/kvm` exists, and skip themselves
-//! where it doesn't.
+//! under plain `cargo test` wherever KVM and counters are usable, and skip
+//! themselves where they are unavailable.
 
 mod instruction;
 mod pmu;
@@ -25,7 +25,7 @@ mod vcpu;
 mod vm;
 
 use crate::abi::Arch;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{Backend, Vcpu, VcpuError};
 
@@ -33,38 +33,84 @@ use super::{Backend, Vcpu, VcpuError};
 #[derive(Debug)]
 pub struct KvmBackend {
     vm: Arc<vm::Vm>,
-    branch_quantum: Option<u64>,
+    branch_quantum: u64,
 }
 
 impl KvmBackend {
     /// Probe KVM by opening `/dev/kvm` and building the VM (control block
-    /// mapped, CPU profile checked against host capabilities). Returns an error — which
-    /// [`crate::vcpu::select`] turns into an interpreter fallback — when KVM
-    /// is unavailable or inaccessible.
+    /// mapped, CPU profile checked against host capabilities), then verifying
+    /// guest-only branch counting. Automatic selection falls back to the
+    /// interpreter if either facility is unavailable.
     pub fn new() -> Result<Self, VcpuError> {
         let branch_quantum = std::env::var_os("NIXVM_BRANCH_QUANTUM")
             .map(|value| pmu::parse_quantum(&value.to_string_lossy()))
-            .transpose()?;
+            .transpose()?
+            .unwrap_or(100_000);
         Self::configured(branch_quantum)
     }
 
-    /// Require precise preemption after this many retired conditional branches.
-    /// This controls scheduling only; guest time, entropy and I/O remain separate.
+    /// Set the fairness quantum in retired conditional branches. All guest
+    /// execution contributes one virtual nanosecond per conditional branch.
     pub fn with_branch_quantum(branches: u64) -> Result<Self, VcpuError> {
         if branches == 0 || branches > i64::MAX as u64 {
             return Err(VcpuError::Backend(
                 "branch quantum must be in 1..=i64::MAX".into(),
             ));
         }
-        Self::configured(Some(branches))
+        Self::configured(branches)
     }
 
-    fn configured(branch_quantum: Option<u64>) -> Result<Self, VcpuError> {
+    fn configured(branch_quantum: u64) -> Result<Self, VcpuError> {
+        probe_guest_counter()?;
         Ok(Self {
             vm: Arc::new(vm::Vm::new()?),
             branch_quantum,
         })
     }
+}
+
+/// A successful perf_event_open alone does not establish guest counting.
+/// Compare the counter against an independent guest loop before selection.
+fn probe_guest_counter() -> Result<(), VcpuError> {
+    static PROBE: OnceLock<Result<(), String>> = OnceLock::new();
+    PROBE
+        .get_or_init(|| {
+            let run = || -> Result<(), VcpuError> {
+                use crate::vcpu::{GuestMemory, Prot};
+                let vm = Arc::new(vm::Vm::new()?);
+                let base = 0x1_0000;
+                let mut memory = GuestMemory::new(base, 64 * 1024);
+                memory.map(base, crate::vcpu::mem::PAGE_SIZE, Prot::rx())?;
+                // MOV EBX,32; DEC EBX; JNZ dec; SYSCALL.
+                memory.write_init(
+                    base,
+                    &[0xbb, 32, 0, 0, 0, 0xff, 0xcb, 0x75, 0xfc, 0x0f, 0x05],
+                )?;
+                let mut cpu = vcpu::KvmVcpu::new(vm, base, base + 0x8000, 100_000)?;
+                for _ in 0..100 {
+                    match cpu.run(&mut memory)? {
+                        crate::vcpu::Exit::Interrupted => {}
+                        crate::vcpu::Exit::Syscall
+                            if cpu.reg(3) == 0 && cpu.retired_branches() == Some(32) =>
+                        {
+                            return Ok(());
+                        }
+                        exit => {
+                            return Err(VcpuError::Backend(format!(
+                                "PMU guest counter probe failed: {exit:?}, branches={:?}",
+                                cpu.retired_branches()
+                            )));
+                        }
+                    }
+                }
+                Err(VcpuError::Backend(
+                    "PMU guest counter probe did not complete".into(),
+                ))
+            };
+            run().map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(VcpuError::Backend)
 }
 
 impl Backend for KvmBackend {
@@ -74,7 +120,12 @@ impl Backend for KvmBackend {
         mem: &super::GuestMemory,
     ) -> Result<crate::confinement::Resources, VcpuError> {
         self.vm.ensure_memslot(mem)?;
-        self.vm.prepare_pool(capacity)
+        let mut resources = self.vm.prepare_pool(capacity)?;
+        prepare_thread()?;
+        if let Some(fd) = perf_fd() {
+            resources.perf.push(fd);
+        }
+        Ok(resources)
     }
     fn name(&self) -> &'static str {
         "kvm"
@@ -89,11 +140,9 @@ impl Backend for KvmBackend {
     }
 }
 
-pub(crate) fn prepare_thread(pmu: bool) -> Result<(), VcpuError> {
+pub(crate) fn prepare_thread() -> Result<(), VcpuError> {
     vcpu::preempt::prepare()?;
-    if pmu {
-        pmu::prepare_thread()?;
-    }
+    pmu::prepare_thread()?;
     Ok(())
 }
 

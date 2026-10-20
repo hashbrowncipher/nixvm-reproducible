@@ -818,6 +818,7 @@ fn attrs_of(m: &fs::Metadata) -> Attrs {
         mode: m.mode(),
         uid: m.uid(),
         gid: m.gid(),
+        // We considered isolating passthrough timestamps and chose to preserve host time.
         atime: m.atime(),
         mtime: m.mtime(),
         inode: m.ino(),

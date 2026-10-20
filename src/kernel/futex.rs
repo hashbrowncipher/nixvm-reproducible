@@ -15,7 +15,7 @@
 //! between processes that map it at different addresses; everything else is
 //! keyed by `(address space, address)`.
 
-use super::{Kernel, RunState, ServiceCtx, Shared, err, poll};
+use super::{Kernel, RunState, ServiceCtx, Shared, err};
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
 
@@ -99,9 +99,10 @@ impl Kernel {
         Self::futex_could_wake(sh, FutexKey::Private(mm, 0))
     }
 
-    /// Seed (on the first run of a timed wait) or fetch the wall-clock
+    /// Seed (on the first run of a timed wait) or fetch the VM monotonic
     /// deadline of the caller's futex wait. `Err` for a malformed timespec.
     fn futex_deadline(
+        &self,
         cx: &mut ServiceCtx,
         t: Timeout,
         mem: &GuestMemory,
@@ -121,14 +122,13 @@ impl Kernel {
             return Err(err(Errno::EINVAL));
         }
         let want = u128::from(s) * 1_000_000_000 + u128::from(n);
-        let now = poll::now_ns();
+        let now = self.clock.now_monotonic().as_nanos();
         let dl = if !abs {
             now + want
         } else if realtime {
-            want
+            now + want.saturating_sub(self.clock.now_unix().as_nanos())
         } else {
-            let mono = crate::clock::now_monotonic().as_nanos();
-            now + want.saturating_sub(mono)
+            want
         };
         cx.cur.wake_deadline = Some(dl);
         Ok(Some(dl))
@@ -139,6 +139,8 @@ impl Kernel {
         cx.cur.futex_wait = None;
         cx.cur.futex_waitv.clear();
         cx.cur.futex_woken = false;
+        cx.cur.futex_timed_out = false;
+        cx.cur.wake_deadline = None;
         cx.cur.futex_pi = false;
     }
 
@@ -243,7 +245,7 @@ impl Kernel {
     #[allow(clippy::unused_self, clippy::too_many_arguments)]
     fn futex_wait(
         &self,
-        sh: &Shared,
+        _sh: &Shared,
         cx: &mut ServiceCtx,
         mem: &GuestMemory,
         key: FutexKey,
@@ -254,22 +256,38 @@ impl Kernel {
     ) -> i64 {
         // Woken by an explicit wake (directly, or after being requeued to
         // another word by a condvar signal): consume it.
+        if cx.cur.futex_timed_out {
+            Self::futex_done(cx);
+            return err(Errno::ETIMEDOUT);
+        }
         if cx.cur.futex_woken {
             Self::futex_done(cx);
             return 0;
         }
-        let deadline = match Self::futex_deadline(cx, timeout, mem) {
+        let deadline = match self.futex_deadline(cx, timeout, mem) {
             Ok(d) => d,
             Err(e) => return e,
         };
-        if deadline.is_some_and(|d| poll::now_ns() >= d) {
+        if cx.cur.futex_wait.is_none() {
+            match mem.read_u32(uaddr) {
+                Ok(cur) if cur != val => {
+                    Self::futex_done(cx);
+                    return err(Errno::EAGAIN);
+                }
+                Err(_) => {
+                    Self::futex_done(cx);
+                    return err(Errno::EFAULT);
+                }
+                Ok(_) => {}
+            }
+        }
+        if deadline.is_some_and(|d| self.clock.now_monotonic().as_nanos() >= d) {
             Self::futex_done(cx);
             return err(Errno::ETIMEDOUT);
         }
-        // Parked on a *different* word than this call names: requeued. Stay
-        // parked; only a wake on the requeue target releases us (re-comparing
-        // this word would spuriously EAGAIN and desync the condvar).
-        if cx.cur.futex_wait.is_some_and(|w| w != key) {
+        // Registration fixes the wait key, including across requeue. Only an
+        // explicit outcome releases it; retries do not compare the word again.
+        if cx.cur.futex_wait.is_some() {
             cx.block = true;
             return 0;
         }
@@ -283,13 +301,6 @@ impl Kernel {
             Ok(cur) if cur != val => {
                 Self::futex_done(cx);
                 err(Errno::EAGAIN)
-            }
-            // Nobody could ever wake an untimed wait: report a spurious wake
-            // (the futex contract permits it; callers re-check and loop)
-            // instead of a false deadlock — the single-threaded case.
-            Ok(_) if deadline.is_none() && !Self::futex_could_wake(sh, key) => {
-                Self::futex_done(cx);
-                0
             }
             Ok(_) => {
                 cx.cur.futex_wait = Some(key);
@@ -310,7 +321,7 @@ impl Kernel {
                 break;
             }
             let i = &mut p.info;
-            if i.futex_woken || i.futex_pi {
+            if i.futex_woken || i.futex_timed_out || i.futex_pi {
                 continue;
             }
             if i.futex_wait == Some(key) && i.futex_bitset & bitset != 0 {
@@ -321,6 +332,7 @@ impl Kernel {
             } else {
                 continue;
             }
+            i.wake_deadline = None;
             i.parked = false; // make it runnable so the sweep re-runs it
             woken += 1;
         }
@@ -339,11 +351,12 @@ impl Kernel {
         let mut woken = 0i64;
         let mut requeued = 0i64;
         for p in sh.procs.iter_mut().flatten() {
-            if p.info.futex_wait != Some(from) || p.info.futex_woken {
+            if p.info.futex_wait != Some(from) || p.info.futex_woken || p.info.futex_timed_out {
                 continue;
             }
             if woken < nr_wake {
                 p.info.futex_woken = true;
+                p.info.wake_deadline = None;
                 p.info.parked = false;
                 woken += 1;
             } else if requeued < nr_requeue {
@@ -444,6 +457,10 @@ impl Kernel {
         timeout: Option<Timeout>,
     ) -> i64 {
         let tid = cx.cur.pid as u32;
+        if cx.cur.futex_timed_out {
+            Self::futex_done(cx);
+            return err(Errno::ETIMEDOUT);
+        }
         if cx.cur.futex_woken {
             // The unlocker already wrote our tid into the word.
             Self::futex_done(cx);
@@ -481,11 +498,11 @@ impl Kernel {
         let Some(timeout) = timeout else {
             return err(Errno::EAGAIN); // trylock on a held lock
         };
-        let deadline = match Self::futex_deadline(cx, timeout, mem) {
+        let deadline = match self.futex_deadline(cx, timeout, mem) {
             Ok(d) => d,
             Err(e) => return e,
         };
-        if deadline.is_some_and(|d| poll::now_ns() >= d) {
+        if deadline.is_some_and(|d| self.clock.now_monotonic().as_nanos() >= d) {
             Self::futex_done(cx);
             return err(Errno::ETIMEDOUT);
         }
@@ -567,7 +584,7 @@ impl Kernel {
     #[allow(clippy::unused_self)]
     pub(super) fn sys_futex_waitv(
         &self,
-        sh: &Shared,
+        _sh: &Shared,
         cx: &mut ServiceCtx,
         a: &[u64; 6],
         mem: &GuestMemory,
@@ -579,10 +596,26 @@ impl Kernel {
         if timeout != 0 && clock > 1 {
             return err(Errno::EINVAL);
         }
+        if cx.cur.futex_timed_out {
+            Self::futex_done(cx);
+            return err(Errno::ETIMEDOUT);
+        }
         if cx.cur.futex_woken {
             let idx = cx.cur.futex_waitv_idx;
             Self::futex_done(cx);
             return idx as i64;
+        }
+        if !cx.cur.futex_waitv.is_empty() {
+            if cx
+                .cur
+                .wake_deadline
+                .is_some_and(|d| d <= self.clock.now_monotonic().as_nanos())
+            {
+                Self::futex_done(cx);
+                return err(Errno::ETIMEDOUT);
+            }
+            cx.block = true;
+            return 0;
         }
         let Ok(raw) = mem.read_vec(waiters, (nr * 24) as usize) else {
             return err(Errno::EFAULT);
@@ -599,14 +632,6 @@ impl Kernel {
                 Err(e) => return e,
             }
         }
-        let deadline = match Self::futex_deadline(cx, Timeout::Absolute(timeout, clock == 0), mem) {
-            Ok(d) => d,
-            Err(e) => return e,
-        };
-        if deadline.is_some_and(|d| poll::now_ns() >= d) {
-            Self::futex_done(cx);
-            return err(Errno::ETIMEDOUT);
-        }
         let mut keys = Vec::with_capacity(words.len());
         for &(val, uaddr, private) in &words {
             match mem.read_u32(uaddr) {
@@ -621,9 +646,13 @@ impl Kernel {
                 }
             }
         }
-        if deadline.is_none() && !keys.iter().any(|&k| Self::futex_could_wake(sh, k)) {
+        let deadline = match self.futex_deadline(cx, Timeout::Absolute(timeout, clock == 0), mem) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        if deadline.is_some_and(|d| self.clock.now_monotonic().as_nanos() >= d) {
             Self::futex_done(cx);
-            return 0; // spurious wake of index 0, rather than a false deadlock
+            return err(Errno::ETIMEDOUT);
         }
         cx.cur.futex_waitv = keys;
         cx.block = true;
@@ -765,7 +794,7 @@ mod tests {
             0
         );
         assert!(cx.block);
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        k.clock.advance_to(cx.cur.wake_deadline.unwrap());
         // …and the re-trap after the deadline reports ETIMEDOUT.
         cx.block = false;
         assert_eq!(

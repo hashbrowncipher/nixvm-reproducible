@@ -61,14 +61,14 @@ fn rdtsc_rdtscp_and_syscall_entry_advance_one_vm_counter() {
     v.set_reg(2, u64::MAX);
     v.set_reg(6, u64::MAX);
     assert_eq!(run(v.as_mut(), &mut mem, true), Exit::Syscall);
-    assert_eq!((v.reg(0), v.reg(2)), (3, 0));
+    assert_eq!((v.reg(0), v.reg(2)), (4, 0));
     assert_eq!(v.reg(6), 0, "RDTSCP zero-extends the fixed TSC_AUX");
     assert_eq!(v.reg(3), 0x1234_5678_9abc_def0);
     assert_eq!(v.reg(4), STACK);
 
     // Fork and reset share the VM timeline; neither copies nor resets its clock.
     let mut child = v.fork();
-    for (cpu, expected) in [(&mut v, 5), (&mut child, 7)] {
+    for (cpu, expected) in [(&mut v, 6), (&mut child, 8)] {
         cpu.reset(BASE, STACK);
         assert_eq!(run(cpu.as_mut(), &mut mem, true), Exit::Syscall);
         assert_eq!((cpu.reg(0), cpu.reg(2)), (expected, 0));
@@ -76,7 +76,7 @@ fn rdtsc_rdtscp_and_syscall_entry_advance_one_vm_counter() {
     let mut sibling = backend.new_vcpu(BASE + 4, STACK).unwrap();
     sibling.set_reg(1, u64::MAX);
     assert_eq!(run(sibling.as_mut(), &mut mem, false), Exit::Syscall);
-    assert_eq!((sibling.reg(0), sibling.reg(2)), (9, 0));
+    assert_eq!((sibling.reg(0), sibling.reg(2)), (10, 0));
     assert_eq!(sibling.reg(6), 0);
 }
 

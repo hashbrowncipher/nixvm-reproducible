@@ -16,6 +16,8 @@
 //! [`select`] picks the best available one for the host + guest arch.
 
 use crate::abi::Arch;
+use crate::clock::VirtualClock;
+use std::sync::Arc;
 
 pub(crate) mod cpuid;
 pub(crate) mod ctrl;
@@ -27,43 +29,23 @@ pub(crate) mod vdso;
 
 pub use mem::{GuestMemory, MemError, Prot};
 
-/// The wall-clock preemption quantum shared by every backend.
+/// KVM's host watchdog while counting without an exact execution target.
+/// Its timer returns control to the embedder without advancing virtual time.
+/// Exact timer and fairness boundaries use the PMU instead of this watchdog.
 ///
-/// Syscall-count preemption (the scheduler's `slice_cap`) has a hole: a
-/// compute-bound guest thread that issues *no* syscalls — a JIT'd hot loop, a
-/// GC sweep, a crypto kernel — never hands control back, so it monopolizes its
-/// CPU for the whole run. The time quantum closes that hole: after roughly this
-/// long, a running vcpu's [`Vcpu::run`] returns [`Exit::Interrupted`] even mid
-/// computation, and the scheduler resumes the (still-runnable) task on its next
-/// turn. The interpreter polls the wall clock in its instruction loop; the KVM
-/// backend arms a per-thread timer whose signal breaks `KVM_RUN` out.
-///
-/// Configured once by `NIXVM_QUANTUM_MS` (default 10 ms); `0` disables
-/// time-based preemption, leaving only the syscall-count cap. Read and cached on
-/// first use.
+/// Configured once by `NIXVM_QUANTUM_MS` (default 10 ms); `0` disables it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[must_use]
 pub(crate) fn preempt_quantum() -> Option<std::time::Duration> {
-    // wasm32-unknown-unknown has no monotonic clock: `Instant::now()` panics
-    // ("time not implemented on this platform"). Time-based preemption is a
-    // scheduling nicety, not a correctness requirement — the per-run `MAX_STEPS`
-    // budget still bounds a compute-bound slice — so disable it there rather
-    // than crash the browser demo the first time the x86 interpreter runs.
-    #[cfg(target_arch = "wasm32")]
-    {
-        return None;
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use std::sync::OnceLock;
-        static Q: OnceLock<Option<std::time::Duration>> = OnceLock::new();
-        *Q.get_or_init(|| {
-            let ms = std::env::var("NIXVM_QUANTUM_MS")
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(10);
-            (ms > 0).then(|| std::time::Duration::from_millis(ms))
-        })
-    }
+    use std::sync::OnceLock;
+    static Q: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *Q.get_or_init(|| {
+        let ms = std::env::var("NIXVM_QUANTUM_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(10);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
 }
 
 thread_local! {
@@ -84,7 +66,142 @@ pub(crate) fn set_yield_deadline(at: Option<std::time::Duration>) {
 /// poll it every few thousand instructions and return [`Exit::Interrupted`].
 pub(crate) fn yield_due() -> bool {
     let at = YIELD_AT_NS.with(std::cell::Cell::get);
-    at != 0 && crate::clock::now_monotonic().as_nanos() >= at
+    at != 0 && crate::clock::host_monotonic().as_nanos() >= at
+}
+
+/// Interpreter-side execution accounting, batched until an observable boundary.
+/// The cached deadline is decremented per execution unit, so checking it in an
+/// instruction loop does not require locking the shared clock on every step.
+#[derive(Clone)]
+pub(crate) struct ExecutionClock {
+    clock: Arc<VirtualClock>,
+    task: u64,
+    pending: u64,
+    total: u64,
+    slice_used: u64,
+    quantum: u64,
+    preempt: bool,
+    limit: Option<u64>,
+    until_deadline: Option<u128>,
+    syscall_pc: Option<u64>,
+}
+
+impl ExecutionClock {
+    pub(crate) fn new() -> Self {
+        let clock = Arc::new(VirtualClock::new());
+        let task = clock.allocate_observer();
+        Self {
+            clock,
+            task,
+            pending: 0,
+            total: 0,
+            slice_used: 0,
+            quantum: std::env::var("NIXVM_BRANCH_QUANTUM")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .filter(|&value| value > 0)
+                .unwrap_or(100_000),
+            preempt: true,
+            limit: None,
+            until_deadline: None,
+            syscall_pc: None,
+        }
+    }
+
+    pub(crate) fn bind(&mut self, clock: Arc<VirtualClock>, task: u64) {
+        self.flush();
+        self.clock = clock;
+        self.task = task;
+        self.refresh_deadline();
+    }
+
+    pub(crate) fn enter(&mut self) {
+        self.refresh_deadline();
+    }
+
+    fn refresh_deadline(&mut self) {
+        self.until_deadline = self
+            .clock
+            .next_deadline()
+            .map(|deadline| deadline.saturating_sub(self.clock.now_monotonic().as_nanos()));
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.until_deadline == Some(0)
+            || self.limit == Some(0)
+            || (self.preempt && self.slice_used >= self.quantum)
+    }
+
+    pub(crate) fn account(&mut self) {
+        self.pending = self.pending.saturating_add(1);
+        self.total = self.total.saturating_add(1);
+        if self.preempt {
+            self.slice_used = self.slice_used.saturating_add(1);
+        }
+        self.limit = self.limit.map(|remaining| remaining.saturating_sub(1));
+        self.until_deadline = self
+            .until_deadline
+            .map(|remaining| remaining.saturating_sub(1));
+    }
+
+    pub(crate) fn flush(&mut self) {
+        if self.pending != 0 {
+            self.clock.advance_execution(self.pending);
+            self.pending = 0;
+        }
+    }
+
+    pub(crate) fn observe(&mut self) -> u64 {
+        self.flush();
+        let timestamp = self.clock.observe(self.task).as_nanos() as u64;
+        self.refresh_deadline();
+        timestamp
+    }
+
+    pub(crate) fn syscall(&mut self, pc: u64) {
+        self.flush();
+        if self.syscall_pc != Some(pc) {
+            self.clock.advance_event();
+            self.syscall_pc = Some(pc);
+        }
+        self.refresh_deadline();
+    }
+
+    pub(crate) fn complete_syscall(&mut self) {
+        self.syscall_pc = None;
+    }
+
+    pub(crate) fn reset_observations(&self) {
+        self.clock.reset_observations(self.task);
+    }
+
+    pub(crate) fn begin_slice(&mut self) {
+        self.slice_used = 0;
+    }
+
+    pub(crate) fn set_preemption_required(&mut self, required: bool) {
+        if required && !self.preempt {
+            self.slice_used = 0;
+        }
+        self.preempt = required;
+    }
+
+    pub(crate) fn set_limit(&mut self, remaining: Option<u64>) {
+        self.limit = remaining;
+    }
+
+    pub(crate) fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub(crate) fn fork(&self) -> Self {
+        let mut child = self.clone();
+        child.pending = 0;
+        child.task = self.clock.allocate_observer();
+        child.slice_used = 0;
+        child.syscall_pc = None;
+        child
+    }
 }
 
 /// Size of the x86-64 `XSAVE` area [`Vcpu::simd_state`] uses (x87, SSE and
@@ -192,20 +309,37 @@ pub trait Vcpu: Send {
     /// hypervisor (once) and the guest writes through to the same buffer.
     fn run(&mut self, mem: &mut GuestMemory) -> Result<Exit, VcpuError>;
 
+    /// Bind this task to its VM's clock. Timestamp instructions and syscall
+    /// observations use the same task identity, including after fork and exec.
+    fn set_clock(&mut self, _clock: Arc<VirtualClock>, _task: u64) {}
+
+    /// Set an additional execution-unit limit, independent of the scheduling
+    /// quantum. It survives incidental exits and is cleared by passing `None`.
+    /// A zero limit returns to the kernel before another instruction executes.
+    fn set_execution_limit(&mut self, _remaining: Option<u64>) {}
+
     /// Start a scheduler slice. Precise backends keep its budget across syscalls
     /// and memory faults, resetting it only when the scheduler dispatches anew.
     fn begin_slice(&mut self) {}
 
-    /// Whether another task needs a bounded share of execution. Precise PMU
-    /// backends enable their counter only while this is true. The scheduler
+    /// Whether another task needs a bounded share of execution. Backends count
+    /// solo execution too; this only enables the fairness limit. The scheduler
     /// updates it before guest entry, including after syscalls and wakeups.
     /// Direct vCPU drivers supply their own runnable-task policy.
     fn set_preemption_required(&mut self, _required: bool) {}
 
-    /// Conditional branches counted while precise PMU preemption is required.
+    /// Conditional branches counted during all execution, including solo runs.
     /// The scheduler uses differences for ordering instead of host elapsed time.
     fn retired_branches(&self) -> Option<u64> {
         None
+    }
+
+    /// Execution units retired by this vCPU, excluding idle jumps, clock
+    /// observation costs and syscall-entry costs. Unlike the shared clock's
+    /// total, differences are safe for task CPU accounting during SMP runs.
+    /// The unit is one virtual nanosecond; its execution metric is backend-specific.
+    fn execution_ticks(&self) -> Option<u64> {
+        self.retired_branches()
     }
 
     /// Whether [`Vcpu::run`] must hold the `GuestMemory` lock for its whole
@@ -389,15 +523,12 @@ pub mod interp;
 pub mod interp_x86;
 pub(crate) mod softfloat;
 
-/// Pick the best backend available for the host, targeting `guest`.
+/// Pick a backend that supplies the VM's execution clock for `guest`.
 ///
-/// Prefers hardware virtualization when the guest arch matches the host and the
-/// process can create a VM; otherwise falls back to the software interpreter.
-/// The fallback is what keeps an unentitled/unsigned binary (CI, plain
-/// `cargo test`) working — `hvf::HvfBackend::new` fails there, and we drop to
-/// the interpreter instead of erroring. `NIXVM_INTERP=1` skips the hardware
-/// probes entirely (a debugging/parity escape hatch, the env twin of
-/// `SandboxBuilder::prefer_interp`).
+/// Linux/x86-64 prefers KVM when both virtualization and guest-only branch
+/// counting are usable. Other hosts and unavailable hardware use the software
+/// interpreter. The optional HVF backend lacks virtual execution accounting and
+/// is excluded from automatic selection. `NIXVM_INTERP=1` skips hardware probes.
 pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
     let force_interp = std::env::var_os("NIXVM_INTERP").is_some_and(|v| v == "1");
     if std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some() {
@@ -414,21 +545,10 @@ pub fn select(guest: Arch) -> Result<Box<dyn Backend>, VcpuError> {
         ));
     }
 
-    #[cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
-    {
-        // When the hypervisor is unavailable/unentitled, `new` fails and we fall
-        // through to the interpreter.
-        if !force_interp
-            && guest == Arch::Aarch64
-            && let Ok(backend) = hvf::HvfBackend::new()
-        {
-            return Ok(Box::new(backend) as Box<dyn Backend>);
-        }
-    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        // When `/dev/kvm` is unavailable/inaccessible (a container, CI without
-        // the device), `new` fails and we fall through to the interpreter.
+        // Both virtualization and a usable guest-only counter are required.
+        // Failure leaves software execution with its internal clock available.
         if !force_interp
             && guest == Arch::X86_64
             && let Ok(backend) = kvm::KvmBackend::new()

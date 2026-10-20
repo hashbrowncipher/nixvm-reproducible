@@ -318,6 +318,10 @@ fn eagain() -> io::Error {
 }
 
 impl MountFs for DevFs {
+    fn set_clock(&mut self, clock: std::sync::Arc<crate::clock::VirtualClock>) {
+        self.shm.set_clock(clock);
+    }
+
     fn visit_devfs_mut(&mut self, visitor: &mut dyn FnMut(&mut Self)) {
         visitor(self);
     }

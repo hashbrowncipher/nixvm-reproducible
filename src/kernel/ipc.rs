@@ -21,7 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::{Kernel, ServiceCtx, Shared, err, poll};
+use super::{Kernel, ServiceCtx, Shared, err};
 use crate::abi::Arch;
 use crate::abi::errno::Errno;
 use crate::vcpu::GuestMemory;
@@ -121,8 +121,8 @@ impl Perm {
     }
 }
 
-fn now_s() -> i64 {
-    crate::clock::now_unix().as_secs() as i64
+fn now_s(clock: &crate::clock::VirtualClock) -> i64 {
+    clock.now_unix().as_secs() as i64
 }
 
 /// One message queue.
@@ -177,6 +177,7 @@ struct ShmSeg {
 /// The machine's System V IPC namespace.
 #[derive(Debug, Default)]
 pub(super) struct Ipc {
+    pub(super) clock: std::sync::Arc<crate::clock::VirtualClock>,
     msq: BTreeMap<i32, MsgQueue>,
     sem: BTreeMap<i32, SemSet>,
     shm: BTreeMap<i32, ShmSeg>,
@@ -192,6 +193,12 @@ pub(super) struct Ipc {
 }
 
 impl Ipc {
+    pub(super) fn with_clock(clock: std::sync::Arc<crate::clock::VirtualClock>) -> Self {
+        Self {
+            clock,
+            ..Self::default()
+        }
+    }
     fn alloc_id(&mut self) -> (i32, u16) {
         let n = self.next;
         self.next = self.next.wrapping_add(1);
@@ -211,7 +218,7 @@ impl Ipc {
             let before = s.attaches.len();
             s.attaches.retain(|a| a.0 != mm);
             if s.attaches.len() != before {
-                s.dtime = now_s();
+                s.dtime = now_s(&self.clock);
             }
             if s.removed && s.attaches.is_empty() {
                 dead.push(id);
@@ -361,7 +368,7 @@ impl Kernel {
                     qbytes: MSGMNB,
                     stime: 0,
                     rtime: 0,
-                    ctime: now_s(),
+                    ctime: now_s(&self.clock),
                     lspid: 0,
                     lrpid: 0,
                 })
@@ -407,7 +414,7 @@ impl Kernel {
             };
         }
         q.msgs.push_back((mtype as i64, text));
-        q.stime = now_s();
+        q.stime = now_s(&self.clock);
         q.lspid = cx.cur.tgid;
         sh.unpark_all();
         0
@@ -479,7 +486,7 @@ impl Kernel {
         }
         if flags & MSG_COPY == 0 {
             q.msgs.remove(i);
-            q.rtime = now_s();
+            q.rtime = now_s(&self.clock);
             q.lrpid = cx.cur.tgid;
             sh.unpark_all();
         }
@@ -590,7 +597,7 @@ impl Kernel {
                 }
                 q.perm.set_from(&raw);
                 q.qbytes = qbytes;
-                q.ctime = now_s();
+                q.ctime = now_s(&self.clock);
                 sh.unpark_all();
                 0
             }
@@ -648,7 +655,7 @@ impl Kernel {
                     vals: vec![0; nsems as usize],
                     pids: vec![0; nsems as usize],
                     otime: 0,
-                    ctime: now_s(),
+                    ctime: now_s(&self.clock),
                 })
             }
         )
@@ -702,7 +709,9 @@ impl Kernel {
                 if (s as i64) < 0 || n >= 1_000_000_000 {
                     return err(Errno::EINVAL);
                 }
-                let dl = poll::now_ns() + u128::from(s) * 1_000_000_000 + u128::from(n);
+                let dl = self.clock.now_monotonic().as_nanos()
+                    + u128::from(s) * 1_000_000_000
+                    + u128::from(n);
                 cx.cur.wake_deadline = Some(dl);
                 Some(dl)
             }
@@ -719,6 +728,13 @@ impl Kernel {
         }
         if ops.iter().any(|o| o.0 as usize >= set.vals.len()) {
             return err(Errno::EFBIG);
+        }
+        if cx.cur.sem_wait.is_some()
+            && deadline.is_some_and(|d| d <= self.clock.now_monotonic().as_nanos())
+        {
+            cx.cur.sem_wait = None;
+            cx.cur.wake_deadline = None;
+            return err(Errno::EAGAIN);
         }
         // Try the whole batch on a copy.
         let mut vals = set.vals.clone();
@@ -748,7 +764,7 @@ impl Kernel {
                 cx.cur.wake_deadline = None;
                 return err(Errno::EAGAIN);
             }
-            if deadline.is_some_and(|dl| poll::now_ns() >= dl) {
+            if deadline.is_some_and(|dl| self.clock.now_monotonic().as_nanos() >= dl) {
                 cx.cur.wake_deadline = None;
                 return err(Errno::EAGAIN);
             }
@@ -765,7 +781,7 @@ impl Kernel {
             }
         }
         if let Some(set) = sh.ipc.sem.get_mut(&id) {
-            set.otime = now_s();
+            set.otime = now_s(&self.clock);
         }
         if alters {
             sh.unpark_all();
@@ -880,7 +896,7 @@ impl Kernel {
                     return err(Errno::ERANGE);
                 }
                 set.vals[num] = v;
-                set.ctime = now_s();
+                set.ctime = now_s(&self.clock);
                 ipc.semadj
                     .retain(|k, _| !(k.1 == id && k.2 as usize == num));
                 sh.unpark_all();
@@ -900,7 +916,7 @@ impl Kernel {
                     return err(Errno::ERANGE);
                 }
                 set.vals = vals;
-                set.ctime = now_s();
+                set.ctime = now_s(&self.clock);
                 ipc.semadj.retain(|k, _| k.1 != id);
                 sh.unpark_all();
                 0
@@ -933,7 +949,7 @@ impl Kernel {
                     return err(Errno::EPERM);
                 }
                 set.perm.set_from(&raw);
-                set.ctime = now_s();
+                set.ctime = now_s(&self.clock);
                 0
             }
             IPC_RMID => {
@@ -994,7 +1010,7 @@ impl Kernel {
                     removed: false,
                     atime: 0,
                     dtime: 0,
-                    ctime: now_s(),
+                    ctime: now_s(&self.clock),
                     cpid: pid,
                     lpid: 0,
                 })
@@ -1073,7 +1089,7 @@ impl Kernel {
         let tgid = cx.cur.tgid;
         if let Some(seg) = sh.ipc.shm.get_mut(&id) {
             seg.attaches.push((mm, base));
-            seg.atime = now_s();
+            seg.atime = now_s(&self.clock);
             seg.lpid = tgid;
         }
         base as i64
@@ -1105,7 +1121,7 @@ impl Kernel {
         if let Some(i) = seg.attaches.iter().position(|a| *a == (mm, addr)) {
             seg.attaches.remove(i);
         }
-        seg.dtime = now_s();
+        seg.dtime = now_s(&self.clock);
         seg.lpid = tgid;
         if seg.removed && seg.attaches.is_empty() {
             let seg = sh.ipc.shm.remove(&id).expect("present");
@@ -1213,7 +1229,7 @@ impl Kernel {
                     return err(Errno::EPERM);
                 }
                 s.perm.set_from(&raw);
-                s.ctime = now_s();
+                s.ctime = now_s(&self.clock);
                 0
             }
             IPC_RMID => {

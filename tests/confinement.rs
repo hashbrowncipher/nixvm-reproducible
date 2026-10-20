@@ -174,7 +174,7 @@ fn fork_exec_program(iterations: u32) -> Vec<u8> {
 
 #[test]
 #[ignore = "requires real KVM and guest-only Intel perf counters"]
-fn kvm_fork_exec_reuses_slots_across_serial_smp_and_pmu_runs() {
+fn kvm_fork_exec_reuses_slots_and_measured_smp_is_rejected() {
     nixvm::vcpu::kvm::KvmBackend::new().expect("hardware test requires KVM");
     let root = Root::new("fork");
     root.write("init", &fork_exec_program(8));
@@ -186,7 +186,16 @@ fn kvm_fork_exec_reuses_slots_across_serial_smp_and_pmu_runs() {
         vec![("NIXVM_CPUS", "4")],
         vec![("NIXVM_BRANCH_QUANTUM", "8")],
     ] {
-        assert_code(&run(&root.0, &["--vcpu-capacity", "2"], &environment), 0);
+        let output = run(&root.0, &["--vcpu-capacity", "2"], &environment);
+        if environment.iter().any(|(name, _)| *name == "NIXVM_CPUS") {
+            assert_code(&output, 1);
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("virtual execution requires one scheduler CPU")
+            );
+        } else {
+            assert_code(&output, 0);
+        }
     }
 }
 

@@ -16,9 +16,10 @@
 //! * [`image`]  — guest root-image resolve/download/cache.
 //! * [`sandbox`]— the public [`Sandbox`] builder that wires it all together.
 //!
-//! Host FFI lives in the hardware backends, guest-memory allocation,
-//! filesystem passthrough, and Linux process confinement. The CLI also owns
-//! its executable-only getrandom interposition.
+//! Audited host FFI covers hardware backends, guest-RAM allocation,
+//! filesystem passthrough, Linux confinement, and [`host`] preparation/RNG.
+//! Executable-only glue exports the Linux RNG symbol; linking this library
+//! alone does not interpose randomness or change the process personality.
 //!
 //! ```no_run
 //! use nixvm::Sandbox;
@@ -37,6 +38,7 @@ pub mod clock;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod confinement;
 pub mod fs;
+pub mod host;
 pub mod image;
 pub mod kernel;
 pub mod loader;

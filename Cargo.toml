@@ -28,6 +28,10 @@ name = "nixvm"
 path = "src/bin/nixvm.rs"
 required-features = ["cli"]
 
+[[test]]
+name = "host_determinism"
+harness = false
+
 [features]
 default = ["cli"]
 # CLI-only deps (clap, tracing-subscriber, …) get added here in a later phase.
@@ -71,7 +75,7 @@ fetch = ["dep:ureq"]
 tunnel = ["dep:pktkit"]
 
 [dependencies]
-# Seeded guest randomness; rand_core is re-exported, and OS seeding is unused.
+# Seeded guest and host randomness; rand_core is re-exported, and OS seeding is unused.
 rand_chacha = { version = "=0.10.0", default-features = false }
 # Portable runtime libraries are feature-gated. The KVM instruction decoder is
 # target-gated; the host-only CPUID parser is under build-dependencies.
@@ -110,10 +114,12 @@ pktkit = { version = "0.1.11", optional = true, default-features = false, featur
 serde = { version = "=1.0.228", features = ["derive"] }
 toml = { version = "=0.8.23", default-features = false, features = ["parse"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.186"
+
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
 iced-x86 = { version = "=1.21.0", default-features = false, features = ["std", "decoder"] }
 landlock = "=0.4.7"
-libc = "=0.2.186"
 seccompiler = "=0.5.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

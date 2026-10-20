@@ -331,10 +331,19 @@ impl Resources {
                 ioctls.push(rule(vec![eq(0, fd), eq(1, request)]));
             }
         }
-        if let (Some(&first), Some(&last)) = (self.vcpus.first(), self.vcpus.last()) {
-            if last - first + 1 != self.vcpus.len() as i32 {
-                return Err(error("vCPU descriptors must be contiguous"));
+        // Existing prepared resources may leave gaps between vCPU numbers.
+        // Compact only consecutive exact vCPU descriptors; never include gaps.
+        let mut ranges: Vec<(i32, i32)> = Vec::new();
+        for fd in self.vcpus.iter().copied().collect::<BTreeSet<_>>() {
+            if let Some((_, last)) = ranges.last_mut()
+                && *last + 1 == fd
+            {
+                *last = fd;
+            } else {
+                ranges.push((fd, fd));
             }
+        }
+        for (first, last) in ranges {
             for request in crate::vcpu::kvm::runtime_requests() {
                 ioctls.push(rule(vec![
                     condition(0, SeccompCmpOp::Ge, first as u64),
@@ -562,7 +571,7 @@ mod tests {
             || {
                 begin().unwrap();
                 restrict_filesystem(&[]).unwrap();
-                let (workers, _) = crate::kernel::PreparedWorkers::new(2, false, false).unwrap();
+                let (workers, _) = crate::kernel::PreparedWorkers::new(2, false).unwrap();
                 drop_thread_privileges().unwrap();
                 Resources::default().install(false).unwrap();
                 workers.probe(|| unsafe {
@@ -690,7 +699,7 @@ mod tests {
                     .write_init(base, &[0xb8, 39, 0, 0, 0, 0x0f, 0x05])
                     .unwrap();
                 let resources = backend.prepare_confinement(2, &memory).unwrap();
-                crate::vcpu::kvm::prepare_thread(false).unwrap();
+                crate::vcpu::kvm::prepare_thread().unwrap();
                 restrict_filesystem(&[]).unwrap();
                 drop_thread_privileges().unwrap();
                 resources.install(false).unwrap();
@@ -737,7 +746,7 @@ mod tests {
                     let vcpu = resources.vcpus[0];
                     let system = resources.protected[0];
                     let vm = resources.protected[1];
-                    crate::vcpu::kvm::prepare_thread(false).unwrap();
+                    crate::vcpu::kvm::prepare_thread().unwrap();
                     restrict_filesystem(&[]).unwrap();
                     drop_thread_privileges().unwrap();
                     resources.install(false).unwrap();

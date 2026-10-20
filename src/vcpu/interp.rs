@@ -40,8 +40,10 @@ mod simd;
 mod simd_ext;
 
 use crate::abi::Arch;
+use crate::clock::VirtualClock;
+use std::sync::Arc;
 
-use super::{Backend, Exit, GuestMemory, Vcpu, VcpuError};
+use super::{Backend, ExecutionClock, Exit, GuestMemory, Vcpu, VcpuError};
 
 /// Upper bound on instructions executed per `run()` call before yielding, so a
 /// runaway guest loop can't wedge the host. (Real deadlines land in Phase 9.)
@@ -50,11 +52,15 @@ const MAX_STEPS: u64 = 50_000_000;
 #[derive(Debug)]
 pub struct InterpBackend {
     guest: Arch,
+    clock: Arc<VirtualClock>,
 }
 
 impl InterpBackend {
     pub fn new(guest: Arch) -> Result<Self, VcpuError> {
-        Ok(Self { guest })
+        Ok(Self {
+            guest,
+            clock: Arc::new(VirtualClock::new()),
+        })
     }
 }
 
@@ -69,7 +75,11 @@ impl Backend for InterpBackend {
 
     fn new_vcpu(&self, entry: u64, stack: u64) -> Result<Box<dyn Vcpu>, VcpuError> {
         match self.guest {
-            Arch::Aarch64 => Ok(Box::new(Aarch64Interp::new(entry, stack))),
+            Arch::Aarch64 => {
+                let mut cpu = Aarch64Interp::new(entry, stack);
+                cpu.set_clock(self.clock.clone(), self.clock.allocate_observer());
+                Ok(Box::new(cpu))
+            }
             Arch::X86_64 => Err(VcpuError::Backend(
                 "interp x86-64 not implemented yet (ROADMAP Phase 10)".into(),
             )),
@@ -141,10 +151,9 @@ struct Aarch64Interp {
     sp: u64,
     pc: u64,
     tpidr: u64,
-    /// Backing state for `CNTVCT_EL0`: incremented on every read so a guest
-    /// spin loop waiting for the counter to advance terminates, even though
-    /// this interpreter has no wall-clock timer to drive a real one.
-    cntvct: u64,
+    /// ARM execution time uses retired instructions, rather than x86's
+    /// conditional-branch metric. Syscall entry costs are accounted separately.
+    time: ExecutionClock,
     /// `FPCR` (control: rounding mode, `FZ`, `DN`, `AHP`) and `FPSR`
     /// (cumulative exception flags and `QC`), honoured/updated by every FP and
     /// saturating SIMD instruction.
@@ -238,7 +247,7 @@ impl Aarch64Interp {
             sp: stack,
             pc: entry,
             tpidr: 0,
-            cntvct: 0,
+            time: ExecutionClock::new(),
             fpcr: 0,
             fpsr: 0,
             flags: Flags::default(),
@@ -354,56 +363,83 @@ impl Vcpu for Aarch64Interp {
         self.excl_monitor = false;
         // Memory may have changed while the kernel (or another vcpu) ran.
         self.fetch.clear();
-        // Time-based preemption (`NIXVM_QUANTUM_MS`): a syscall-free hot loop
-        // still hands control back, so siblings run and pending signals
-        // (`alarm`, Go's SIGURG preemption) reach it.
-        let deadline = super::preempt_quantum().map(|q| crate::clock::now_monotonic() + q);
-        for i in 0..MAX_STEPS {
-            // The quantum and the embedder's yield deadline
-            // (`Kernel::pump_for`), polled every 4096 instructions: a clock
-            // read per instruction would dominate.
-            if i & 4095 == 4095
-                && (super::yield_due()
-                    || deadline.is_some_and(|d| crate::clock::now_monotonic() >= d))
-            {
-                return Ok(Exit::Interrupted);
-            }
-            // A misaligned PC is a PC alignment fault (SIGBUS on Linux).
-            let fetched = if self.pc & 3 == 0 {
-                self.fetch.fetch(self.pc, mem)
-            } else {
-                None
-            };
-            let Some(instr) = fetched else {
-                // A misaligned PC is a PC alignment fault (SIGBUS).
-                return Ok(if self.pc & 3 == 0 {
-                    Exit::MemFault {
-                        addr: self.pc,
-                        write: false,
-                    }
-                } else {
-                    Exit::Misaligned {
-                        addr: self.pc,
-                        write: false,
-                    }
-                });
-            };
-            match self.exec(instr, mem) {
-                Step::Next => self.pc = self.pc.wrapping_add(4),
-                Step::Branched => {}
-                Step::Syscall => return Ok(Exit::Syscall),
-                Step::Illegal => return Ok(Exit::IllegalInstruction { pc: self.pc }),
-                Step::Fault { addr, write } => return Ok(Exit::MemFault { addr, write }),
-                Step::Breakpoint { imm } => {
-                    return Ok(Exit::Breakpoint {
-                        pc: self.pc,
-                        code: u64::from(imm),
-                    });
+        self.time.enter();
+        let exit = 'run: {
+            for i in 0..MAX_STEPS {
+                if self.time.exhausted() || (i & 4095 == 0 && super::yield_due()) {
+                    break 'run Exit::Interrupted;
                 }
-                Step::Misaligned { addr, write } => return Ok(Exit::Misaligned { addr, write }),
+                // A misaligned PC is a PC alignment fault (SIGBUS on Linux).
+                let fetched = if self.pc & 3 == 0 {
+                    self.fetch.fetch(self.pc, mem)
+                } else {
+                    None
+                };
+                let Some(instr) = fetched else {
+                    // A misaligned PC is a PC alignment fault (SIGBUS).
+                    break 'run if self.pc & 3 == 0 {
+                        Exit::MemFault {
+                            addr: self.pc,
+                            write: false,
+                        }
+                    } else {
+                        Exit::Misaligned {
+                            addr: self.pc,
+                            write: false,
+                        }
+                    };
+                };
+                match self.exec(instr, mem) {
+                    Step::Next => {
+                        // CNTVCT accounts its own instruction before observing,
+                        // preventing an observation leap from skipping a deadline.
+                        if instr & !31 != 0xD53B_E040 {
+                            self.time.account();
+                        }
+                        self.pc = self.pc.wrapping_add(4);
+                    }
+                    Step::Branched => self.time.account(),
+                    Step::Syscall => {
+                        self.time.syscall(self.pc);
+                        break 'run Exit::Syscall;
+                    }
+                    Step::Illegal => break 'run Exit::IllegalInstruction { pc: self.pc },
+                    Step::Fault { addr, write } => break 'run Exit::MemFault { addr, write },
+                    Step::Breakpoint { imm } => {
+                        break 'run Exit::Breakpoint {
+                            pc: self.pc,
+                            code: u64::from(imm),
+                        };
+                    }
+                    Step::Misaligned { addr, write } => {
+                        break 'run Exit::Misaligned { addr, write };
+                    }
+                }
             }
-        }
-        Ok(Exit::Interrupted)
+            Exit::Interrupted
+        };
+        self.time.flush();
+        Ok(exit)
+    }
+
+    fn set_clock(&mut self, clock: Arc<VirtualClock>, task: u64) {
+        self.time.bind(clock, task);
+    }
+
+    fn set_execution_limit(&mut self, remaining: Option<u64>) {
+        self.time.set_limit(remaining);
+    }
+
+    fn begin_slice(&mut self) {
+        self.time.begin_slice();
+    }
+
+    fn set_preemption_required(&mut self, required: bool) {
+        self.time.set_preemption_required(required);
+    }
+
+    fn execution_ticks(&self) -> Option<u64> {
+        Some(self.time.total())
     }
 
     fn syscall_nr(&self) -> u64 {
@@ -415,6 +451,7 @@ impl Vcpu for Aarch64Interp {
         ]
     }
     fn set_syscall_ret(&mut self, value: u64) {
+        self.time.complete_syscall();
         self.x[0] = value;
         self.pc = self.pc.wrapping_add(4);
     }
@@ -432,6 +469,7 @@ impl Vcpu for Aarch64Interp {
         self.pc
     }
     fn set_pc(&mut self, pc: u64) {
+        self.time.complete_syscall();
         self.pc = pc;
     }
     fn sp(&self) -> u64 {
@@ -480,10 +518,14 @@ impl Vcpu for Aarch64Interp {
     }
 
     fn fork(&self) -> Box<dyn Vcpu> {
-        Box::new(self.clone())
+        let mut child = self.clone();
+        child.time = self.time.fork();
+        Box::new(child)
     }
 
     fn reset(&mut self, entry: u64, sp: u64) {
+        self.time.complete_syscall();
+        self.time.reset_observations();
         self.x = [0; 31];
         self.v = [0; 32];
         self.sp = sp;
@@ -583,6 +625,42 @@ mod tests {
     /// A scratch memory for instructions that don't touch it.
     fn scratch() -> GuestMemory {
         GuestMemory::new(0x1_0000, PAGE_SIZE)
+    }
+
+    #[test]
+    fn solo_instructions_advance_virtual_time_to_deadline() {
+        let (mut cpu, mut memory) = (cpu(), scratch());
+        memory.map(0x1_0000, PAGE_SIZE, Prot::rx()).unwrap();
+        memory
+            .write_init(0x1_0000, &0x1400_0000u32.to_le_bytes())
+            .unwrap(); // b .
+        let clock = Arc::new(VirtualClock::new());
+        cpu.set_clock(clock.clone(), 4);
+        cpu.set_preemption_required(false);
+        clock.set_deadline(Some(37));
+        assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+        assert_eq!(clock.now_monotonic().as_nanos(), 37);
+        assert_eq!(clock.execution_ns(), 37);
+        assert_eq!(cpu.pc, 0x1_0000);
+    }
+
+    #[test]
+    fn counter_polling_observes_deadline_after_accounting_instruction() {
+        let (mut cpu, mut memory) = (cpu(), scratch());
+        memory.map(0x1_0000, PAGE_SIZE, Prot::rx()).unwrap();
+        let code = [0xD53B_E040u32, 0x17FF_FFFF]; // mrs x0,cntvct_el0; b back
+        for (i, instruction) in code.iter().enumerate() {
+            memory
+                .write_init(0x1_0000 + 4 * i as u64, &instruction.to_le_bytes())
+                .unwrap();
+        }
+        let clock = Arc::new(VirtualClock::new());
+        cpu.set_clock(clock.clone(), 4);
+        clock.set_deadline(Some(100));
+        assert_eq!(cpu.run(&mut memory).unwrap(), Exit::Interrupted);
+        assert_eq!(clock.now_monotonic().as_nanos(), 100);
+        assert!(clock.execution_ns() < 100);
+        assert_eq!(cpu.pc, 0x1_0004);
     }
 
     #[test]

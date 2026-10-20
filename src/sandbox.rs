@@ -91,7 +91,8 @@ pub struct Config {
     pub mode: RunMode,
     /// Explicit init binary for [`RunMode::Booted`] (default `/sbin/init`).
     pub init: Option<String>,
-    /// Number of virtual CPUs (host worker threads); `1` is single-threaded.
+    /// Requested scheduler worker count. Current virtual-time execution
+    /// supports `1`; larger counts return an error when the sandbox runs.
     pub ncpus: usize,
     /// Guest memory ceiling in bytes.
     pub mem_bytes: u64,
@@ -152,9 +153,9 @@ impl Default for SandboxBuilder {
                 root: RootSource::Empty,
                 mode: RunMode::Nude,
                 init: None,
-                // NIXVM_CPUS=N runs guest compute on N host worker threads (the
-                // SMP scheduler); unset or unparseable means 1 (serial). An
-                // explicit `.ncpus()` on the builder still overrides this.
+                // NIXVM_CPUS requests the scheduler worker count. Virtual-time
+                // execution supports one; larger requests fail at run time. An
+                // explicit `.ncpus()` on the builder overrides this setting.
                 ncpus: std::env::var("NIXVM_CPUS")
                     .ok()
                     .and_then(|s| s.trim().parse::<usize>().ok())
@@ -195,7 +196,8 @@ impl SandboxBuilder {
     /// Restrict this process's files, descriptors, privileges and syscalls before
     /// parsing guest files. This is irreversible and closes inherited fds above
     /// stderr. Call from a dedicated, single-threaded process only. The CLI
-    /// enables this by default; embedders must explicitly opt in.
+    /// enables this by default on Linux x86-64; embedders must explicitly opt in.
+    /// Perform one confined run per dedicated process, then exit.
     #[must_use]
     pub fn confine_host(mut self, yes: bool) -> Self {
         self.config.confine_host = yes;
@@ -319,7 +321,9 @@ impl SandboxBuilder {
         self
     }
 
-    /// Set the number of virtual CPUs (host worker threads for guest compute).
+    /// Request the scheduler worker count; zero means one. Current virtual-time
+    /// execution supports one worker. Larger requests return an error from
+    /// [`Sandbox::run`]. Guest processes and threads share that scheduler CPU.
     #[must_use]
     pub fn ncpus(mut self, n: usize) -> Self {
         self.config.ncpus = n.max(1);
@@ -511,27 +515,20 @@ impl Sandbox {
                 "host networking is unavailable in confined runs".into(),
             ));
         }
+        if sandbox.config.ncpus != 1 {
+            return Err(Error::Config(
+                "virtual execution requires one scheduler CPU".into(),
+            ));
+        }
         confinement::begin()?;
         let backend = sandbox.backend(sandbox.config.arch)?;
         let kvm = backend.name() == "kvm";
-        let pmu = std::env::var_os("NIXVM_BRANCH_QUANTUM").is_some();
-        if pmu && sandbox.config.ncpus != 1 {
-            return Err(Error::Config(
-                "PMU scheduling requires one scheduler CPU".into(),
-            ));
-        }
         let mem = GuestMemory::new_split(
             GUEST_BASE,
             GUEST_VSIZE,
             round_up_page(sandbox.config.mem_bytes),
         );
         let mut resources = backend.prepare_confinement(sandbox.config.vcpu_capacity, &mem)?;
-        if kvm {
-            crate::vcpu::kvm::prepare_thread(pmu)?;
-        }
-        if let Some(fd) = crate::vcpu::kvm::perf_fd() {
-            resources.perf.push(fd);
-        }
         let mut directories = Vec::new();
         let mut mounts = MountTable::new();
         let directory_lower = match &sandbox.config.root {
@@ -599,7 +596,7 @@ impl Sandbox {
         } else {
             0
         };
-        let (workers, perf) = crate::kernel::PreparedWorkers::new(count, kvm, pmu)?;
+        let (workers, perf) = crate::kernel::PreparedWorkers::new(count, kvm)?;
         resources.perf.extend(perf);
         confinement::drop_thread_privileges()?;
         resources.install(!directories.is_empty())?;
@@ -1221,19 +1218,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn same_result_on_four_cpus() {
+    fn virtual_execution_rejects_four_cpus() {
         let dir = temp_root("smp");
         std::fs::write(dir.join("init"), build_exit_elf(19)).unwrap();
-        let code = Sandbox::builder()
+        let error = Sandbox::builder()
             .arch(Arch::Aarch64)
             .prefer_interp(true)
             .root_dir(&dir)
             .command(["/init"])
             .ncpus(4)
             .run()
-            .unwrap();
+            .unwrap_err();
         std::fs::remove_dir_all(&dir).ok();
-        assert_eq!(code, 19);
+        assert!(matches!(
+            error,
+            Error::Vcpu(vcpu::VcpuError::Backend(message))
+                if message == "virtual execution requires one scheduler CPU"
+        ));
     }
 
     #[test]

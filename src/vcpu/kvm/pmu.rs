@@ -1,7 +1,7 @@
 //! Guest-only conditional-branch counting and exact slice boundaries.
 //!
 //! Overflow is an early warning. Only single-stepped instruction boundaries
-//! may finish a quantum. A late interrupt is an error, including an interrupt
+//! may finish an execution limit. A late interrupt is an error, including an interrupt
 //! at the target count: uncounted instructions may already have run after it.
 
 use super::{
@@ -42,15 +42,17 @@ struct Budget {
 
 impl Budget {
     fn remaining(&self) -> u64 {
-        self.quantum - self.used
+        self.quantum.saturating_sub(self.used)
     }
 
-    fn account(&mut self, branches: u64, stepping: bool) -> Result<(), VcpuError> {
-        let used = self
-            .used
-            .checked_add(branches)
-            .ok_or_else(|| error("count overflow"))?;
-        if used > self.quantum || (!stepping && used == self.quantum) {
+    fn account(
+        &mut self,
+        branches: u64,
+        stepping: bool,
+        target: Option<u64>,
+        fairness: bool,
+    ) -> Result<(), VcpuError> {
+        if target.is_some_and(|target| branches > target || (!stepping && branches == target)) {
             return Err(error(
                 "overflow arrived too late for an exact branch boundary",
             ));
@@ -64,7 +66,12 @@ impl Budget {
             .total
             .checked_add(branches)
             .ok_or_else(|| error("total count overflow"))?;
-        self.used = used;
+        if fairness {
+            self.used = self
+                .used
+                .checked_add(branches)
+                .ok_or_else(|| error("count overflow"))?;
+        }
         Ok(())
     }
 }
@@ -384,14 +391,14 @@ impl Counter {
 }
 
 pub(super) struct Pmu {
-    enabled: bool,
+    fairness: bool,
     budget: Budget,
 }
 
 impl Pmu {
     pub fn new(quantum: u64) -> Self {
         Self {
-            enabled: false,
+            fairness: false,
             budget: Budget {
                 quantum,
                 used: 0,
@@ -405,26 +412,24 @@ impl Pmu {
     pub fn total(&self) -> u64 {
         self.budget.total
     }
-    pub fn enabled(&self) -> bool {
-        self.enabled
-    }
     pub fn begin_slice(&mut self) {
         self.budget.used = 0;
     }
-    pub fn set_enabled(&mut self, enabled: bool) {
-        if enabled && !self.enabled {
+    pub fn set_fairness(&mut self, fairness: bool) {
+        if fairness && !self.fairness {
             self.begin_slice();
         }
-        self.enabled = enabled;
+        self.fairness = fairness;
+    }
+    pub fn remaining(&self) -> Option<u64> {
+        self.fairness.then(|| self.budget.remaining())
     }
     pub fn finished(&self) -> bool {
-        self.enabled && self.budget.remaining() == 0
+        self.remaining() == Some(0)
     }
 
-    pub fn start(&mut self, vcpu: i32) -> Result<Option<RunGuard>, VcpuError> {
-        if !self.enabled {
-            return Ok(None);
-        }
+    /// Count every run; optional targets add exact virtual-time boundaries.
+    pub fn start(&mut self, vcpu: i32, target: Option<u64>) -> Result<RunGuard, VcpuError> {
         let host = if PREPARED.get() {
             None
         } else {
@@ -437,12 +442,13 @@ impl Pmu {
             let counter = counter.as_ref().unwrap();
             (counter.fd.0, counter.guest_mask)
         });
-        let stepping = self.budget.remaining() <= SKID;
+        let stepping = target.is_some_and(|target| target <= SKID);
         let guard = RunGuard {
             counter,
             vcpu,
             stepping,
             host,
+            target,
         };
         // Overflow stays blocked on the host, and KVM unblocks it only in guest.
         let mask = sys::kvm_signal_mask {
@@ -457,10 +463,9 @@ impl Pmu {
             },
             ..Default::default()
         };
-        let period = if stepping {
-            i64::MAX as u64
-        } else {
-            self.budget.remaining() - SKID
+        let period = match target {
+            Some(target) if !stepping => target - SKID,
+            _ => i64::MAX as u64,
         };
         // SAFETY: owned event and vcpu descriptors; all ioctl pointers have the
         // layouts specified by linux/perf_event.h and linux/kvm.h.
@@ -478,10 +483,10 @@ impl Pmu {
             check(sys::ioctl(counter, PERIOD, &period), "PMU period")?;
             check(sys::ioctl(counter, ENABLE, 0), "PMU enable")?;
         }
-        Ok(Some(guard))
+        Ok(guard)
     }
 
-    pub fn finish(&mut self, mut guard: RunGuard) -> Result<(), VcpuError> {
+    pub fn finish(&mut self, mut guard: RunGuard) -> Result<u64, VcpuError> {
         // SAFETY: the guard keeps the descriptor live and the CPU pinned.
         check(
             unsafe { sys::ioctl(guard.counter, DISABLE, 0) },
@@ -496,7 +501,9 @@ impl Pmu {
         if sample[1] == 0 || sample[2] != sample[1] {
             return Err(error("counter was not continuously scheduled"));
         }
-        let result = self.budget.account(sample[0], guard.stepping);
+        let result = self
+            .budget
+            .account(sample[0], guard.stepping, guard.target, self.fairness);
         let debug = sys::kvm_guest_debug::default();
         // SAFETY: the live guard owns the vcpu's temporary debugger state.
         check(
@@ -507,7 +514,7 @@ impl Pmu {
             host.restore()?;
         }
         drop(guard);
-        result
+        result.map(|()| sample[0])
     }
 }
 
@@ -517,6 +524,7 @@ pub(super) struct RunGuard {
     vcpu: i32,
     pub stepping: bool,
     host: Option<HostScope>,
+    target: Option<u64>,
 }
 
 impl Drop for RunGuard {
@@ -536,26 +544,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uncontended_runs_do_not_open_a_counter_or_consume_the_budget() {
+    fn solo_execution_counts_without_consuming_fairness_budget() {
         let mut pmu = Pmu::new(8);
-        assert!(pmu.start(-1).unwrap().is_none());
-        assert_eq!(pmu.total(), 0);
-        pmu.set_enabled(true);
-        pmu.budget.account(7, false).unwrap();
-        pmu.budget.account(1, true).unwrap();
+        pmu.budget.account(100, false, None, false).unwrap();
+        assert_eq!(pmu.total(), 100);
+        assert_eq!(pmu.remaining(), None);
+        pmu.set_fairness(true);
+        assert_eq!(pmu.remaining(), Some(8));
+        pmu.budget.account(7, false, Some(8), true).unwrap();
+        pmu.budget.account(1, true, Some(1), true).unwrap();
         assert!(pmu.finished());
-        pmu.set_enabled(false);
+        pmu.set_fairness(false);
+        pmu.budget.account(100, false, None, false).unwrap();
         assert!(!pmu.finished());
-        assert!(pmu.start(-1).unwrap().is_none());
-        assert_eq!(pmu.total(), 8);
-        pmu.set_enabled(true);
-        assert!(!pmu.finished(), "new contention starts a fresh quantum");
-        assert_eq!(pmu.budget.remaining(), 8);
-        assert_eq!(
-            pmu.total(),
-            8,
-            "inactive execution adds no counted branches"
-        );
+        assert_eq!(pmu.total(), 208);
+        pmu.set_fairness(true);
+        assert_eq!(pmu.remaining(), Some(8));
     }
 
     #[test]
@@ -573,11 +577,11 @@ mod tests {
             used: 0,
             total: 0,
         };
-        budget.account(2000, false).unwrap(); // syscall
-        budget.account(0, false).unwrap(); // unrelated host interrupt
-        budget.account(2999, false).unwrap();
+        budget.account(2000, false, Some(5000), true).unwrap(); // syscall
+        budget.account(0, false, Some(3000), true).unwrap(); // unrelated host interrupt
+        budget.account(2999, false, Some(3000), true).unwrap();
         assert_eq!(budget.remaining(), 1);
-        budget.account(1, true).unwrap();
+        budget.account(1, true, Some(1), true).unwrap();
         assert_eq!(budget.remaining(), 0);
         budget.used = 0;
         assert_eq!(budget.remaining(), 5000);
@@ -592,14 +596,14 @@ mod tests {
                 used: 0,
                 total: 0,
             };
-            assert!(budget.account(count, false).is_err());
+            assert!(budget.account(count, false, Some(5000), true).is_err());
         }
         let mut budget = Budget {
             quantum: 5000,
             used: 4999,
             total: 4999,
         };
-        assert!(budget.account(2, true).is_err());
+        assert!(budget.account(2, true, Some(1), true).is_err());
     }
 
     #[test]

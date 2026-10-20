@@ -1,4 +1,4 @@
-//! Seeded byte stream shared by a sandbox's randomness interfaces.
+//! Buffered seeded byte streams for host and sandbox randomness.
 
 use std::sync::{Arc, Mutex};
 
@@ -9,7 +9,7 @@ use rand_chacha::rand_core::{Rng, SeedableRng};
 #[derive(Clone)]
 pub(crate) struct RandomSource(Arc<Mutex<RandomState>>);
 
-struct RandomState {
+pub(crate) struct RandomState {
     generator: ChaCha20Rng,
     // rand_chacha consumes whole words. Keep unused bytes so read boundaries
     // cannot skip bytes in the sandbox's stream.
@@ -24,7 +24,7 @@ impl std::fmt::Debug for RandomSource {
 }
 
 impl RandomState {
-    fn new(seed: [u8; 32]) -> Self {
+    pub(crate) fn new(seed: [u8; 32]) -> Self {
         Self {
             generator: ChaCha20Rng::from_seed(seed),
             pending: [0; 64],
@@ -32,7 +32,7 @@ impl RandomState {
         }
     }
 
-    fn fill(&mut self, mut output: &mut [u8]) {
+    pub(crate) fn fill(&mut self, mut output: &mut [u8]) {
         while !output.is_empty() {
             if self.used == self.pending.len() {
                 self.generator.fill_bytes(&mut self.pending);

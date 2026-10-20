@@ -30,6 +30,7 @@ impl std::fmt::Debug for Mount {
 /// Resolves guest paths across a set of mounted backends.
 #[derive(Debug, Default)]
 pub struct MountTable {
+    clock: Option<std::sync::Arc<crate::clock::VirtualClock>>,
     mounts: Vec<Mount>,
 }
 
@@ -39,13 +40,23 @@ impl MountTable {
         Self::default()
     }
 
+    pub fn set_clock(&mut self, clock: std::sync::Arc<crate::clock::VirtualClock>) {
+        for mount in &mut self.mounts {
+            mount.fs.set_clock(std::sync::Arc::clone(&clock));
+        }
+        self.clock = Some(clock);
+    }
+
     /// Mount `fs` at absolute `point`. Deeper mount points win via
     /// longest-prefix resolution.
     ///
     /// `point` is normalized (see `normalize`) before being stored, so
     /// callers may pass e.g. `"/dev/"` or `"/dev/../dev"` and still get the
     /// expected `"/dev"` mount point.
-    pub fn mount(&mut self, point: impl Into<String>, fs: Box<dyn MountFs>) {
+    pub fn mount(&mut self, point: impl Into<String>, mut fs: Box<dyn MountFs>) {
+        if let Some(clock) = &self.clock {
+            fs.set_clock(std::sync::Arc::clone(clock));
+        }
         self.mounts.push(Mount {
             point: normalize(&point.into()),
             fs,
@@ -55,7 +66,10 @@ impl MountTable {
 
     /// Mount `fs` at `point` on the guest's behalf (`mount(2)`); it stacks
     /// over whatever was there and can be removed with [`Self::unmount`].
-    pub fn mount_guest(&mut self, point: &str, fs: Box<dyn MountFs>) {
+    pub fn mount_guest(&mut self, point: &str, mut fs: Box<dyn MountFs>) {
+        if let Some(clock) = &self.clock {
+            fs.set_clock(std::sync::Arc::clone(clock));
+        }
         self.mounts.push(Mount {
             point: normalize(point),
             fs,

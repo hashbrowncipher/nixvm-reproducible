@@ -196,6 +196,11 @@ fn enotempty() -> io::Error {
 }
 
 impl MountFs for Overlay {
+    fn set_clock(&mut self, clock: std::sync::Arc<crate::clock::VirtualClock>) {
+        self.upper.set_clock(std::sync::Arc::clone(&clock));
+        self.lower.set_clock(clock);
+    }
+
     fn visit_devfs_mut(&mut self, visitor: &mut dyn FnMut(&mut DevFs)) {
         self.upper.visit_devfs_mut(visitor);
         self.lower.visit_devfs_mut(visitor);

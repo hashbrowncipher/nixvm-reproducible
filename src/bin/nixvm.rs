@@ -12,15 +12,14 @@
 //! nixvm version
 //! ```
 
+mod common;
+
 use std::process::ExitCode;
 
 use nixvm::{Arch, Sandbox};
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[path = "nixvm/host_random.rs"]
-mod host_random;
-
 fn main() -> ExitCode {
+    common::prepare();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
@@ -140,11 +139,6 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
     if !erofs_layers.is_empty() {
         builder = builder.root_erofs_layers(erofs_layers);
-    }
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    if let Err(error) = host_random::prepare() {
-        eprintln!("nixvm: prepare host randomness: {error}");
-        return ExitCode::FAILURE;
     }
     match builder.command(command).run() {
         Ok(code) => ExitCode::from(u8::try_from(code & 0xff).unwrap_or(1)),
