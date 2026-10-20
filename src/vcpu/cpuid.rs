@@ -201,10 +201,10 @@ mod tests {
     fn cpuinfo_flags_include_vectors_and_exclude_hidden_host_features() {
         let flags = super::flag_string();
         let flags: Vec<_> = flags.split_whitespace().collect();
-        for name in ["xsave", "osxsave", "avx", "avx2", "bmi1", "bmi2"] {
+        for name in ["xsave", "osxsave", "avx", "avx2", "bmi1", "bmi2", "rdtscp"] {
             assert!(flags.contains(&name), "missing {name}");
         }
-        for name in ["rdrand", "rdseed", "aes", "pclmulqdq", "rdtscp", "x2apic"] {
+        for name in ["rdrand", "rdseed", "aes", "pclmulqdq", "x2apic"] {
             assert!(!flags.contains(&name), "unexpected {name}");
         }
     }

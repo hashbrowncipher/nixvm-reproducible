@@ -52,7 +52,7 @@ ebx = 0x00010800
 #                           min_delta calibration storm at 128 GHz virtual TSC makes
 #                           it 24x slower than the legacy periodic timer. See commit
 #                           history for details.
-#   RDRAND (bit 30)  — not advertised until VMCS-level interception works
+#   RDRAND (bit 30)  — intentionally unavailable on KVM; see docs/cpu.md
 #   AES-NI (bit 25)  — not needed for boot; can add later
 #
 # Advertised but not a real CPU feature:
@@ -198,8 +198,9 @@ ecx = 0x00000001
 #   bit 11  SYSCALL/SYSRET
 #   bit 20  NX (Execute Disable)
 #   bit 26  1 GiB pages
+#   bit 27  RDTSCP (logical VM timestamp, TSC_AUX = 0)
 #   bit 29  Long Mode (Intel 64)
-edx = 0x24100800
+edx = 0x2C100800
 
 # ============================================================================
 # Leaves 0x80000002–0x80000004 — Processor Name String

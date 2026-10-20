@@ -32,13 +32,16 @@ fn run(v: &mut dyn Vcpu, mem: &mut GuestMemory, bare: bool) -> Exit {
 }
 
 #[test]
-fn rdtsc_and_syscall_entry_advance_one_vm_counter() {
+fn rdtsc_rdtscp_and_syscall_entry_advance_one_vm_counter() {
     let Some(backend) = backend() else { return };
     let mut mem = GuestMemory::new(BASE, 64 * 1024);
     mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
-    // RDTSC; SYSCALL; RDTSC; SYSCALL.
-    mem.write_init(BASE, &[0x0f, 0x31, 0x0f, 0x05, 0x0f, 0x31, 0x0f, 0x05])
-        .unwrap();
+    // RDTSC; SYSCALL; MOV RCX, -1; RDTSCP; MOV RSI, RCX; SYSCALL.
+    // Save all 64 bits of TSC_AUX before SYSCALL overwrites RCX.
+    let mut code = vec![0x0f, 0x31, 0x0f, 0x05, 0x48, 0xb9];
+    code.extend_from_slice(&u64::MAX.to_le_bytes());
+    code.extend_from_slice(&[0x0f, 0x01, 0xf9, 0x48, 0x89, 0xce, 0x0f, 0x05]);
+    mem.write_init(BASE, &code).unwrap();
     let mut v = backend.new_vcpu(BASE, STACK).unwrap();
     assert!(
         v.vdso_calibration().is_none(),
@@ -54,8 +57,14 @@ fn rdtsc_and_syscall_entry_advance_one_vm_counter() {
     // A parked syscall is re-delivered without another entry or another tick.
     assert_eq!(run(v.as_mut(), &mut mem, false), Exit::Syscall);
     v.set_syscall_ret(0);
+    v.set_reg(0, u64::MAX);
+    v.set_reg(2, u64::MAX);
+    v.set_reg(6, u64::MAX);
     assert_eq!(run(v.as_mut(), &mut mem, true), Exit::Syscall);
     assert_eq!((v.reg(0), v.reg(2)), (3, 0));
+    assert_eq!(v.reg(6), 0, "RDTSCP zero-extends the fixed TSC_AUX");
+    assert_eq!(v.reg(3), 0x1234_5678_9abc_def0);
+    assert_eq!(v.reg(4), STACK);
 
     // Fork and reset share the VM timeline; neither copies nor resets its clock.
     let mut child = v.fork();
@@ -64,50 +73,62 @@ fn rdtsc_and_syscall_entry_advance_one_vm_counter() {
         assert_eq!(run(cpu.as_mut(), &mut mem, true), Exit::Syscall);
         assert_eq!((cpu.reg(0), cpu.reg(2)), (expected, 0));
     }
-    let mut sibling = backend.new_vcpu(BASE, STACK).unwrap();
+    let mut sibling = backend.new_vcpu(BASE + 4, STACK).unwrap();
+    sibling.set_reg(1, u64::MAX);
     assert_eq!(run(sibling.as_mut(), &mut mem, false), Exit::Syscall);
     assert_eq!((sibling.reg(0), sibling.reg(2)), (9, 0));
+    assert_eq!(sibling.reg(6), 0);
 }
 
 #[test]
-fn prefixed_rdtsc_can_end_at_a_page_boundary() {
-    for prefixes in [
-        &[][..],
-        &[0x66][..],
-        &[0x67, 0xf3, 0x48][..],
-        &[0x66; 13][..],
-    ] {
-        let Some(backend) = backend() else { return };
-        let mut mem = GuestMemory::new(BASE, 64 * 1024);
-        mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
-        let pc = BASE + PAGE_SIZE - 2 - prefixes.len() as u64;
-        let mut code = prefixes.to_vec();
-        code.extend_from_slice(&[0x0f, 0x31]);
-        mem.write_init(pc, &code).unwrap();
-        let mut v = backend.new_vcpu(pc, STACK).unwrap();
-        // The following fetch faults, but RDTSC must already have completed.
-        assert_eq!(
-            run(v.as_mut(), &mut mem, true),
-            Exit::MemFault {
-                addr: BASE + PAGE_SIZE,
-                write: false
-            }
-        );
-        assert_eq!(v.pc(), BASE + PAGE_SIZE);
-        assert_eq!((v.reg(0), v.reg(2)), (1, 0));
+fn prefixed_timestamps_can_end_at_a_page_boundary() {
+    for opcode in [&[0x0f, 0x31][..], &[0x0f, 0x01, 0xf9][..]] {
+        for prefixes in [
+            vec![],
+            vec![0x66],
+            vec![0x67, 0xf3, 0x48],
+            vec![0x66; 15 - opcode.len()],
+        ] {
+            let Some(backend) = backend() else { return };
+            let mut mem = GuestMemory::new(BASE, 64 * 1024);
+            mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+            let pc = BASE + PAGE_SIZE - (opcode.len() + prefixes.len()) as u64;
+            let mut code = prefixes;
+            code.extend_from_slice(opcode);
+            mem.write_init(pc, &code).unwrap();
+            let mut v = backend.new_vcpu(pc, STACK).unwrap();
+            v.set_reg(1, u64::MAX);
+            // The following fetch faults, but the timestamp read has completed.
+            assert_eq!(
+                run(v.as_mut(), &mut mem, true),
+                Exit::MemFault {
+                    addr: BASE + PAGE_SIZE,
+                    write: false
+                }
+            );
+            assert_eq!(v.pc(), BASE + PAGE_SIZE);
+            assert_eq!((v.reg(0), v.reg(2)), (1, 0));
+            assert_eq!(v.reg(1), if opcode.len() == 3 { 0 } else { u64::MAX });
+        }
     }
 }
 
 #[test]
-fn rdtsc_can_cross_a_page_boundary() {
-    let Some(backend) = backend() else { return };
-    let mut mem = GuestMemory::new(BASE, 64 * 1024);
-    mem.map(BASE, 2 * PAGE_SIZE, Prot::rx()).unwrap();
-    let pc = BASE + PAGE_SIZE - 1;
-    mem.write_init(pc, &[0x0f, 0x31, 0x0f, 0x05]).unwrap();
-    let mut v = backend.new_vcpu(pc, STACK).unwrap();
-    assert_eq!(run(v.as_mut(), &mut mem, true), Exit::Syscall);
-    assert_eq!((v.reg(0), v.reg(2)), (1, 0));
+fn timestamps_can_cross_a_page_boundary() {
+    for opcode in [&[0x0f, 0x31][..], &[0x0f, 0x01, 0xf9][..]] {
+        for split in 1..opcode.len() {
+            let Some(backend) = backend() else { return };
+            let mut mem = GuestMemory::new(BASE, 64 * 1024);
+            mem.map(BASE, 2 * PAGE_SIZE, Prot::rx()).unwrap();
+            let pc = BASE + PAGE_SIZE - split as u64;
+            let mut code = opcode.to_vec();
+            code.extend_from_slice(&[0x0f, 0x05]);
+            mem.write_init(pc, &code).unwrap();
+            let mut v = backend.new_vcpu(pc, STACK).unwrap();
+            assert_eq!(run(v.as_mut(), &mut mem, true), Exit::Syscall);
+            assert_eq!((v.reg(0), v.reg(2)), (1, 0));
+        }
+    }
 }
 
 #[test]
@@ -147,7 +168,7 @@ fn unrelated_gp_and_ud_recover_the_original_user_state() {
             ][..],
             false,
         ), // 16 bytes: #GP
-        (&[0x0f, 0x01, 0xf9][..], true), // masked RDTSCP
+        (&[0xf0, 0x0f, 0x01, 0xf9][..], true), // LOCK RDTSCP
         (&[0x48, 0x0f, 0xc7, 0xf0][..], true), // masked RDRAND RAX
         (&[0x48, 0x0f, 0xc7, 0xf8][..], true), // masked RDSEED RAX
     ] {
@@ -184,34 +205,43 @@ fn unrelated_gp_and_ud_recover_the_original_user_state() {
 }
 
 #[test]
-fn rdtsc_preserves_flags() {
-    let Some(backend) = backend() else { return };
-    let mut mem = GuestMemory::new(BASE, 64 * 1024);
-    mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
-    mem.map(STACK - PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
-    mem.write_init(STACK - 8, &[0; 8]).unwrap();
-    // STD; STC; RDTSC; PUSHFQ; POP RBX; SYSCALL.
-    mem.write_init(BASE, &[0xfd, 0xf9, 0x0f, 0x31, 0x9c, 0x5b, 0x0f, 0x05])
-        .unwrap();
-    let mut v = backend.new_vcpu(BASE, STACK).unwrap();
-    assert_eq!(run(v.as_mut(), &mut mem, true), Exit::Syscall);
-    assert_eq!(v.reg(0), 1);
-    assert_eq!(v.reg(3), 0x603, "CF, DF, IF and the fixed bit survive");
-    assert_eq!(v.reg(11), 0x603, "SYSCALL's saved flags");
-    assert_eq!(v.reg(4), STACK);
+fn timestamp_reads_preserve_flags() {
+    for opcode in [&[0x0f, 0x31][..], &[0x0f, 0x01, 0xf9][..]] {
+        let Some(backend) = backend() else { return };
+        let mut mem = GuestMemory::new(BASE, 64 * 1024);
+        mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+        mem.map(STACK - PAGE_SIZE, PAGE_SIZE, Prot::rw()).unwrap();
+        mem.write_init(STACK - 8, &[0; 8]).unwrap();
+        // STD; STC; timestamp read; PUSHFQ; POP RBX; SYSCALL.
+        let mut code = vec![0xfd, 0xf9];
+        code.extend_from_slice(opcode);
+        code.extend_from_slice(&[0x9c, 0x5b, 0x0f, 0x05]);
+        mem.write_init(BASE, &code).unwrap();
+        let mut v = backend.new_vcpu(BASE, STACK).unwrap();
+        assert_eq!(run(v.as_mut(), &mut mem, true), Exit::Syscall);
+        assert_eq!(v.reg(0), 1);
+        assert_eq!(v.reg(3), 0x603, "CF, DF, IF and the fixed bit survive");
+        assert_eq!(v.reg(11), 0x603, "SYSCALL's saved flags");
+        assert_eq!(v.reg(4), STACK);
+    }
 }
 
 #[test]
 fn timestamp_trap_loop_still_yields() {
-    let Some(backend) = backend() else { return };
-    let mut mem = GuestMemory::new(BASE, 64 * 1024);
-    mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
-    mem.write_init(BASE, &[0x0f, 0x31, 0xeb, 0xfc]).unwrap(); // RDTSC; JMP back
-    let mut v = backend.new_vcpu(BASE, STACK).unwrap();
-    v.reconcile(&mut mem).unwrap();
-    let started = std::time::Instant::now();
-    for _ in 0..3 {
-        assert_eq!(v.run_bare().unwrap(), Exit::Interrupted);
+    for code in [
+        &[0x0f, 0x31, 0xeb, 0xfc][..],
+        &[0x0f, 0x01, 0xf9, 0xeb, 0xfb][..],
+    ] {
+        let Some(backend) = backend() else { return };
+        let mut mem = GuestMemory::new(BASE, 64 * 1024);
+        mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+        mem.write_init(BASE, code).unwrap(); // timestamp read; JMP back
+        let mut v = backend.new_vcpu(BASE, STACK).unwrap();
+        v.reconcile(&mut mem).unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            assert_eq!(v.run_bare().unwrap(), Exit::Interrupted);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
-    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }

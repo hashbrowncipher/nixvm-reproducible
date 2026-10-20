@@ -88,6 +88,23 @@ fn interpreter_reports_the_fixed_identity_and_avx_profile() {
     assert_eq!(answers[6], [0, 0x0010_03a8, 0, 0x2000_0000]);
     assert_eq!(answers[11], [7, 832, 832, 0]);
     assert_eq!(answers[13], [256, 576, 0, 0]);
+    assert_ne!(answers[20][3] & (1 << 27), 0, "RDTSCP is advertised");
+}
+
+#[test]
+fn interpreter_rdtscp_returns_a_logical_timestamp_and_fixed_aux() {
+    let backend = nixvm::vcpu::interp_x86::X86Backend::new(Arch::X86_64).unwrap();
+    let mut mem = GuestMemory::new(BASE, 64 * 1024);
+    mem.map(BASE, PAGE_SIZE, Prot::rx()).unwrap();
+    // RDTSCP; MOV RSI, RCX; SYSCALL. Preserve TSC_AUX before SYSCALL clobbers RCX.
+    mem.write_init(BASE, &[0x0f, 0x01, 0xf9, 0x48, 0x89, 0xce, 0x0f, 0x05])
+        .unwrap();
+    let mut v = backend.new_vcpu(BASE, BASE + 0x8000).unwrap();
+    for index in [0, 1, 2] {
+        v.set_reg(index, u64::MAX);
+    }
+    until_syscall(v.as_mut(), &mut mem, false);
+    assert_eq!((v.reg(0), v.reg(2), v.reg(6)), (1, 0, 0));
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

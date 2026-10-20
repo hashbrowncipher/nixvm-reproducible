@@ -74,8 +74,8 @@ pub struct Vm {
     /// none). All address spaces share this pool, so it is registered exactly once.
     pool: Mutex<Option<std::sync::Arc<PhysMem>>>,
     next_vcpu_id: AtomicU32,
-    /// Logical time shared by every vcpu and address space in this VM. RDTSC
-    /// and syscall entry each advance it by one tick.
+    /// Logical time shared by every vcpu and address space in this VM. RDTSC,
+    /// RDTSCP and syscall entry each advance it by one tick.
     tsc: AtomicU64,
 }
 

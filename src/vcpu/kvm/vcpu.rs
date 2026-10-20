@@ -10,7 +10,7 @@
 //!   `syscall` saved in `rcx`/`r11`.
 //! * #PF, #GP and #UD enter supervisor HLT trampolines through the IDT. The
 //!   host recovers the original user state from the exception frame. CR4.TSD
-//!   traps RDTSC through #GP; we decode it and supply a logical counter.
+//!   traps RDTSC/RDTSCP through #GP; we decode them and supply a logical counter.
 //!
 //! Register state is cached host-side: refreshed from the vcpu after every
 //! `KVM_RUN`, flushed back (when dirty) before the next. That makes the
@@ -178,7 +178,7 @@ const CR0_LONG: u64 = 0x8005_0033;
 /// x87|SSE|AVX via `KVM_SET_XCRS`. Without OSXSAVE a runtime's AVX probe (which
 /// checks OSXSAVE then `xgetbv`) reports AVX unavailable and may fall back to a
 /// slower/rarer path.
-// TSD (bit 2) makes CPL3 RDTSC fault so it cannot expose the hardware clock.
+// TSD (bit 2) makes CPL3 RDTSC/RDTSCP fault so they cannot expose the hardware clock.
 const CR4_LONG: u64 = 0x620 | 0x4_0000 | (1 << 2);
 
 /// `XCR0` value: enable x87 (bit 0), SSE (bit 1) and AVX (bit 2) xsave state.
@@ -637,10 +637,17 @@ impl KvmVcpu {
                         self.regs.rip,
                     );
                     match decoded {
-                        Ok(instruction) if instruction.code() == Code::Rdtsc => {
+                        Ok(instruction)
+                            if matches!(instruction.code(), Code::Rdtsc | Code::Rdtscp) =>
+                        {
                             let tsc = self.vm.tick();
                             self.regs.rax = u64::from(tsc as u32);
                             self.regs.rdx = tsc >> 32;
+                            if instruction.code() == Code::Rdtscp {
+                                // Fixed TSC_AUX: neither host CPU identity nor
+                                // guest thread migration affects this value.
+                                self.regs.rcx = 0;
+                            }
                             self.regs.rip = instruction.next_ip();
                             // Fault delivery sets RF in the saved image. The
                             // emulated instruction completed, so consume RF.

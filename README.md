@@ -154,8 +154,9 @@ The x86 CPU identity and feature bits come from `cpuid.toml`, embedded at build
 time for both KVM and the interpreter. The profile includes AVX/AVX2 and a fixed
 832-byte x87/SSE/YMM XSAVE layout. KVM checks host support and rejects an
 incompatible hardware backend; automatic backend selection can use the interpreter.
-`/proc/cpuinfo` and ELF hardware capabilities use the same profile. CPUID feature
-masking does not itself intercept instructions such as `RDRAND` or virtualize time.
+`/proc/cpuinfo` and ELF hardware capabilities use the same profile. KVM emulates
+`RDTSC` and `RDTSCP` with a shared logical counter. See [CPU instruction policy](docs/cpu.md)
+for timestamp and randomness behavior.
 
 ## Default sandbox layout
 
