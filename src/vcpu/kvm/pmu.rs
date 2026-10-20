@@ -539,6 +539,12 @@ mod tests {
     }
 
     #[test]
+    fn homogeneous_alder_lake_does_not_require_a_hybrid_core_type() {
+        let profile = Profile::select(b"GenuineIntel", 6, 0x97, 0).unwrap();
+        assert_eq!(profile.event, 0x11c4);
+    }
+
+    #[test]
     fn event_abi_is_pinned_guest_userspace_only() {
         let attributes = EventAttr::new(Profile {
             event: 0x1c4,
