@@ -405,6 +405,56 @@ mod tests {
     }
 
     #[test]
+    fn pending_pmu_signal_can_be_drained_after_confinement() {
+        child(
+            || {
+                // Queue on this thread before filtering; only signal waiting
+                // and process exit are needed after confinement takes effect.
+                unsafe {
+                    let mut blocked: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&raw mut blocked);
+                    libc::sigaddset(&raw mut blocked, 41);
+                    assert_eq!(
+                        libc::pthread_sigmask(
+                            libc::SIG_BLOCK,
+                            &raw const blocked,
+                            std::ptr::null_mut()
+                        ),
+                        0
+                    );
+                    assert_eq!(libc::pthread_kill(libc::pthread_self(), 41), 0);
+                    strict();
+                    let timeout = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    };
+                    assert_eq!(
+                        libc::sigtimedwait(
+                            &raw const blocked,
+                            std::ptr::null_mut(),
+                            &raw const timeout
+                        ),
+                        41
+                    );
+                    assert_eq!(
+                        libc::sigtimedwait(
+                            &raw const blocked,
+                            std::ptr::null_mut(),
+                            &raw const timeout
+                        ),
+                        -1
+                    );
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::EAGAIN)
+                    );
+                }
+            },
+            None,
+        );
+    }
+
+    #[test]
     fn unauthorized_host_syscalls_kill_the_subprocess() {
         for number in [
             libc::SYS_open,

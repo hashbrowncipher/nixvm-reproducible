@@ -544,6 +544,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_guard_drains_pending_overflows_without_consuming_other_signals() {
+        // Keep the test's blocked signals on a dedicated thread. Its pending
+        // signals disappear when it exits, including if an assertion fails.
+        std::thread::spawn(|| {
+            // SAFETY: valid signal sets; pthread_kill targets this same thread.
+            unsafe {
+                let mut blocked: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&raw mut blocked);
+                libc::sigaddset(&raw mut blocked, SIGNAL);
+                libc::sigaddset(&raw mut blocked, libc::SIGUSR1);
+                assert_eq!(
+                    libc::pthread_sigmask(
+                        libc::SIG_BLOCK,
+                        &raw const blocked,
+                        std::ptr::null_mut()
+                    ),
+                    0
+                );
+                assert_eq!(libc::pthread_kill(libc::pthread_self(), libc::SIGUSR1), 0);
+                for _ in 0..3 {
+                    assert_eq!(libc::pthread_kill(libc::pthread_self(), SIGNAL), 0);
+                }
+                // No perf or KVM device is needed to exercise guard cleanup.
+                drop(RunGuard {
+                    counter: -1,
+                    vcpu: -1,
+                    stepping: false,
+                    host: None,
+                    target: None,
+                });
+                let mut pending: libc::sigset_t = std::mem::zeroed();
+                assert_eq!(libc::sigpending(&raw mut pending), 0);
+                assert_eq!(libc::sigismember(&raw const pending, SIGNAL), 0);
+                assert_eq!(libc::sigismember(&raw const pending, libc::SIGUSR1), 1);
+                let mut mask: libc::sigset_t = std::mem::zeroed();
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask),
+                    0
+                );
+                assert_eq!(libc::sigismember(&raw const mask, SIGNAL), 1);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
     fn solo_execution_counts_without_consuming_fairness_budget() {
         let mut pmu = Pmu::new(8);
         pmu.budget.account(100, false, None, false).unwrap();
