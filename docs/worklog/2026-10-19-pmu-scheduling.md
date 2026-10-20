@@ -27,22 +27,30 @@ python3 ../../../../tools/sealed.py cargo test --offline --locked --quiet
 python3 ../../../../tools/sealed.py cargo clippy --offline --locked --all-targets -- -D warnings -A clippy::field-reassign-with-default
 ```
 
-The default suite passed, including 729 library tests. Two existing library
-tests and the two new PMU hardware tests were ignored. Clippy's allowance is
-for an existing test initializer in `src/vcpu/kvm/vm.rs`. Formatting used the
+The default suite passed, including 730 library tests. Two existing library
+tests and the two PMU hardware tests are ignored by default. The PMU tests also
+passed when explicitly enabled. Clippy's allowance is for an existing test initializer in `src/vcpu/kvm/vm.rs`. Formatting used the
 parent repository's `tools/format.py` runner with this crate's explicit manifest;
 its CLI does not discover a standalone crate at the Git root.
 
-Hardware validation remains open: this environment has no `/dev/kvm`. Run:
+Hardware validation passed outside the assistant sandbox. The sandbox hides
+`/dev/kvm`; the host exposes it and permits the guest-only perf events with
+`perf_event_paranoid=2`. The command was:
 
 ```sh
-cargo test --offline --locked --test pmu -- --ignored --test-threads=1
+python3 ../../../../tools/sealed.py cargo test --offline --locked --test pmu -- --ignored --test-threads=1 --nocapture
 ```
 
-Those tests require actual KVM and guest-only perf access. They compare PMU
+Both hardware tests passed on the host's Intel Core i5-12500T. They compare PMU
 counts and stopping PCs against a guest loop counter, exercise repeated slices
 and syscall exits, and check that host stepping does not expose TF. They fail
 when explicitly requested without the required hardware.
+
+The first hardware run exposed CPU detection rejecting a P-core-only Alder Lake
+part. This CPU reports a zero core type and clears CPUID's hybrid feature bit.
+Commit `ffd66a4` recorded a failing regression before the fix. Detection accepts
+that homogeneous combination while still rejecting a missing core type on a CPU
+that reports hybrid support. E-core execution remains untested on this host.
 
 Guest clocks, entropy, filesystem publication and host-process forks are outside
 this change. A branch-free loop cannot exhaust a conditional-branch budget.

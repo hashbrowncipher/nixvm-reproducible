@@ -82,6 +82,7 @@ impl Profile {
         family: u32,
         model: u32,
         core_type: u32,
+        hybrid_cpu: bool,
     ) -> Result<Self, VcpuError> {
         if vendor != b"GenuineIntel" || family != 6 {
             return Err(error(
@@ -94,6 +95,9 @@ impl Profile {
             | 0xa5 | 0xa6 => 0x01c4,
             0x6a | 0x6c | 0x7d | 0x7e | 0x8c | 0x8d | 0xa7 | 0x8f | 0xcf => 0x11c4,
             0x97 | 0x9a | 0xb7 | 0xba | 0xbf => match core_type {
+                // P-core-only parts do not advertise CPUID's hybrid feature
+                // and can return zero for the core-type leaf.
+                0 if !hybrid_cpu => 0x11c4,
                 0x40 => 0x11c4,
                 0x20 => 0x7ec4,
                 _ => return Err(error("unknown Intel hybrid core type")),
@@ -134,11 +138,12 @@ impl Profile {
 
     fn detect() -> Result<Self, VcpuError> {
         // SAFETY: CPUID is available on x86-64. Affinity is fixed by the caller.
-        let (identity, signature, hybrid) = unsafe {
+        let (identity, signature, hybrid, structured) = unsafe {
             (
                 std::arch::x86_64::__cpuid(0),
                 std::arch::x86_64::__cpuid(1),
                 std::arch::x86_64::__cpuid(0x1a),
+                std::arch::x86_64::__cpuid_count(7, 0),
             )
         };
         let mut vendor = [0u8; 12];
@@ -152,7 +157,8 @@ impl Profile {
         } else {
             0
         };
-        let mut profile = Self::select(&vendor, family, model, core_type)?;
+        let hybrid_cpu = identity.eax >= 7 && structured.edx & (1 << 15) != 0;
+        let mut profile = Self::select(&vendor, family, model, core_type, hybrid_cpu)?;
         // Hybrid PMUs have separate kernel type ids. PERF_TYPE_RAW alone can
         // select the wrong PMU on an efficiency core, even with CPU affinity.
         if matches!(core_type, 0x20 | 0x40) {
@@ -527,20 +533,20 @@ mod tests {
             (0x97, 0x20, 0x7ec4),
         ] {
             assert_eq!(
-                Profile::select(b"GenuineIntel", 6, model, core)
+                Profile::select(b"GenuineIntel", 6, model, core, core != 0)
                     .unwrap()
                     .event,
                 event
             );
         }
-        assert!(Profile::select(b"AuthenticAMD", 0x19, 0, 0).is_err());
-        assert!(Profile::select(b"GenuineIntel", 6, 0xff, 0).is_err());
-        assert!(Profile::select(b"GenuineIntel", 6, 0x97, 0).is_err());
+        assert!(Profile::select(b"AuthenticAMD", 0x19, 0, 0, false).is_err());
+        assert!(Profile::select(b"GenuineIntel", 6, 0xff, 0, false).is_err());
+        assert!(Profile::select(b"GenuineIntel", 6, 0x97, 0, true).is_err());
     }
 
     #[test]
     fn homogeneous_alder_lake_does_not_require_a_hybrid_core_type() {
-        let profile = Profile::select(b"GenuineIntel", 6, 0x97, 0).unwrap();
+        let profile = Profile::select(b"GenuineIntel", 6, 0x97, 0, false).unwrap();
         assert_eq!(profile.event, 0x11c4);
     }
 
