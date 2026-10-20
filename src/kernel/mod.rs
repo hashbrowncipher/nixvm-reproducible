@@ -55,6 +55,8 @@ mod sys_misc;
 #[cfg(test)]
 mod testutil;
 mod time;
+#[cfg(test)]
+mod timed_wait_regression;
 mod unavailable;
 mod xattr;
 
