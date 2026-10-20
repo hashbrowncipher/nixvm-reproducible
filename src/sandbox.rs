@@ -363,7 +363,6 @@ pub struct Sandbox {
 struct PreparedRuntime {
     backend: Box<dyn Backend>,
     mem: GuestMemory,
-    workers: crate::kernel::PreparedWorkers,
 }
 
 impl Sandbox {
@@ -409,7 +408,7 @@ impl Sandbox {
         })?;
 
         let arch = self.guest_arch(&elf, &path)?;
-        let (backend, mut mem, workers) = if let Some(prepared) = prepared {
+        let (backend, mut mem) = if let Some(prepared) = prepared {
             let backend = if prepared.backend.guest_arch() == arch {
                 prepared.backend
             } else {
@@ -418,7 +417,7 @@ impl Sandbox {
                 }
                 Box::new(InterpBackend::new(arch)?) as Box<dyn Backend>
             };
-            (backend, prepared.mem, Some(prepared.workers))
+            (backend, prepared.mem)
         } else {
             (
                 self.backend(arch)?,
@@ -427,7 +426,6 @@ impl Sandbox {
                     GUEST_VSIZE,
                     round_up_page(self.config.mem_bytes),
                 ),
-                None,
             )
         };
         let spec = ProcessSpec {
@@ -468,11 +466,7 @@ impl Sandbox {
         // ENETUNREACH). No-op unless the env var is set.
         crate::vm::install_egress(&mut kernel);
         calibrate_vdso(vcpu.as_ref(), &mem);
-        if let Some(workers) = workers {
-            Ok(kernel.run_prepared(vcpu, mem, &workers)?)
-        } else {
-            Ok(kernel.run(vcpu, mem)?)
-        }
+        Ok(kernel.run(vcpu, mem)?)
     }
 
     #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -522,12 +516,12 @@ impl Sandbox {
         }
         confinement::begin()?;
         let backend = sandbox.backend(sandbox.config.arch)?;
-        let kvm = backend.name() == "kvm";
         let mem = GuestMemory::new_split(
             GUEST_BASE,
             GUEST_VSIZE,
             round_up_page(sandbox.config.mem_bytes),
         );
+        #[cfg_attr(not(feature = "erofs"), allow(unused_mut))] // EROFS adds image fds below.
         let mut resources = backend.prepare_confinement(sandbox.config.vcpu_capacity, &mem)?;
         let mut directories = Vec::new();
         let mut mounts = MountTable::new();
@@ -591,13 +585,6 @@ impl Sandbox {
             ));
         }
         confinement::restrict_filesystem(&directories)?;
-        let count = if sandbox.config.ncpus > 1 {
-            sandbox.config.ncpus
-        } else {
-            0
-        };
-        let (workers, perf) = crate::kernel::PreparedWorkers::new(count, kvm)?;
-        resources.perf.extend(perf);
         confinement::drop_thread_privileges()?;
         resources.install(!directories.is_empty())?;
         // No guest parsing or decompression occurs above this boundary.
@@ -653,14 +640,7 @@ impl Sandbox {
         );
         mounts.mount("/proc", Box::new(ProcFs::new(sandbox.config.ncpus)));
         mounts.mount("/sys", Box::new(SysFs::new(sandbox.config.ncpus)));
-        sandbox.run_mounts(
-            mounts,
-            Some(PreparedRuntime {
-                backend,
-                mem,
-                workers,
-            }),
-        )
+        sandbox.run_mounts(mounts, Some(PreparedRuntime { backend, mem }))
     }
 
     /// PID 1's path and argv. Booted mode runs init (config override, else

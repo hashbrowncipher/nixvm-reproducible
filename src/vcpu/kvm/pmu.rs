@@ -429,7 +429,7 @@ impl Pmu {
     }
 
     /// Count every run; optional targets add exact virtual-time boundaries.
-    pub fn start(&mut self, vcpu: i32, target: Option<u64>) -> Result<RunGuard, VcpuError> {
+    pub fn start(vcpu: i32, target: Option<u64>) -> Result<RunGuard, VcpuError> {
         let host = if PREPARED.get() {
             None
         } else {

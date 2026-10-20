@@ -519,6 +519,8 @@ mod tests {
         assert_eq!(size_of::<kvm_dtable>(), 16);
         assert_eq!(size_of::<kvm_sregs>(), 312);
         assert_eq!(size_of::<kvm_fpu>(), 416);
+        assert_eq!(size_of::<kvm_vcpu_events>(), 64);
+        assert_eq!(size_of::<kvm_debugregs>(), 128);
         assert_eq!(size_of::<kvm_userspace_memory_region>(), 32);
         assert_eq!(size_of::<kvm_msr_entry>(), 16);
         assert_eq!(size_of::<kvm_cpuid_entry2>(), 40);

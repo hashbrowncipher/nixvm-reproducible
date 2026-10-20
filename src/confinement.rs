@@ -571,14 +571,26 @@ mod tests {
             || {
                 begin().unwrap();
                 restrict_filesystem(&[]).unwrap();
-                let (workers, _) = crate::kernel::PreparedWorkers::new(2, false).unwrap();
+                let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+                let (run_tx, run_rx) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let _ = std::collections::hash_map::RandomState::new();
+                    drop_thread_privileges().unwrap();
+                    ready_tx.send(()).unwrap();
+                    run_rx.recv().unwrap();
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("worker", 42);
+                    assert_eq!(map["worker"], 42);
+                    unsafe {
+                        libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
+                    }
+                });
+                ready_rx.recv().unwrap();
                 drop_thread_privileges().unwrap();
                 Resources::default().install(false).unwrap();
-                workers.probe(|| unsafe {
-                    libc::syscall(libc::SYS_socket, libc::AF_INET, libc::SOCK_STREAM, 0);
-                });
-                // Drop joins the prepared worker; the forbidden syscall must kill us.
-                drop(workers);
+                run_tx.send(()).unwrap();
+                // Joining verifies that the prepared worker executes the forbidden call.
+                worker.join().unwrap();
             },
             Some(libc::SIGSYS),
         );

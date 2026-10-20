@@ -1,12 +1,12 @@
 //! Browser demo entry point.
 //!
-//! [`run_elf`] loads a statically-linked ELF64 image (aarch64 or x86-64,
+//! `run_elf` loads a statically-linked ELF64 image (aarch64 or x86-64,
 //! auto-detected from the ELF header's `e_machine` field), runs it to
 //! completion on the matching software interpreter
 //! ([`crate::vcpu::interp`] for aarch64, [`crate::vcpu::interp_x86`] for
 //! x86-64), and returns a JSON string with the guest's captured
 //! stdout/stderr, exit code, and unsupported-syscall ledger, for
-//! `web/index.html` to render. [`run_elf_with_argv`] is the same but lets the
+//! `web/index.html` to render. `run_elf_with_argv` is the same but lets the
 //! caller supply `argv`.
 //!
 //! ## Manual verification
@@ -29,14 +29,14 @@
 //!
 //! ## Capturing guest stdout/stderr
 //!
-//! [`Kernel`] already exposes [`Kernel::set_stdout`]/[`Kernel::set_stderr`]
+//! [`Kernel`](crate::kernel::Kernel) already exposes [`Kernel::set_stdout`](crate::kernel::Kernel::set_stdout)/[`Kernel::set_stderr`](crate::kernel::Kernel::set_stderr)
 //! (see `src/kernel/mod.rs`) to redirect guest fd 1/2 away from the host's
 //! real stdout/stderr — which don't exist in a browser tab — into an
 //! in-memory sink. No new kernel seam was needed for this.
 //!
 //! [`crate::sandbox::Sandbox::exec_elf`] does not expose that hook (it always
 //! wires the real host stdout/stderr), so this module bypasses `Sandbox` and
-//! talks to [`crate::loader`], the [`crate::vcpu`] backends, and [`Kernel`]
+//! talks to [`crate::loader`], the [`crate::vcpu`] backends, and [`Kernel`](crate::kernel::Kernel)
 //! directly — mirroring the wiring in `src/bin/run-elf.rs`.
 //!
 //! There is also no host filesystem to share into a browser tab, so the guest
@@ -46,9 +46,9 @@
 //! ## Diagnostics surfaced to the page
 //!
 //! Besides stdout/stderr/exit code, the JSON includes the guest architecture
-//! nixvm detected and [`Kernel::unsupported`]'s ledger of syscalls the guest
+//! nixvm detected and [`Kernel::unsupported`](crate::kernel::Kernel::unsupported)'s ledger of syscalls the guest
 //! attempted that nixvm doesn't implement (raw syscall number -> attempt
-//! count) — there is no public step/instruction counter on [`Kernel`] to
+//! count) — there is no public step/instruction counter on [`Kernel`](crate::kernel::Kernel) to
 //! surface a wall-independent step count, so this is the richest telemetry
 //! available through its public API today.
 

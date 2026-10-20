@@ -474,7 +474,7 @@ impl KvmVcpu {
         // exits is broken out after the quantum: the timer signal interrupts
         // KVM_RUN (EINTR), which becomes Exit::Interrupted below. Disarmed right
         // after so a late expiry can't fire into an unrelated later slice.
-        let counter = self.pmu.start(self.fd.0, target)?;
+        let counter = pmu::Pmu::start(self.fd.0, target)?;
         let stepping = counter.stepping;
         if let Some(q) = quantum {
             preempt::arm(q);

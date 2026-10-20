@@ -262,12 +262,12 @@ policies.
 ## Linux host confinement
 
 The Linux x86-64 CLI confines its host process before parsing guest files or
-decompressing images. It opens images and KVM resources first, prepares worker
-threads, timers and perf counters, closes inherited descriptors above stderr,
-and drops capabilities, dumpability and new privileges. Landlock restricts file
-contents and seccomp applies to every worker. Landlock ABI 5, close_range and
-seccomp thread synchronization are required;
-confinement setup errors stop the run.
+decompressing images. It closes inherited descriptors above stderr, opens images
+and KVM resources, and prepares timers, affinity, signal masks and perf counters.
+It then drops capabilities, dumpability and new privileges. Landlock restricts
+file contents and seccomp applies to every thread. Landlock ABI 5 (Linux 6.10+),
+close_range and seccomp thread synchronization are required. Confinement setup
+errors stop the run. Inherited READ_IMPLIES_EXEC personality is rejected.
 
 No host directory is mounted by default. `--workdir DIR` explicitly mounts
 `DIR` at `/work`; `--root DIR` supplies a read-only directory root. Library
