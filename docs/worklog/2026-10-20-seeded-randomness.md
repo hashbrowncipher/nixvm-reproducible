@@ -43,3 +43,38 @@ Capital notes:
    root-Cargo support would remove the adapters; it is cheap enough to do before
    the next change. The shared randomness source now provides one place for
    future seed and replay policy changes.
+
+## Review corrections
+
+Independent review reproduced two gaps: constructor binding skipped DevFs behind
+Overlay or LayerStack, and mmap could cache random-device bytes and discarded
+writes. Added regression tests and confirmed four expected failures before
+committing the tests in `3f9b5ce`. The fixes bind every nested DevFs through a
+recursive visitor and reject random-character-device mmap with `ENODEV` before
+address-space or stream changes. Metadata identifies the devices through aliases
+and wrappers. Clone reseeding and its seed recipe are unchanged. The README now
+states that deliberate host-device passthrough remains host I/O.
+
+Validation used the same sealed offline environment and Rust 1.93.1:
+
+- Focused random tests: 12 passed, including nested composition and clone reseeding,
+  private/shared/shared-validate mmap denial, MAP_FIXED preservation, arena and
+  stream preservation, syscall writes/reads and the `/dev/zero` control.
+- Default suite: 801 passed; erofs,fstool,tunnel suite: 832 passed. Each retained
+  two existing ignored tests.
+- Strict all-target Clippy passed with only the known existing
+  `field_reassign_with_default` lint allowed. wasm32 core, public rustdoc with
+  warnings denied, scoped root-crate Rust formatting and `git diff --check` passed.
+- Independent re-review of these corrections remains a separate pending step.
+
+Capital notes, ranked:
+
+1. Recursive filesystem capabilities remove assumptions about mount depth. The
+   visitor addresses this debt within the correction.
+2. Syscall-level random-device tests exercise page-cache interactions omitted by
+   direct backend reads. The added tests address this gap without another Vcpu harness.
+3. Standalone-crate support in the parent validation helpers would remove the
+   adapter and avoid unrelated vendor-toolchain discovery during formatting.
+
+Fix agent: GPT-6 family; exact model identifier and token/tool counters were not
+exposed. The correction changed nine files (342 insertions, 19 deletions).

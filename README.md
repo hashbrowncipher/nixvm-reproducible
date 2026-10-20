@@ -194,8 +194,10 @@ for timestamp and randomness behavior.
 
 ### Seeded randomness
 
-`getrandom()`, `/dev/random`, and `/dev/urandom` consume one sandbox-wide
-ChaCha20 byte stream from `rand_chacha`, without reading host entropy or time.
+`getrandom()` and the synthesized `/dev/random` and `/dev/urandom` devices
+consume one sandbox-wide ChaCha20 byte stream from `rand_chacha`, without
+reading host entropy or time. Explicitly passed-through host devices remain
+host I/O.
 The initial seed defaults to 32 zero bytes. Set it with
 `Sandbox::builder().random_seed(seed)`, where `seed` is `[u8; 32]`, or pass
 `--random-seed` followed by 64 hexadecimal digits to `nixvm run`.
@@ -205,7 +207,8 @@ A successful clone without `CLONE_VM` reseeds the shared stream for every
 task and device mount. It consumes the next 32 bytes, XORs the child's
 little-endian 32-bit PID into the first four bytes, and uses that as a fresh
 ChaCha20 seed. Clones with `CLONE_VM`, including vfork, do not reseed.
-Device writes are discarded, and mounting devtmpfs joins the current stream.
+Device writes are discarded, random-device mmap returns `ENODEV`, and
+mounting devtmpfs joins the current stream.
 Read boundaries preserve every byte. Replay requires the same seed, random
 reads and clone order; host scheduling, clocks and external I/O remain separate.
 ELF `AT_RANDOM` and CPU randomness instructions retain their own deterministic

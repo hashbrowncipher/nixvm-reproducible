@@ -318,8 +318,8 @@ fn eagain() -> io::Error {
 }
 
 impl MountFs for DevFs {
-    fn as_devfs_mut(&mut self) -> Option<&mut Self> {
-        Some(self)
+    fn visit_devfs_mut(&mut self, visitor: &mut dyn FnMut(&mut Self)) {
+        visitor(self);
     }
 
     fn read_only(&self) -> bool {

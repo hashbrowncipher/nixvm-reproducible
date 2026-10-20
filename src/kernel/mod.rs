@@ -7919,11 +7919,23 @@ impl Kernel {
         // fd fails before we disturb the address space.
         let file_src = if flags & MAP_ANONYMOUS == 0 {
             match cx.cur.fds.get(fd as i32) {
-                // A shared mapping of /dev/zero is anonymous shared memory.
-                Some(Fd::File { path, .. }) if path == "/dev/zero" && flags & MAP_SHARED != 0 => {
-                    None
+                Some(Fd::File { path, .. }) => {
+                    // Random devices have no mappable storage: page caching would
+                    // replay consumed bytes and retain discarded device writes.
+                    if vfs.stat(path).is_some_and(|attrs| {
+                        attrs.kind == NodeKind::CharDevice
+                            && (attrs.rdev == stat::makedev(1, 8)
+                                || attrs.rdev == stat::makedev(1, 9))
+                    }) {
+                        return err(Errno::ENODEV);
+                    }
+                    // A shared mapping of /dev/zero is anonymous shared memory.
+                    if path == "/dev/zero" && flags & MAP_SHARED != 0 {
+                        None
+                    } else {
+                        Some(path.clone())
+                    }
                 }
-                Some(Fd::File { path, .. }) => Some(path.clone()),
                 Some(_) => return err(Errno::EACCES), // mmap of pipe/socket/dir
                 None => return err(Errno::EBADF),
             }

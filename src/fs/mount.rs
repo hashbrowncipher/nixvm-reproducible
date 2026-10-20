@@ -263,9 +263,9 @@ impl MountTable {
 
     pub(crate) fn set_random_source(&mut self, random: &RandomSource) {
         for mount in &mut self.mounts {
-            if let Some(devfs) = mount.fs.as_devfs_mut() {
+            mount.fs.visit_devfs_mut(&mut |devfs| {
                 devfs.set_random_source(random.clone());
-            }
+            });
         }
     }
 

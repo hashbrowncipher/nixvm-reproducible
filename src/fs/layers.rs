@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-use super::{Attrs, DirEntry, MountFs, NodeKind, SetTime};
+use super::{Attrs, DevFs, DirEntry, MountFs, NodeKind, SetTime};
 
 #[derive(Debug)]
 pub struct LayerStack {
@@ -136,6 +136,12 @@ fn overlay_name(name: &str) -> bool {
 }
 
 impl MountFs for LayerStack {
+    fn visit_devfs_mut(&mut self, visitor: &mut dyn FnMut(&mut DevFs)) {
+        for layer in &mut self.layers {
+            layer.visit_devfs_mut(visitor);
+        }
+    }
+
     fn stat(&mut self, rel: &str) -> Option<Attrs> {
         self.try_stat(rel).ok()
     }

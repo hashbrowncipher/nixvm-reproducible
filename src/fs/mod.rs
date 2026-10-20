@@ -232,10 +232,9 @@ pub trait MountFs: std::fmt::Debug + Send {
         None
     }
 
-    /// Device filesystem whose randomness the kernel wires to its shared stream.
-    fn as_devfs_mut(&mut self) -> Option<&mut DevFs> {
-        None
-    }
+    /// Visit every device filesystem whose randomness the kernel binds to its
+    /// shared stream. Composed backends forward the visitor to every child.
+    fn visit_devfs_mut(&mut self, _visitor: &mut dyn FnMut(&mut DevFs)) {}
 }
 
 fn erofs() -> io::Error {
