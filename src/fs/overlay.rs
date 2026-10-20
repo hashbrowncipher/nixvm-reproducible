@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
-use super::{Attrs, DirEntry, MountFs, NodeKind};
+use super::{Attrs, DevFs, DirEntry, MountFs, NodeKind};
 
 /// High bit set on an upper-layer inode so it can never collide with a
 /// lower-layer one. The upper (tmpfs, inodes from 2) and the lower (squashfs,
@@ -200,6 +200,12 @@ impl MountFs for Overlay {
         self.upper.set_clock(std::sync::Arc::clone(&clock));
         self.lower.set_clock(clock);
     }
+
+    fn visit_devfs_mut(&mut self, visitor: &mut dyn FnMut(&mut DevFs)) {
+        self.upper.visit_devfs_mut(visitor);
+        self.lower.visit_devfs_mut(visitor);
+    }
+
     fn read_only(&self) -> bool {
         false
     }

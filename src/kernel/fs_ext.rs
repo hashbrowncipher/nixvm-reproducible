@@ -70,7 +70,7 @@ impl Kernel {
             "tmpfs" | "ramfs" => Box::new(crate::fs::TmpFs::new()),
             "proc" => Box::new(crate::fs::ProcFs::new(self.ncpus)),
             "sysfs" => Box::new(crate::fs::SysFs::new(self.ncpus)),
-            "devtmpfs" => Box::new(crate::fs::DevFs::new()),
+            "devtmpfs" => Box::new(crate::fs::DevFs::with_random_source(self.random.clone())),
             "devpts" | "mqueue" | "cgroup" | "cgroup2" | "securityfs" | "debugfs" | "tracefs"
             | "bpf" | "fusectl" | "configfs" | "pstore" | "efivarfs" | "binfmt_misc"
             | "hugetlbfs" | "autofs" | "rpc_pipefs" | "nsfs" => return 0,

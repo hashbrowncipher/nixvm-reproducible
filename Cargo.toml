@@ -46,8 +46,8 @@ kvm = []    # KVM, Linux/x86-64 (x86-64 guests); arm64 KVM is Phase 10
 # Software CPU interpreter — the no-acceleration fallback (Phase 10).
 interp = []
 # Real on-disk filesystem images (ext2/3/4) via our `fstool` crate, for the
-# read-only guest root. Off by default so the core stays dependency-free and
-# wasm-buildable; only mounting a real image needs it.
+# read-only guest root. Only mounting a real image needs it; the core remains
+# wasm-buildable without it.
 fstool = ["dep:fstool"]
 # Host-opened EROFS images and a merged stack of immutable root layers.
 erofs = ["dep:rust-fs-erofs", "dep:rust-fs-core"]
@@ -63,7 +63,7 @@ targz = ["dep:compcol"]
 # into an in-memory squashfs (read-only lower of a copy-on-write overlay).
 wasm = ["dep:wasm-bindgen", "dep:console_error_panic_hook", "targz", "fstool", "tunnel"]
 # HTTP(S) fetching of guest root images (src/image.rs). Off by default so the
-# core stays dependency-free and wasm-buildable; sha256 verification is
+# core stays wasm-buildable; sha256 verification is
 # hand-rolled in image.rs so it needs no extra dep either way.
 fetch = ["dep:ureq"]
 # Guest networking over an L3 packet tunnel (src/tunnel.rs): guest sockets are
@@ -73,12 +73,14 @@ fetch = ["dep:ureq"]
 tunnel = ["dep:pktkit"]
 
 [dependencies]
+# Seeded guest randomness; rand_core is re-exported, and OS seeding is unused.
+rand_chacha = { version = "=0.10.0", default-features = false }
 # Portable runtime libraries are feature-gated. The KVM instruction decoder is
 # target-gated; the host-only CPUID parser is under build-dependencies.
 rust-fs-erofs = { version = "=0.4.1", path = "vendor/rust-fs-erofs", optional = true }
 rust-fs-core = { version = "=0.3.9", optional = true }
-# The core links no third-party runtime dependencies. Optional runtime libraries
-# are feature-gated; the host-only CPUID parser is under build-dependencies.
+# Filesystem, network and image-fetch libraries are feature-gated; the host-only
+# CPUID parser is under build-dependencies.
 # `gzip` lets us repack an Alpine .tar.gz minirootfs into an ext4 root image.
 # Since 0.4.28 each filesystem is its own feature (a `default-features = false`
 # build gets none and doesn't compile); enable the ones nixvm reads/builds:
