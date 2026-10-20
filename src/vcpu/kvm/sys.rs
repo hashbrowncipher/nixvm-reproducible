@@ -221,6 +221,8 @@ pub const MSR_IA32_LSTAR: u32 = 0xC000_0082;
 pub const MSR_IA32_CSTAR: u32 = 0xC000_0083;
 pub const MSR_IA32_FMASK: u32 = 0xC000_0084;
 pub const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
+/// `IA32_TSC_AUX`, which RDPID returns natively. RDTSCP is emulated.
+pub const MSR_TSC_AUX: u32 = 0xC000_0103;
 
 /// General-purpose registers (`KVM_GET_REGS`/`KVM_SET_REGS`). 144 bytes.
 /// Field order is the kernel's (rax, rbx, rcx, rdx, …), *not* the x86 register

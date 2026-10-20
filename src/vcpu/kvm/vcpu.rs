@@ -1216,6 +1216,56 @@ mod tests {
     }
 
     #[test]
+    fn recycled_slot_rdpid_ignores_a_stale_tsc_aux() {
+        use crate::vcpu::Prot;
+        let vm = match Vm::new() {
+            Ok(vm) => Arc::new(vm),
+            Err(error) => {
+                eprintln!("skipping KVM TSC_AUX reset test: {error}");
+                return;
+            }
+        };
+        let base = 0x1_0000;
+        let mut mem = GuestMemory::new(base, 64 * 1024);
+        mem.map(base, crate::vcpu::mem::PAGE_SIZE, Prot::rx())
+            .unwrap();
+        // MOV RAX, -1; RDPID RAX; SYSCALL.
+        mem.write_init(
+            base,
+            &[
+                0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff, 0xf3, 0x0f, 0xc7, 0xf8, 0x0f, 0x05,
+            ],
+        )
+        .unwrap();
+        vm.ensure_memslot(&mem).unwrap();
+        vm.prepare_pool(1).unwrap();
+        // Model a previous slot owner that left a different TSC_AUX behind.
+        let stale = KvmVcpu::create(vm.clone(), 100_000).unwrap();
+        let mut msrs = sys::kvm_msrs {
+            nmsrs: 1,
+            ..Default::default()
+        };
+        msrs.entries[0] = sys::kvm_msr_entry {
+            index: sys::MSR_TSC_AUX,
+            reserved: 0,
+            data: 7,
+        };
+        // SAFETY: `msrs` is a valid struct whose `nmsrs` bounds the entries.
+        let ret = unsafe { sys::ioctl(stale.fd.0, sys::KVM_SET_MSRS, std::ptr::from_ref(&msrs)) };
+        assert_eq!(ret, 1);
+        drop(stale);
+        let mut v = KvmVcpu::new(vm, base, base + 0x8000, 100_000).unwrap();
+        loop {
+            match v.run(&mut mem).unwrap() {
+                Exit::Interrupted => {}
+                Exit::Syscall => break,
+                other => panic!("unexpected guest exit: {other:?}"),
+            }
+        }
+        assert_eq!(v.reg(0), 0);
+    }
+
+    #[test]
     fn interrupted_user_pc_is_not_a_supervisor_exception_frame() {
         let vm = match Vm::new() {
             Ok(vm) => Arc::new(vm),
