@@ -30,6 +30,8 @@ use crate::vcpu::mem::{PAGE_SIZE, Prot};
 use crate::vcpu::{Exit, GuestMemory, Vcpu, VcpuError};
 
 mod attrs;
+#[cfg(test)]
+mod exec_tests;
 pub mod egress;
 mod fcntl;
 mod fd;
