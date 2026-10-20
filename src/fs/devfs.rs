@@ -629,6 +629,17 @@ mod tests {
     }
 
     #[test]
+    fn random_default_replays() {
+        let mut first = DevFs::new();
+        let mut second = DevFs::new();
+        let mut expected = [0; 64];
+        let mut actual = [0; 64];
+        first.read_at("random", 0, &mut expected).unwrap();
+        second.read_at("urandom", 0, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn urandom_fills_non_zero_bytes() {
         let mut fs = DevFs::new();
         let mut buf = [0u8; 64];

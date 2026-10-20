@@ -9667,6 +9667,28 @@ mod tests {
     }
 
     #[test]
+    fn getrandom_default_replays() {
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let (k, mut mem, mut v, mut cx) = setup();
+            let buf = 0x1_0000;
+            assert_eq!(
+                call(
+                    &k,
+                    &mut cx,
+                    &mut mem,
+                    &mut v,
+                    Sysno::Getrandom,
+                    [buf, 64, 0, 0, 0, 0]
+                ),
+                64
+            );
+            outputs.push(mem.read_vec(buf, 64).unwrap());
+        }
+        assert_eq!(outputs[0], outputs[1]);
+    }
+
+    #[test]
     fn getrandom_fills_buffer() {
         let (k, mut mem, mut v, mut cx) = setup();
         let buf = 0x1_0000;
