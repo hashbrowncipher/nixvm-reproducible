@@ -10,6 +10,7 @@ changing the caller. Failed loads preserve memory, identity, handlers and
 close-on-exec descriptors. Successful loads keep the KVM memslot and replace
 the page tables. Temporary images return their frames on failure. Exhaustion
 returns ENOMEM. NIXVM_TRACE includes the loader error.
+The pool temporarily holds both images until loading succeeds.
 
 Validation started at fd7aa99 with the committed Cargo.lock and installed
 Rust 1.93.1 on Linux x86-64. Both kernel regression tests failed before the fix:
@@ -26,6 +27,8 @@ executing /bin/true, and fork/exec of true and false. Each passed on the
 interpreter and KVM. The KVM cases also passed with
 NIXVM_BRANCH_QUANTUM=65536. The interpreter rejects that explicit setting by
 design. The Debian EROFS image was reused locally; nothing was downloaded.
+Its SHA-256 is
+`0cf879a77e81d846b9e07c49fea84aca074f2596ba54027228a23b704afc2510`.
 
 Debt and capital:
 

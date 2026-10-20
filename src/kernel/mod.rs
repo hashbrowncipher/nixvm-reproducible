@@ -4514,9 +4514,8 @@ impl Kernel {
         let spec = ProcessSpec { argv, envp };
         // Build the replacement before changing memory or process state. Both
         // address spaces use the same pool, keeping the KVM memslot valid.
-        let mut replacement = match mem.new_exec() {
-            Ok(memory) => memory,
-            Err(_) => return err(Errno::ENOMEM),
+        let Ok(mut replacement) = mem.new_exec() else {
+            return err(Errno::ENOMEM);
         };
         let loaded = if let Some(bytes) = interpreter {
             load_dynamic(&mut replacement, &elf, &bytes, &spec)

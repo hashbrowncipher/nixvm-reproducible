@@ -285,7 +285,7 @@ impl GuestMemory {
 
     /// Physical address of this address space's private kernel-stack frame, so a
     /// KVM vcpu can read the pushed `#PF` exception frame lock-free (no
-    /// `GuestMemory` borrow) on the SMP path. Changes on `fork`/`exec_reset`.
+    /// `GuestMemory` borrow) on the SMP path. Changes on fork and exec.
     #[must_use]
     #[cfg_attr(
         not(all(target_os = "linux", target_arch = "x86_64")),
@@ -1133,15 +1133,6 @@ impl GuestMemory {
         self.space.destroy(&mut self.fa.lock().unwrap(), &self.phys);
     }
 
-    /// Tear down the current page tables (returning their frames to the pool) and
-    /// install a fresh empty address space in the *same* pool — the `execve` seam.
-    /// The `CR3` changes; a KVM vcpu picks the new value up on its next run. The
-    /// loader then maps the new image into this same `GuestMemory`.
-    #[cfg(test)]
-    pub(crate) fn exec_reset(&mut self) {
-        self.reset_space();
-    }
-
     /// Release this address space's frames back to the pool on process exit,
     /// leaving a minimal empty space behind (the task is a zombie and never runs
     /// again). Keeps the pool from filling with dead processes' frames.
@@ -1414,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn release_and_exec_reset_return_frames_to_the_pool() {
+    fn release_and_exec_return_frames_to_the_pool() {
         let mut m = mem();
         let baseline = m.frames_in_use(); // empty space: PML4 + control-block tables
         // Touch several pages so real data frames are allocated (demand-paged).
@@ -1431,12 +1422,9 @@ mod tests {
         assert_eq!(m.frames_in_use(), baseline, "release returned all frames");
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         m.write_u64(0x1_0000, 1).unwrap();
-        m.exec_reset();
-        assert_eq!(
-            m.frames_in_use(),
-            baseline,
-            "exec_reset returned all frames"
-        );
+        let replacement = m.new_exec().unwrap();
+        std::mem::replace(&mut m, replacement).discard();
+        assert_eq!(m.frames_in_use(), baseline, "exec returned all frames");
     }
 
     #[test]
@@ -1522,12 +1510,13 @@ mod tests {
     }
 
     #[test]
-    fn exec_reset_clears_mappings_and_reuses_pool() {
+    fn exec_clears_mappings_and_reuses_pool() {
         let mut m = mem();
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
         m.write(0x1_0000, &[0x11]).unwrap();
         let old_cr3 = m.cr3();
-        m.exec_reset();
+        let replacement = m.new_exec().unwrap();
+        std::mem::replace(&mut m, replacement).discard();
         assert_ne!(m.cr3(), old_cr3, "execve installs fresh page tables");
         assert!(m.read_vec(0x1_0000, 1).is_err(), "old mapping is gone");
         m.map(0x1_0000, PAGE_SIZE, Prot::rw()).unwrap();
